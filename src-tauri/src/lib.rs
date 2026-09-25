@@ -1,3 +1,6 @@
+pub mod application;
+pub mod commands;
+
 /// Product name, used as the desktop window title and in diagnostics.
 pub const APP_NAME: &str = "dbtables";
 
@@ -5,6 +8,7 @@ pub const APP_NAME: &str = "dbtables";
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![commands::status::app_status])
         .run(tauri::generate_context!())
         .expect("error while running the dbtables application");
 }
