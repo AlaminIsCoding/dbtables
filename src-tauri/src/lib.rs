@@ -1,5 +1,6 @@
 pub mod application;
 pub mod commands;
+pub mod domain;
 
 /// Product name, used as the desktop window title and in diagnostics.
 pub const APP_NAME: &str = "dbtables";
