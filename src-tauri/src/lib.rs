@@ -27,6 +27,7 @@ pub fn run() {
             commands::queries::query_capabilities,
             commands::queries::cancel_query,
             commands::table_data::fetch_table_page,
+            commands::table_data::apply_table_changes,
             commands::export::export_query_csv,
         ])
         .run(tauri::generate_context!())

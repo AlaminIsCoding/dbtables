@@ -2,7 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { TablePage, TablePageRequest } from "../domain";
-import { FETCH_TABLE_PAGE_COMMAND, fetchTablePage } from "./tableData";
+import {
+  APPLY_TABLE_CHANGES_COMMAND,
+  applyTableChanges,
+  FETCH_TABLE_PAGE_COMMAND,
+  fetchTablePage,
+  type ChangeGroupResult,
+  type ChangeRequest,
+} from "./tableData";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -62,5 +69,40 @@ describe("table data service", () => {
     invokeMock.mockRejectedValue(error);
 
     await expect(fetchTablePage("sqlite-1", request)).rejects.toEqual(error);
+  });
+
+  it("invokes apply_table_changes with the connection id and requests", async () => {
+    const requests: ChangeRequest[] = [
+      {
+        operationId: "chg-1",
+        object: { name: "users", kind: "table" },
+        change: {
+          kind: "update",
+          identity: { keys: [{ column: "id", value: { type: "integer", value: 1 } }] },
+          values: [{ column: "name", value: { type: "text", value: "bob" } }],
+        },
+      },
+    ];
+    const group: ChangeGroupResult = {
+      results: [{ operationId: "chg-1", outcome: "applied", affectedRows: 1 }],
+      grouped: true,
+      state: "applied",
+      transaction: "tx-1",
+    };
+    invokeMock.mockResolvedValue(group);
+
+    await expect(applyTableChanges("sqlite-1", requests)).resolves.toEqual(group);
+
+    expect(invokeMock).toHaveBeenCalledWith(APPLY_TABLE_CHANGES_COMMAND, {
+      connectionId: "sqlite-1",
+      requests,
+    });
+  });
+
+  it("propagates a rejected apply precondition unchanged", async () => {
+    const error = { category: "unsupported", message: "no safe row identity" };
+    invokeMock.mockRejectedValue(error);
+
+    await expect(applyTableChanges("sqlite-1", [])).rejects.toEqual(error);
   });
 });

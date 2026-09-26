@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { GridSelection, Item } from "@glideapps/glide-data-grid";
+import type { GridCell, GridSelection, Item, Theme } from "@glideapps/glide-data-grid";
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
@@ -7,6 +7,7 @@ import type { CellValue, FilterOperator, ObjectRef, QueryError } from "../../dom
 import { ResultGrid } from "../results/ResultGrid";
 import type { ResultSet } from "../results/resultSet";
 import { ValueViewer } from "../results/ValueViewer";
+import { isEditableValue } from "./editorValue";
 import {
   createTableFilter,
   describeFilter,
@@ -16,8 +17,17 @@ import {
   sortColumnOf,
   sortDirectionOf,
 } from "./filters";
+import { InsertRowDialog } from "./InsertRowDialog";
 import { pageRangeLabel } from "./paging";
+import {
+  describeStagedChange,
+  stagedDeletedRows,
+  stagedEditedCells,
+  type StagedChangeStatus,
+} from "./stagedChanges";
+import { useStagedChanges } from "./useStagedChanges";
 import { useTableDataController } from "./useTableData";
+import { ValueEditor } from "./ValueEditor";
 
 export interface TableDataViewProps {
   /** Connection token the page requests target. */
@@ -28,6 +38,19 @@ export interface TableDataViewProps {
   onClose?: () => void;
   className?: string;
 }
+
+/** Pending-edit colours kept subtle so they do not hide the underlying value. */
+const EDITED_CELL_THEME: Partial<Theme> = { bgCell: "#2563eb1f" };
+const DELETED_ROW_THEME: Partial<Theme> = { bgCell: "#dc26261f", textDark: "#b91c1c" };
+
+const STATUS_LABELS: Record<StagedChangeStatus, string> = {
+  pending: "Pending",
+  applying: "Applying…",
+  applied: "Applied",
+  failed: "Failed",
+  conflict: "Conflict",
+  outcome_unknown: "Outcome unknown",
+};
 
 function qualifiedObjectName(object: ObjectRef): string {
   const parts = [object.database, object.schema, object.name].filter(
@@ -45,6 +68,11 @@ function cellAt(
     return null;
   }
   return rows[row]?.[col] ?? null;
+}
+
+/** Applies a theme override without discarding an existing cell override. */
+function withTheme(cell: GridCell, override: Partial<Theme>): GridCell {
+  return { ...cell, themeOverride: { ...cell.themeOverride, ...override } };
 }
 
 function selectClass(): string {
@@ -99,14 +127,71 @@ function ErrorState({ error, onRetry }: { error: QueryError; onRetry: () => void
   );
 }
 
+interface ConfirmState {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+}
+
+function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div
+      data-testid="confirm-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label={state.title}
+      className="absolute inset-0 z-20 flex items-center justify-center bg-background/70 p-4"
+    >
+      <div className="flex w-full max-w-md flex-col overflow-hidden rounded-md border border-border bg-background shadow-lg">
+        <div className="border-b border-border px-3 py-1.5 text-[11px] font-medium">
+          {state.title}
+        </div>
+        <p className="px-3 py-3 text-xs text-muted-foreground">{state.message}</p>
+        <div className="flex shrink-0 items-center justify-end gap-1 border-t border-border px-3 py-1.5">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-6 px-2 text-[10px]"
+            onClick={onClose}
+          >
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="destructive"
+            className="h-6 px-2 text-[10px]"
+            onClick={() => {
+              state.onConfirm();
+              onClose();
+            }}
+          >
+            {state.confirmLabel}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /**
- * Read-only table data browser.
+ * Table data browser with guarded staged editing.
  *
- * Renders one bounded page at a time with database-side paging, sorting, and
- * filtering. There is deliberately no edit affordance: the grid receives no
- * edit handlers, a read-only badge is always shown, and a table without a
- * primary key or other safe identity is called out explicitly rather than
- * implying its rows can be targeted.
+ * Rows stay read-only until the backend reports a safe row identity and the
+ * object is a base table. Edits are staged against that identity and shown in
+ * the pending list and grid until an explicit apply. A conflict or unconfirmed
+ * write is surfaced distinctly and never retried automatically, and the staged
+ * edits survive a failed apply so they can be inspected or discarded.
  */
 export function TableDataView({
   connectionId,
@@ -126,12 +211,28 @@ export function TableDataView({
     pageSize,
   } = controller;
 
+  const rowIdentityColumns = page?.rowIdentity ?? [];
+  const canEdit = object.kind === "table" && controller.hasRowIdentity;
+
   const [filterColumn, setFilterColumn] = useState("");
   const [filterOperator, setFilterOperator] = useState<FilterOperator>("equal");
   const [filterValue, setFilterValue] = useState("");
   const [filterNotice, setFilterNotice] = useState<string | null>(null);
   const [selectedCell, setSelectedCell] = useState<Item | null>(null);
   const [viewerCell, setViewerCell] = useState<Item | null>(null);
+  const [editorCell, setEditorCell] = useState<Item | null>(null);
+  const [insertOpen, setInsertOpen] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmState | null>(null);
+
+  const staged = useStagedChanges({
+    connectionId,
+    object,
+    columns,
+    rows,
+    rowIdentityColumns,
+    canEdit,
+    onApplied: controller.refresh,
+  });
 
   // Keep the selected filter column valid as columns arrive for a new object.
   useEffect(() => {
@@ -144,10 +245,13 @@ export function TableDataView({
     }
   }, [columns, filterColumn]);
 
-  // A different object's rows replace what a viewer or selection referred to.
+  // A different object's rows replace what a viewer, editor, or selection referred to.
   useEffect(() => {
     setSelectedCell(null);
     setViewerCell(null);
+    setEditorCell(null);
+    setInsertOpen(false);
+    setConfirm(null);
     setFilterValue("");
     setFilterNotice(null);
   }, [connectionId, object.name, object.database, object.schema, object.kind]);
@@ -163,6 +267,24 @@ export function TableDataView({
 
   const activeSortColumn = sortColumnOf(sort) ?? "";
   const activeSortDirection = sortDirectionOf(sort);
+
+  const editedCells = useMemo(() => stagedEditedCells(staged.staged), [staged.staged]);
+  const deletedRows = useMemo(() => stagedDeletedRows(staged.staged), [staged.staged]);
+
+  const decorateCell = useCallback(
+    (cell: Item, _value: CellValue, gridCell: GridCell): GridCell => {
+      const [col, row] = cell;
+      if (deletedRows.has(row)) {
+        return withTheme(gridCell, DELETED_ROW_THEME);
+      }
+      const columnName = columns[col]?.name;
+      if (columnName && editedCells.get(row)?.has(columnName)) {
+        return withTheme(gridCell, EDITED_CELL_THEME);
+      }
+      return gridCell;
+    },
+    [columns, deletedRows, editedCells],
+  );
 
   const handleAddFilter = useCallback(() => {
     const column = columns.find((candidate) => candidate.name === filterColumn);
@@ -203,6 +325,72 @@ export function TableDataView({
     [activeSortColumn, controller],
   );
 
+  const handleCellActivated = useCallback(
+    (cell: Item) => {
+      const value = cellAt(columns, rows, cell);
+      if (value === null) {
+        return;
+      }
+      if (!canEdit || !isEditableValue(value)) {
+        setViewerCell(cell);
+        return;
+      }
+      setEditorCell(cell);
+    },
+    [canEdit, columns, rows],
+  );
+
+  const handleStageEdit = useCallback(
+    (value: CellValue) => {
+      if (!editorCell) {
+        return;
+      }
+      const [col, row] = editorCell;
+      staged.stageEdit(row, col, value);
+    },
+    [editorCell, staged],
+  );
+
+  const handleDeleteRow = useCallback(() => {
+    const row = selectedCell?.[1];
+    if (row === undefined || !canEdit) {
+      return;
+    }
+    setConfirm({
+      title: "Delete row",
+      message: `Stage a delete for row ${row + 1} in ${qualifiedObjectName(object)}? The row is only removed after you apply the staged changes.`,
+      confirmLabel: "Stage delete",
+      onConfirm: () => staged.deleteRow(row),
+    });
+  }, [canEdit, object, selectedCell, staged]);
+
+  const handleApply = useCallback(() => {
+    if (staged.summary.hasDeletes) {
+      setConfirm({
+        title: "Apply changes",
+        message: `Apply ${staged.summary.applyable} change(s), including deletes, to ${qualifiedObjectName(object)}? This cannot be undone after the database confirms it.`,
+        confirmLabel: "Apply changes",
+        onConfirm: () => {
+          void staged.apply();
+        },
+      });
+      return;
+    }
+    void staged.apply();
+  }, [object, staged]);
+
+  const handleDiscard = useCallback(() => {
+    if (staged.staged.length === 0) {
+      return;
+    }
+    setConfirm({
+      title: "Discard staged changes",
+      message: `Discard ${staged.staged.length} staged change(s)? Nothing has been written to the database.`,
+      confirmLabel: "Discard changes",
+      onConfirm: () => staged.discardAll(),
+    });
+  }, [staged]);
+
   const selectedValue = useMemo(
     () => (selectedCell ? cellAt(columns, rows, selectedCell) : null),
     [columns, rows, selectedCell],
@@ -213,11 +401,24 @@ export function TableDataView({
     [columns, rows, viewerCell],
   );
 
+  const editorValue = useMemo(
+    () => (editorCell ? cellAt(columns, rows, editorCell) : null),
+    [columns, rows, editorCell],
+  );
+
   const rangeLabel = pageRangeLabel(
     controller.offset,
     rows.length,
     page?.totalRows,
   );
+
+  const hasConflicts = staged.summary.conflict > 0;
+  const hasUncertain = staged.summary.outcomeUnknown > 0;
+  const applyDisabled =
+    !canEdit ||
+    staged.isApplying ||
+    staged.summary.applyable === 0 ||
+    staged.summary.hasBlocking;
 
   return (
     <section
@@ -233,13 +434,75 @@ export function TableDataView({
             {qualifiedObjectName(object)}
           </span>
           <span
-            data-testid="table-data-read-only"
-            className="shrink-0 rounded-sm border border-border px-1 text-[9px] uppercase tracking-wide text-muted-foreground"
+            data-testid="table-data-mode"
+            className={cn(
+              "shrink-0 rounded-sm border px-1 text-[9px] uppercase tracking-wide",
+              canEdit
+                ? "border-emerald-600/40 text-emerald-700"
+                : "border-border text-muted-foreground",
+            )}
           >
-            Read-only
+            {canEdit ? "Editable" : "Read-only"}
           </span>
+          {staged.staged.length > 0 ? (
+            <span data-testid="staged-summary" className="shrink-0 text-muted-foreground">
+              {staged.summary.pending + staged.summary.failed} staged
+              {staged.summary.conflict > 0
+                ? ` · ${staged.summary.conflict} conflict`
+                : ""}
+              {staged.summary.outcomeUnknown > 0
+                ? ` · ${staged.summary.outcomeUnknown} uncertain`
+                : ""}
+            </span>
+          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {canEdit ? (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-5 px-1.5 text-[10px]"
+                onClick={() => setInsertOpen(true)}
+                disabled={isLoading || columns.length === 0}
+              >
+                Add row
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-5 px-1.5 text-[10px]"
+                onClick={handleDeleteRow}
+                disabled={!canEdit || selectedCell === null || isLoading}
+              >
+                Delete row
+              </Button>
+              <Button
+                size="sm"
+                className="h-5 px-1.5 text-[10px]"
+                onClick={handleApply}
+                disabled={applyDisabled}
+                title={
+                  staged.summary.hasBlocking
+                    ? "Resolve conflicted or uncertain changes before applying."
+                    : undefined
+                }
+              >
+                {staged.isApplying
+                  ? "Applying…"
+                  : `Apply (${staged.summary.applyable})`}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-5 px-1.5 text-[10px]"
+                onClick={handleDiscard}
+                disabled={staged.staged.length === 0 || staged.isApplying}
+              >
+                Discard
+              </Button>
+            </>
+          ) : null}
           <Button
             size="sm"
             variant="ghost"
@@ -440,7 +703,7 @@ export function TableDataView({
         </div>
       </div>
 
-      {page && !controller.hasRowIdentity ? (
+      {page && object.kind === "table" && !controller.hasRowIdentity ? (
         <p
           data-testid="table-data-no-identity"
           role="status"
@@ -451,10 +714,116 @@ export function TableDataView({
         </p>
       ) : null}
 
-      <p className="shrink-0 px-2 py-1 text-[10px] text-muted-foreground">
-        Read-only view · {qualifiedObjectName(object)} · editing rows is not
-        available.
-      </p>
+      {object.kind === "view" ? (
+        <p
+          data-testid="table-data-view"
+          role="status"
+          className="shrink-0 border-b border-border bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground"
+        >
+          Views are read-only; rows cannot be inserted, updated, or deleted.
+        </p>
+      ) : null}
+
+      {staged.staged.length > 0 || staged.applyError || staged.lastGroup ? (
+        <div
+          data-testid="pending-changes"
+          className="shrink-0 border-b border-border bg-muted/20 px-2 py-1 text-[10px]"
+        >
+          {staged.staged.length > 0 ? (
+            <ul className="flex flex-col gap-0.5">
+              {staged.staged.map((change) => (
+                <li
+                  key={change.id}
+                  data-testid={`staged-change-${change.id}`}
+                  className="flex flex-wrap items-center gap-2"
+                >
+                  <span
+                    data-testid={`staged-status-${change.id}`}
+                    className={cn(
+                      "rounded-sm border px-1 uppercase tracking-wide",
+                      change.status === "conflict" || change.status === "outcome_unknown"
+                        ? "border-destructive/50 text-destructive"
+                        : change.status === "failed"
+                          ? "border-amber-600/50 text-amber-700"
+                          : change.status === "applied"
+                            ? "border-emerald-600/50 text-emerald-700"
+                            : "border-border text-muted-foreground",
+                    )}
+                  >
+                    {STATUS_LABELS[change.status]}
+                  </span>
+                  <span>{describeStagedChange(change)}</span>
+                  {change.conflictedColumns.length > 0 ? (
+                    <span className="text-destructive">
+                      changed on server: {change.conflictedColumns.join(", ")}
+                    </span>
+                  ) : null}
+                  {change.error ? (
+                    <span className="text-destructive">{change.error.message}</span>
+                  ) : null}
+                  <button
+                    type="button"
+                    aria-label={`Discard staged change ${change.id}`}
+                    onClick={() => staged.remove(change.id)}
+                    className="text-muted-foreground underline hover:text-foreground"
+                  >
+                    Discard
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {staged.applyError ? (
+            <p data-testid="apply-error" role="alert" className="mt-1 text-destructive">
+              {staged.applyError.message}
+            </p>
+          ) : null}
+
+          {staged.lastGroup ? (
+            <p data-testid="apply-feedback" role="status" className="mt-1">
+              {staged.lastGroup.state === "applied"
+                ? "Changes applied and committed."
+                : staged.lastGroup.state === "auto_commit"
+                  ? "Changes applied (this engine has no transaction grouping)."
+                  : staged.lastGroup.state === "conflict"
+                    ? "A change conflicted; the batch was rolled back. Nothing was overwritten."
+                    : staged.lastGroup.state === "failed"
+                      ? "A change failed; the batch was rolled back."
+                      : "A write outcome could not be confirmed. Do not retry automatically."}
+              {staged.lastGroup.transaction ? ` (transaction ${staged.lastGroup.transaction})` : ""}
+              {staged.lastGroup.error ? ` — ${staged.lastGroup.error.message}` : ""}
+            </p>
+          ) : null}
+
+          {hasConflicts || hasUncertain || staged.lastGroup ? (
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              {hasConflicts ? (
+                <span className="text-muted-foreground">
+                  Conflicted edits were not applied. Reload to see the current
+                  rows, then re-stage or discard the change.
+                </span>
+              ) : null}
+              {hasUncertain ? (
+                <span className="text-destructive">
+                  A write may or may not have committed. Reload and verify the
+                  table before making further changes.
+                </span>
+              ) : null}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-5 px-1.5 text-[10px]"
+                data-testid="reload-rows"
+                onClick={controller.refresh}
+                disabled={isLoading}
+              >
+                Reload rows
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
         {error ? (
@@ -466,10 +835,11 @@ export function TableDataView({
         ) : (
           <ResultGrid
             result={resultSet}
+            decorateCell={canEdit ? decorateCell : undefined}
             onSelectionChange={(selection: GridSelection) =>
               setSelectedCell(selection.current?.cell ?? null)
             }
-            onCellActivated={setViewerCell}
+            onCellActivated={handleCellActivated}
           />
         )}
 
@@ -481,6 +851,26 @@ export function TableDataView({
             onClose={() => setViewerCell(null)}
           />
         ) : null}
+
+        {editorCell && editorValue !== null && columns[editorCell[0]] ? (
+          <ValueEditor
+            value={editorValue}
+            column={columns[editorCell[0]]}
+            rowNumber={editorCell[1] + 1}
+            onSave={handleStageEdit}
+            onClose={() => setEditorCell(null)}
+          />
+        ) : null}
+
+        {insertOpen ? (
+          <InsertRowDialog
+            columns={columns}
+            onStage={(values) => staged.insertRow(values)}
+            onClose={() => setInsertOpen(false)}
+          />
+        ) : null}
+
+        {confirm ? <ConfirmDialog state={confirm} onClose={() => setConfirm(null)} /> : null}
       </div>
     </section>
   );

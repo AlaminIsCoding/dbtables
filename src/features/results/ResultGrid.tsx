@@ -3,6 +3,7 @@ import {
   DataEditor,
   type DataEditorProps,
   type EditableGridCell,
+  type GridCell,
   type GridSelection,
   type Item,
 } from "@glideapps/glide-data-grid";
@@ -68,6 +69,12 @@ export interface ResultGridProps {
   onSelectionChange?: (selection: GridSelection) => void;
   /** Called when a cell is activated (double-click, Enter, or Space). */
   onCellActivated?: (location: Item) => void;
+  /**
+   * Optionally returns a decorated copy of a rendered cell, for example to mark
+   * a staged edit or a row pending deletion. The value is unchanged; only the
+   * presentation is adjusted.
+   */
+  decorateCell?: (cell: Item, value: CellValue, gridCell: GridCell) => GridCell;
   className?: string;
 }
 
@@ -84,6 +91,7 @@ export function ResultGrid({
   onCellsEdit,
   onSelectionChange,
   onCellActivated,
+  decorateCell,
   className,
 }: ResultGridProps) {
   const { ref, width, height } = useElementSize<HTMLDivElement>();
@@ -98,9 +106,10 @@ export function ResultGrid({
     (cell) => {
       const [col, row] = cell;
       const value = rows[row]?.[col] ?? { type: "null" };
-      return cellValueToGridCell(value);
+      const gridCell = cellValueToGridCell(value);
+      return decorateCell ? decorateCell(cell, value, gridCell) : gridCell;
     },
-    [rows],
+    [rows, decorateCell],
   );
 
   const handleCellEdited = useCallback(

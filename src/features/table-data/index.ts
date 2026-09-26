@@ -1,5 +1,43 @@
 export { TableDataView, type TableDataViewProps } from "./TableDataView";
 export {
+  baseValueForColumn,
+  cellValueToEditText,
+  isEditableValue,
+  parseColumnText,
+  parseEditedCellValue,
+  type EditParseResult,
+} from "./editorValue";
+export { InsertRowDialog, type InsertRowDialogProps } from "./InsertRowDialog";
+export { ValueEditor, type ValueEditorProps } from "./ValueEditor";
+export {
+  cellValuesEqual,
+  describeStagedChange,
+  isApplyable,
+  isBlocking,
+  pendingRequests,
+  reconcileApplyResult,
+  removeApplied,
+  removeStagedChange,
+  rowIdentityFor,
+  rowKeyString,
+  stagedChangeToRequest,
+  stagedDeletedRows,
+  stagedEditedCells,
+  stageCellEdit,
+  stageDelete,
+  stageInsert,
+  summarizeStaged,
+  type StagedChange,
+  type StagedChangeKind,
+  type StagedChangeStatus,
+  type StagedSummary,
+} from "./stagedChanges";
+export {
+  useStagedChanges,
+  type StagedChangesController,
+  type UseStagedChangesOptions,
+} from "./useStagedChanges";
+export {
   TableDataProvider,
   useTableDataSession,
 } from "./context";

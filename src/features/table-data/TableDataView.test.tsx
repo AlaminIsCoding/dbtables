@@ -1,12 +1,29 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { QueryError, TablePage } from "../../domain";
-import { fetchTablePage } from "../../services/tableData";
+import { applyTableChanges, fetchTablePage } from "../../services/tableData";
 import { TableDataView } from "./TableDataView";
 
-vi.mock("../../services/tableData", () => ({
-  fetchTablePage: vi.fn(),
+vi.mock("../../services/tableData", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../services/tableData")>();
+  return { ...actual, fetchTablePage: vi.fn(), applyTableChanges: vi.fn() };
+});
+
+const glide = vi.hoisted(() => ({
+  props: undefined as
+    | {
+        rows: number;
+        getCellContent: (cell: readonly [number, number]) => {
+          kind: string;
+          themeOverride?: unknown;
+        };
+        onCellActivated: (cell: readonly [number, number]) => void;
+        onGridSelectionChange: (selection: {
+          current?: { cell: readonly [number, number] };
+        }) => void;
+      }
+    | undefined,
 }));
 
 vi.mock("@glideapps/glide-data-grid", () => ({
@@ -16,10 +33,14 @@ vi.mock("@glideapps/glide-data-grid", () => ({
     Boolean: "boolean",
   },
   getDefaultTheme: () => ({}),
-  DataEditor: () => null,
+  DataEditor: (props: unknown) => {
+    glide.props = props as typeof glide.props;
+    return null;
+  },
 }));
 
 const fetchMock = vi.mocked(fetchTablePage);
+const applyMock = vi.mocked(applyTableChanges);
 
 const object = { name: "users", kind: "table" as const };
 
@@ -44,32 +65,189 @@ function page(overrides: Partial<TablePage> = {}): TablePage {
   };
 }
 
+function selectRow(row = 0) {
+  act(() => {
+    glide.props?.onGridSelectionChange({ current: { cell: [0, row] } });
+  });
+}
+
+function activateCell(cell: readonly [number, number]) {
+  act(() => {
+    glide.props?.onCellActivated(cell);
+  });
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
+  applyMock.mockReset();
+  glide.props = undefined;
 });
 
 afterEach(cleanup);
 
 describe("TableDataView", () => {
-  it("shows a read-only badge and loads the first page", async () => {
+  it("enables editing when the object has a safe identity", async () => {
     fetchMock.mockResolvedValue(page());
 
     render(<TableDataView connectionId="c1" object={object} />);
 
-    expect(screen.getByTestId("table-data-read-only").textContent).toBe(
-      "Read-only",
+    await waitFor(() =>
+      expect(screen.getByTestId("table-data-range").textContent).toBe("Rows 1–1"),
     );
-    expect(screen.getByText(/editing rows is not available/)).toBeTruthy();
+
+    expect(screen.getByTestId("table-data-mode").textContent).toBe("Editable");
+    expect(screen.getByRole("button", { name: "Add row" })).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: /Apply/ }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("keeps a view read-only even with a reported identity", async () => {
+    fetchMock.mockResolvedValue(page());
+
+    render(
+      <TableDataView connectionId="c1" object={{ name: "v", kind: "view" }} />,
+    );
 
     await waitFor(() =>
-      expect(screen.getByTestId("table-data-range").textContent).toBe(
-        "Rows 1–1",
-      ),
+      expect(screen.getByTestId("table-data-range").textContent).toBe("Rows 1–1"),
     );
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe("c1");
-    expect(fetchMock.mock.calls[0][1].offset).toBe(0);
+    expect(screen.getByTestId("table-data-mode").textContent).toBe("Read-only");
+    expect(screen.getByTestId("table-data-view")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add row" })).toBeNull();
+  });
+
+  it("warns when the object has no safe row identity", async () => {
+    fetchMock.mockResolvedValue(page({ rowIdentity: [] }));
+
+    render(<TableDataView connectionId="c1" object={object} />);
+
+    expect(await screen.findByTestId("table-data-no-identity")).toBeTruthy();
+    expect(screen.getByTestId("table-data-mode").textContent).toBe("Read-only");
+  });
+
+  it("stages a cell edit through the value editor and marks the cell", async () => {
+    fetchMock.mockResolvedValue(page());
+
+    render(<TableDataView connectionId="c1" object={object} />);
+    await waitFor(() => expect(glide.props).toBeDefined());
+
+    activateCell([1, 0]);
+    fireEvent.change(await screen.findByLabelText("Cell value"), {
+      target: { value: "bob" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Stage edit" }));
+
+    expect(await screen.findByTestId("staged-summary")).toBeTruthy();
+    expect(screen.getByTestId("staged-summary").textContent).toContain("1 staged");
+    expect(glide.props?.getCellContent([1, 0]).themeOverride).toBeDefined();
+    expect(applyMock).not.toHaveBeenCalled();
+  });
+
+  it("applies staged edits, reloads, and clears the queue", async () => {
+    fetchMock.mockResolvedValue(page());
+    applyMock.mockImplementation(async (_connection, requests) => ({
+      results: requests.map((request) => ({
+        operationId: request.operationId,
+        outcome: "applied",
+        affectedRows: 1,
+      })),
+      grouped: true,
+      state: "applied",
+    }));
+
+    render(<TableDataView connectionId="c1" object={object} />);
+    await waitFor(() => expect(glide.props).toBeDefined());
+
+    activateCell([1, 0]);
+    fireEvent.change(await screen.findByLabelText("Cell value"), {
+      target: { value: "bob" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Stage edit" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Apply (1)" }));
+
+    await waitFor(() => expect(applyMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId("staged-summary")).toBeNull(),
+    );
+    expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("confirms before applying deletes and surfaces a conflict", async () => {
+    fetchMock.mockResolvedValue(page());
+    applyMock.mockImplementation(async (_connection, requests) => ({
+      results: [
+        {
+          operationId: requests[0].operationId,
+          outcome: "conflict",
+          conflictedColumns: ["id"],
+        },
+      ],
+      grouped: true,
+      state: "conflict",
+    }));
+
+    render(<TableDataView connectionId="c1" object={object} />);
+    await waitFor(() => expect(glide.props).toBeDefined());
+
+    selectRow(0);
+    fireEvent.click(screen.getByRole("button", { name: "Delete row" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Stage delete" }));
+
+    expect(screen.getByTestId("staged-summary").textContent).toContain("1 staged");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply (1)" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Apply changes" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("apply-feedback").textContent).toContain("conflicted"),
+    );
+    expect(screen.getByTestId("reload-rows")).toBeTruthy();
+    expect(screen.getByTestId(/^staged-status-/).textContent).toBe("Conflict");
+  });
+
+  it("discards staged edits only after confirmation", async () => {
+    fetchMock.mockResolvedValue(page());
+
+    render(<TableDataView connectionId="c1" object={object} />);
+    await waitFor(() => expect(glide.props).toBeDefined());
+
+    activateCell([1, 0]);
+    fireEvent.change(await screen.findByLabelText("Cell value"), {
+      target: { value: "bob" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Stage edit" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard changes" }));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("staged-summary")).toBeNull(),
+    );
+    expect(applyMock).not.toHaveBeenCalled();
+  });
+
+  it("stages a new row from the insert dialog", async () => {
+    fetchMock.mockResolvedValue(page());
+
+    render(<TableDataView connectionId="c1" object={object} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("table-data-range").textContent).toBe("Rows 1–1"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }));
+    fireEvent.change(screen.getByLabelText("Value for id"), {
+      target: { value: "2" },
+    });
+    fireEvent.change(screen.getByLabelText("Value for name"), {
+      target: { value: "dana" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Stage insert" }));
+
+    expect(screen.getByTestId("staged-summary").textContent).toContain("1 staged");
+    expect(applyMock).not.toHaveBeenCalled();
   });
 
   it("pages forward and back with bounded requests", async () => {
@@ -80,9 +258,7 @@ describe("TableDataView", () => {
 
     render(<TableDataView connectionId="c1" object={object} />);
     await waitFor(() =>
-      expect(screen.getByTestId("table-data-range").textContent).toBe(
-        "Rows 1–1",
-      ),
+      expect(screen.getByTestId("table-data-range").textContent).toBe("Rows 1–1"),
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
@@ -139,14 +315,6 @@ describe("TableDataView", () => {
       column: "name",
       direction: "ascending",
     });
-  });
-
-  it("warns when the object has no safe row identity", async () => {
-    fetchMock.mockResolvedValue(page({ rowIdentity: [] }));
-
-    render(<TableDataView connectionId="c1" object={object} />);
-
-    expect(await screen.findByTestId("table-data-no-identity")).toBeTruthy();
   });
 
   it("shows a normalized error instead of stale rows", async () => {

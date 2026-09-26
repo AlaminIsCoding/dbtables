@@ -1,4 +1,5 @@
 import { cleanup, render } from "@testing-library/react";
+import type { GridCell, Item } from "@glideapps/glide-data-grid";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createMockResultSet } from "./mockResult";
@@ -9,7 +10,10 @@ const glide = vi.hoisted(() => ({
     | {
         rows: number;
         columns: { title: string }[];
-        getCellContent: (cell: readonly [number, number]) => { kind: string };
+        getCellContent: (cell: readonly [number, number]) => {
+          kind: string;
+          themeOverride?: unknown;
+        };
         onCellEdited: (
           cell: readonly [number, number],
           value: unknown,
@@ -94,8 +98,7 @@ describe("ResultGrid", () => {
     ]);
   });
 
-  it("forwards cell activation for the value viewer", () => {
-    const onCellActivated = vi.fn();
+  it("forwards cell activation for the value viewer", () => {    const onCellActivated = vi.fn();
 
     render(
       <ResultGrid
@@ -107,5 +110,22 @@ describe("ResultGrid", () => {
     glide.props?.onCellActivated([1, 0]);
 
     expect(onCellActivated).toHaveBeenCalledWith([1, 0]);
+  });
+
+  it("applies a caller decoration without changing the cell kind", () => {
+    const decorateCell = vi.fn((_cell: Item, _value: unknown, gridCell: GridCell) => ({
+      ...gridCell,
+      themeOverride: { bgCell: "#ff000022" },
+    }));
+
+    render(
+      <ResultGrid result={createMockResultSet(2)} decorateCell={decorateCell} />,
+    );
+
+    const cell = glide.props?.getCellContent([0, 0]);
+
+    expect(cell?.kind).toBe("number");
+    expect(cell?.themeOverride).toEqual({ bgCell: "#ff000022" });
+    expect(decorateCell).toHaveBeenCalledTimes(1);
   });
 });
