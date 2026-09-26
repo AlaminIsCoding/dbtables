@@ -40,6 +40,12 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), success: vi.fn(), message: vi.fn() },
 }));
 
+// The view reports outcomes to the workspace message log; a stub keeps the
+// test independent of the real provider (connection state, schema listing).
+vi.mock("@/app/store", () => ({
+  useWorkspace: () => ({ log: vi.fn() }),
+}));
+
 const connectMock = vi.mocked(connectSqlite);
 const disconnectMock = vi.mocked(disconnectConnection);
 const listObjectsMock = vi.mocked(listObjects);

@@ -31,16 +31,15 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   Tooltip,
   TooltipContent,
@@ -65,6 +64,7 @@ import {
   dropForeignKey,
   renameColumn,
 } from "@/services/schema";
+import { reportError } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 
 import {
@@ -75,6 +75,7 @@ import {
   type PendingColumnChange,
 } from "./columnEdits";
 import { ErrorBanner, SqlPreview } from "./parts";
+import { NONE, TYPE_OPTIONS } from "./typeOptions";
 
 export interface DefinitionTabViewProps {
   connectionId: string;
@@ -83,12 +84,13 @@ export interface DefinitionTabViewProps {
 
 type AddChange = Extract<PendingColumnChange, { kind: "add" }>;
 
-function selectClass(extra?: string): string {
-  return cn(
-    "h-6 min-w-0 rounded-sm border border-input bg-background px-1 text-[11px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-    extra,
-  );
-}
+/** Grid shared by the column header and its rows. */
+const COLUMN_GRID =
+  "grid grid-cols-[minmax(9rem,1.3fr)_minmax(8rem,1.1fr)_56px_52px_minmax(8rem,1fr)_72px] items-center gap-2";
+
+/** Grid shared by the foreign-key header and its rows. */
+const FK_GRID =
+  "grid grid-cols-[minmax(9rem,1.2fr)_minmax(7rem,1fr)_minmax(9rem,1.3fr)_36px] items-center gap-2";
 
 function fieldLabel(text: string) {
   return (
@@ -98,19 +100,33 @@ function fieldLabel(text: string) {
   );
 }
 
+function inputClass(extra?: string): string {
+  return cn(
+    "h-7 rounded-sm px-1.5 font-mono text-[11px] focus-visible:ring-1",
+    extra,
+  );
+}
+
+interface RefTableInfo {
+  columns: string[];
+  primaryKey: string | null;
+}
+
 /**
  * Table/view definition editor.
  *
- * Columns are edited by staging local add/rename/drop changes, previewing the
- * exact `ALTER TABLE` statements, then applying them in order. Foreign-key
- * controls call the backend directly, so an engine that cannot alter them
- * (SQLite) reports its `unsupported` error rather than pretending to succeed.
+ * A flat, borderless form matching the new-table page. Columns are edited by
+ * staging local add/rename/drop changes, previewing the exact `ALTER TABLE`
+ * statements, then applying them in order. SQLite cannot change an existing
+ * column's type, nullability, or default, so those cells are shown read-only
+ * rather than pretending to be editable. Foreign-key fields are chosen from the
+ * live schema.
  */
 export function DefinitionTabView({
   connectionId,
   object,
 }: DefinitionTabViewProps) {
-  const { refreshSchema } = useWorkspace();
+  const { refreshSchema, schema, log } = useWorkspace();
   const canEdit = object.kind === "table";
 
   const [description, setDescription] = useState<TableDescription | null>(null);
@@ -118,7 +134,6 @@ export function DefinitionTabView({
   const [loadError, setLoadError] = useState<QueryError | null>(null);
   const [pending, setPending] = useState<PendingColumnChange[]>([]);
   const [isApplying, setIsApplying] = useState(false);
-  const [applyError, setApplyError] = useState<QueryError | null>(null);
   const [renaming, setRenaming] = useState<{ from: string; to: string } | null>(
     null,
   );
@@ -136,8 +151,9 @@ export function DefinitionTabView({
   const [fkRefTable, setFkRefTable] = useState("");
   const [fkRefColumn, setFkRefColumn] = useState("");
   const [fkRefSchema, setFkRefSchema] = useState("");
-  const [fkError, setFkError] = useState<QueryError | null>(null);
+  const [fkNotice, setFkNotice] = useState<string | null>(null);
   const [fkBusy, setFkBusy] = useState(false);
+  const [refTables, setRefTables] = useState<Record<string, RefTableInfo>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -163,11 +179,10 @@ export function DefinitionTabView({
 
   useEffect(() => {
     setPending([]);
-    setApplyError(null);
     setRenaming(null);
     setDropTarget(null);
     setAddError(null);
-    setFkError(null);
+    setFkNotice(null);
   }, [connectionId, object.name, object.database, object.schema, object.kind]);
 
   const columns = useMemo(() => description?.columns ?? [], [description]);
@@ -198,9 +213,38 @@ export function DefinitionTabView({
     [description],
   );
 
+  const tableOptions = useMemo(
+    () => (schema.status === "ready" ? schema.tables : []),
+    [schema],
+  );
+
+  const loadRefTable = useCallback(
+    async (table: string): Promise<RefTableInfo | null> => {
+      if (!table) {
+        return null;
+      }
+      try {
+        const info = await describeTable(connectionId, {
+          kind: "table",
+          name: table,
+        });
+        const next: RefTableInfo = {
+          columns: info.columns.map((column) => column.name),
+          primaryKey: info.primaryKeyColumns?.[0] ?? null,
+        };
+        setRefTables((current) => ({ ...current, [table]: next }));
+        return next;
+      } catch {
+        const next: RefTableInfo = { columns: [], primaryKey: null };
+        setRefTables((current) => ({ ...current, [table]: next }));
+        return next;
+      }
+    },
+    [connectionId],
+  );
+
   const discardChange = useCallback((id: string) => {
     setPending((current) => current.filter((change) => change.id !== id));
-    setApplyError(null);
   }, []);
 
   const handleAddColumn = useCallback(() => {
@@ -289,7 +333,6 @@ export function DefinitionTabView({
         { id: createOperationId(), kind: "drop", column: name },
       ];
     });
-    setApplyError(null);
   }, []);
 
   const handleApply = useCallback(async () => {
@@ -297,7 +340,6 @@ export function DefinitionTabView({
       return;
     }
     setIsApplying(true);
-    setApplyError(null);
     let remaining = [...pending];
     try {
       while (remaining.length > 0) {
@@ -313,16 +355,35 @@ export function DefinitionTabView({
         setPending(remaining);
       }
       toast.success(`Applied schema changes to ${object.name}`);
+      log("success", `Applied schema changes to ${object.name}`);
       await refreshSchema();
       await load();
     } catch (error) {
       const normalized = toQueryError(error);
-      setApplyError(normalized);
       toast.error(normalized.message);
+      reportError(
+        log,
+        `Could not apply schema changes to ${object.name}`,
+        normalized,
+      );
     } finally {
       setIsApplying(false);
     }
-  }, [connectionId, isApplying, load, object, pending, refreshSchema]);
+  }, [connectionId, isApplying, load, log, object, pending, refreshSchema]);
+
+  const handleRefTableChange = useCallback(
+    async (table: string) => {
+      setFkRefTable(table);
+      setFkRefColumn("");
+      if (table) {
+        const info = await loadRefTable(table);
+        if (info?.primaryKey) {
+          setFkRefColumn(info.primaryKey);
+        }
+      }
+    },
+    [loadRefTable],
+  );
 
   const handleAddForeignKey = useCallback(async () => {
     if (fkBusy) {
@@ -332,11 +393,7 @@ export function DefinitionTabView({
     const referencedTable = fkRefTable.trim();
     const referencedColumn = fkRefColumn.trim();
     if (!column || !referencedTable || !referencedColumn) {
-      setFkError({
-        category: "validation",
-        message:
-          "Choose a local column and enter the referenced table and column.",
-      });
+      setFkNotice("Choose a local column and a referenced table and column.");
       return;
     }
     const foreignKey: ForeignKeyDefinition = {
@@ -351,10 +408,11 @@ export function DefinitionTabView({
       foreignKey.name = fkName.trim();
     }
     setFkBusy(true);
-    setFkError(null);
+    setFkNotice(null);
     try {
       await addForeignKey(connectionId, object, foreignKey);
       toast.success("Foreign key added");
+      log("success", `Added a foreign key on ${object.name}`);
       setFkName("");
       setFkColumn("");
       setFkRefTable("");
@@ -363,7 +421,13 @@ export function DefinitionTabView({
       await refreshSchema();
       await load();
     } catch (error) {
-      setFkError(toQueryError(error));
+      const normalized = toQueryError(error);
+      toast.error(normalized.message);
+      reportError(
+        log,
+        `Could not add a foreign key on ${object.name}`,
+        normalized,
+      );
     } finally {
       setFkBusy(false);
     }
@@ -376,6 +440,7 @@ export function DefinitionTabView({
     fkRefSchema,
     fkRefTable,
     load,
+    log,
     object,
     refreshSchema,
   ]);
@@ -386,38 +451,46 @@ export function DefinitionTabView({
         return;
       }
       setFkBusy(true);
-      setFkError(null);
       try {
         await dropForeignKey(connectionId, object, name);
         toast.success(`Dropped foreign key ${name}`);
+        log("success", `Dropped foreign key ${name} on ${object.name}`);
         await refreshSchema();
         await load();
       } catch (error) {
-        setFkError(toQueryError(error));
+        const normalized = toQueryError(error);
+        toast.error(normalized.message);
+        reportError(
+          log,
+          `Could not drop foreign key ${name} on ${object.name}`,
+          normalized,
+        );
       } finally {
         setFkBusy(false);
       }
     },
-    [connectionId, fkBusy, load, object, refreshSchema],
+    [connectionId, fkBusy, load, log, object, refreshSchema],
   );
 
-  const fkDisabled = !canEdit || pending.length > 0 || fkBusy || columns.length === 0;
+  const refColumnOptions = refTables[fkRefTable]?.columns ?? [];
+  const fkDisabled =
+    !canEdit || pending.length > 0 || fkBusy || columns.length === 0;
 
   return (
     <section
       aria-label="Object definition"
       className="flex min-h-0 flex-1 flex-col bg-background"
     >
-      <header className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 text-[11px]">
+      <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-semibold tracking-wide uppercase text-muted-foreground">
+          <span className="shrink-0 font-semibold tracking-wide text-muted-foreground uppercase">
             Definition
           </span>
-          <span className="truncate font-mono" title={object.name}>
+          <span className="truncate font-mono text-[11px]" title={object.name}>
             {object.name}
           </span>
           {pending.length > 0 ? (
-            <span data-testid="pending-count" className="text-muted-foreground">
+            <span data-testid="pending-count" className="text-[11px] text-muted-foreground">
               {pending.length} pending
             </span>
           ) : null}
@@ -448,7 +521,6 @@ export function DefinitionTabView({
                 variant="ghost"
                 onClick={() => {
                   setPending([]);
-                  setApplyError(null);
                 }}
                 disabled={pending.length === 0 || isApplying}
               >
@@ -463,16 +535,10 @@ export function DefinitionTabView({
       {object.kind === "view" ? (
         <p
           role="status"
-          className="shrink-0 border-b border-border bg-muted/40 px-2 py-1 text-[10px] text-muted-foreground"
+          className="shrink-0 border-b border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground"
         >
           Views are read-only; their definition cannot be altered here.
         </p>
-      ) : null}
-
-      {applyError ? (
-        <div className="shrink-0 px-2 pt-2">
-          <ErrorBanner error={applyError} title="Apply failed" />
-        </div>
       ) : null}
 
       {loading && description === null ? (
@@ -489,39 +555,37 @@ export function DefinitionTabView({
       ) : (
         <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1">
           <ResizablePanel defaultSize={68} minSize={30} className="min-h-0">
-            <div className="h-full overflow-auto p-2">
-              <div className="flex flex-col gap-3">
-              <p className="text-[10px] text-muted-foreground">
-                Column defaults are not reported by metadata inspection; staged
-                additions show the default they will create.
-              </p>
-              <div className="rounded-md border border-border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                        Name
-                      </TableHead>
-                      <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                        Type
-                      </TableHead>
-                      <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                        Nullable
-                      </TableHead>
-                      <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                        Key
-                      </TableHead>
-                      <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                        Default
-                      </TableHead>
-                      {canEdit ? (
-                        <TableHead className="h-7 w-32 px-2 text-[10px] tracking-wide uppercase">
-                          Edit
-                        </TableHead>
-                      ) : null}
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
+            <div className="h-full overflow-auto p-3">
+              <div className="flex flex-col gap-5">
+                <section className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Columns
+                    </span>
+                    <span className="text-[10px] text-muted-foreground tabular-nums">
+                      {columns.length}
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-muted-foreground">
+                    SQLite cannot change a column type, nullability, or default.
+                    Add, rename, or drop columns instead.
+                  </p>
+
+                  <div
+                    className={cn(
+                      COLUMN_GRID,
+                      "px-1 text-[10px] tracking-wide text-muted-foreground uppercase",
+                    )}
+                  >
+                    <span>Name</span>
+                    <span>Type</span>
+                    <span className="text-center">Null</span>
+                    <span className="text-center">PK</span>
+                    <span>Default</span>
+                    <span className="text-right">Actions</span>
+                  </div>
+
+                  <div className="flex flex-col">
                     {columns.map((column) => {
                       const rename = pending.find(
                         (change) =>
@@ -537,18 +601,21 @@ export function DefinitionTabView({
                       }
                       const isPrimary = primaryKeyColumns.includes(column.name);
                       return (
-                        <TableRow
+                        <div
                           key={column.name}
-                          className={cn(drop ? "opacity-60" : undefined)}
+                          className={cn(
+                            "border-t border-border/60 py-1",
+                            drop && "opacity-60",
+                          )}
                         >
-                          <TableCell className="px-2 py-1">
+                          <div className={COLUMN_GRID}>
                             {renaming?.from === column.name ? (
                               <div className="flex items-center gap-1">
                                 <Input
                                   aria-label={`Rename ${column.name}`}
                                   value={renaming.to}
                                   spellCheck={false}
-                                  className="h-6 w-36 font-mono text-[11px]"
+                                  className={inputClass()}
                                   onChange={(event) =>
                                     setRenaming({
                                       from: column.name,
@@ -581,8 +648,8 @@ export function DefinitionTabView({
                                 </Button>
                               </div>
                             ) : (
-                              <span className="flex items-center gap-1 font-mono">
-                                <span className={cn(drop && "line-through")}>
+                              <span className="flex min-w-0 items-center gap-1 font-mono text-[11px]">
+                                <span className={cn("truncate", drop && "line-through")}>
                                   {displayName}
                                 </span>
                                 {rename ? (
@@ -600,111 +667,109 @@ export function DefinitionTabView({
                                 ) : null}
                               </span>
                             )}
-                          </TableCell>
-                          <TableCell className="px-2 py-1 text-[11px] text-muted-foreground">
-                            {column.typeName ?? "-"}
-                          </TableCell>
-                          <TableCell className="px-2 py-1 text-[11px]">
-                            {column.nullable === undefined
-                              ? "-"
-                              : column.nullable
-                                ? "Yes"
-                                : "No"}
-                          </TableCell>
-                          <TableCell className="px-2 py-1">
-                            {isPrimary ? (
-                              <Badge variant="outline" className="h-4 px-1 text-[9px]">
-                                PK
-                              </Badge>
-                            ) : (
-                              "-"
-                            )}
-                          </TableCell>
-                          <TableCell className="px-2 py-1 font-mono text-[11px] text-muted-foreground">
-                            -
-                          </TableCell>
-                          {canEdit ? (
-                            <TableCell className="px-2 py-1">
-                              <div className="flex items-center gap-0.5">
-                                {drop ? (
+                            <span className="truncate font-mono text-[11px] text-muted-foreground">
+                              {column.typeName ?? "-"}
+                            </span>
+                            <span className="text-center text-[11px] text-muted-foreground">
+                              {column.nullable === undefined
+                                ? "-"
+                                : column.nullable
+                                  ? "Yes"
+                                  : "No"}
+                            </span>
+                            <span className="flex justify-center">
+                              {isPrimary ? (
+                                <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                                  PK
+                                </Badge>
+                              ) : (
+                                <span className="text-[11px] text-muted-foreground">-</span>
+                              )}
+                            </span>
+                            <span className="font-mono text-[11px] text-muted-foreground">
+                              -
+                            </span>
+                            <div className="flex justify-end gap-0.5">
+                              {drop ? (
+                                <Button
+                                  size="xs"
+                                  variant="ghost"
+                                  onClick={() => {
+                                    const target = pending.find(
+                                      (change) =>
+                                        change.kind === "drop" &&
+                                        change.column === column.name,
+                                    );
+                                    if (target) {
+                                      discardChange(target.id);
+                                    }
+                                  }}
+                                >
+                                  Undo
+                                </Button>
+                              ) : (
+                                <>
                                   <Button
-                                    size="xs"
+                                    size="icon-xs"
                                     variant="ghost"
-                                    onClick={() => {
-                                      const target = pending.find(
-                                        (change) =>
-                                          change.kind === "drop" &&
-                                          change.column === column.name,
-                                      );
-                                      if (target) {
-                                        discardChange(target.id);
-                                      }
-                                    }}
+                                    aria-label={`Rename ${column.name}`}
+                                    onClick={() =>
+                                      setRenaming({
+                                        from: column.name,
+                                        to: displayName,
+                                      })
+                                    }
                                   >
-                                    Undo
+                                    <PencilIcon />
                                   </Button>
-                                ) : (
-                                  <>
-                                    <Button
-                                      size="xs"
-                                      variant="ghost"
-                                      aria-label={`Rename ${column.name}`}
-                                      onClick={() =>
-                                        setRenaming({
-                                          from: column.name,
-                                          to: displayName,
-                                        })
-                                      }
-                                    >
-                                      <PencilIcon className="size-3" />
-                                    </Button>
-                                    <Button
-                                      size="xs"
-                                      variant="ghost"
-                                      aria-label={`Drop ${column.name}`}
-                                      onClick={() => setDropTarget(column.name)}
-                                    >
-                                      <Trash2Icon className="size-3" />
-                                    </Button>
-                                  </>
-                                )}
-                              </div>
-                            </TableCell>
-                          ) : null}
-                        </TableRow>
+                                  <Button
+                                    size="icon-xs"
+                                    variant="ghost"
+                                    className="text-muted-foreground hover:text-destructive"
+                                    aria-label={`Drop ${column.name}`}
+                                    onClick={() => setDropTarget(column.name)}
+                                  >
+                                    <Trash2Icon />
+                                  </Button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </div>
                       );
                     })}
 
                     {pendingAdds.map((change) => (
-                      <TableRow key={change.id} className="bg-muted/30">
-                        <TableCell className="px-2 py-1">
-                          <span className="flex items-center gap-1 font-mono">
-                            {change.column.name}
+                      <div
+                        key={change.id}
+                        className="border-t border-border/60 bg-emerald-500/5 py-1"
+                      >
+                        <div className={COLUMN_GRID}>
+                          <span className="flex min-w-0 items-center gap-1 font-mono text-[11px]">
+                            <span className="truncate">{change.column.name}</span>
                             <Badge variant="secondary" className="h-4 px-1 text-[9px]">
                               new
                             </Badge>
                           </span>
-                        </TableCell>
-                        <TableCell className="px-2 py-1 text-[11px] text-muted-foreground">
-                          {change.column.typeName}
-                        </TableCell>
-                        <TableCell className="px-2 py-1 text-[11px]">
-                          {change.column.nullable ? "Yes" : "No"}
-                        </TableCell>
-                        <TableCell className="px-2 py-1">
-                          {change.column.primaryKey ? (
-                            <Badge variant="outline" className="h-4 px-1 text-[9px]">
-                              PK
-                            </Badge>
-                          ) : (
-                            "-"
-                          )}
-                        </TableCell>
-                        <TableCell className="px-2 py-1 font-mono text-[11px]">
-                          {change.column.default ?? "-"}
-                        </TableCell>
-                        {canEdit ? (
-                          <TableCell className="px-2 py-1">
+                          <span className="truncate font-mono text-[11px] text-muted-foreground">
+                            {change.column.typeName}
+                          </span>
+                          <span className="text-center text-[11px] text-muted-foreground">
+                            {change.column.nullable ? "Yes" : "No"}
+                          </span>
+                          <span className="flex justify-center">
+                            {change.column.primaryKey ? (
+                              <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                                PK
+                              </Badge>
+                            ) : (
+                              <span className="text-[11px] text-muted-foreground">-</span>
+                            )}
+                          </span>
+                          <span className="truncate font-mono text-[11px] text-muted-foreground">
+                            {change.column.default ?? "-"}
+                          </span>
+                          <div className="flex justify-end">
                             <Button
                               size="xs"
                               variant="ghost"
@@ -712,283 +777,331 @@ export function DefinitionTabView({
                             >
                               Remove
                             </Button>
-                          </TableCell>
-                        ) : null}
-                      </TableRow>
+                          </div>
+                        </div>
+                      </div>
                     ))}
-                  </TableBody>
-                </Table>
-              </div>
-
-              {canEdit ? (
-                <div className="flex flex-col gap-1.5 rounded-md border border-border p-2">
-                  <div className="flex flex-wrap items-end gap-2">
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Name")}
-                      <Input
-                        aria-label="New column name"
-                        value={newName}
-                        spellCheck={false}
-                        className="h-6 w-40 font-mono text-[11px]"
-                        onChange={(event) => {
-                          setNewName(event.target.value);
-                          setAddError(null);
-                        }}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Type")}
-                      <Input
-                        aria-label="New column type"
-                        value={newType}
-                        spellCheck={false}
-                        className="h-6 w-32 font-mono text-[11px]"
-                        onChange={(event) => {
-                          setNewType(event.target.value);
-                          setAddError(null);
-                        }}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Default")}
-                      <Input
-                        aria-label="New column default"
-                        value={newDefault}
-                        spellCheck={false}
-                        placeholder="(none)"
-                        className="h-6 w-36 font-mono text-[11px]"
-                        onChange={(event) => setNewDefault(event.target.value)}
-                      />
-                    </label>
-                    <label className="flex items-center gap-1 pb-1 text-[11px]">
-                      <Checkbox
-                        aria-label="New column nullable"
-                        checked={newNullable}
-                        onCheckedChange={(checked) =>
-                          setNewNullable(checked === true)
-                        }
-                      />
-                      Nullable
-                    </label>
-                    <label className="flex items-center gap-1 pb-1 text-[11px]">
-                      <Checkbox
-                        aria-label="New column primary key"
-                        checked={newPrimary}
-                        onCheckedChange={(checked) =>
-                          setNewPrimary(checked === true)
-                        }
-                      />
-                      Primary key
-                    </label>
-                    <Button
-                      size="xs"
-                      className="mb-0.5"
-                      onClick={handleAddColumn}
-                      data-testid="stage-add-column"
-                    >
-                      <PlusIcon className="size-3" />
-                      Add column
-                    </Button>
                   </div>
-                  {addError ? (
-                    <p role="alert" className="text-[11px] text-destructive">
-                      {addError}
-                    </p>
+
+                  {canEdit ? (
+                    <div className="flex flex-col gap-2 border-t border-border/60 pt-2">
+                      <div className={COLUMN_GRID}>
+                        <Input
+                          aria-label="New column name"
+                          value={newName}
+                          spellCheck={false}
+                          placeholder="column_name"
+                          className={inputClass()}
+                          onChange={(event) => {
+                            setNewName(event.target.value);
+                            setAddError(null);
+                          }}
+                        />
+                        <Select
+                          value={newType}
+                          onValueChange={(value) => {
+                            setNewType(value);
+                            setAddError(null);
+                          }}
+                        >
+                          <SelectTrigger
+                            size="sm"
+                            aria-label="New column type"
+                            className="h-7 w-full font-mono text-[11px]"
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {TYPE_OPTIONS.map((type) => (
+                              <SelectItem key={type} value={type}>
+                                {type}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <span className="flex justify-center">
+                          <Checkbox
+                            aria-label="New column nullable"
+                            checked={newNullable}
+                            onCheckedChange={(checked) =>
+                              setNewNullable(checked === true)
+                            }
+                          />
+                        </span>
+                        <span className="flex justify-center">
+                          <Checkbox
+                            aria-label="New column primary key"
+                            checked={newPrimary}
+                            onCheckedChange={(checked) =>
+                              setNewPrimary(checked === true)
+                            }
+                          />
+                        </span>
+                        <Input
+                          aria-label="New column default"
+                          value={newDefault}
+                          spellCheck={false}
+                          placeholder="(none)"
+                          className={inputClass()}
+                          onChange={(event) => setNewDefault(event.target.value)}
+                        />
+                        <div className="flex justify-end">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={handleAddColumn}
+                            data-testid="stage-add-column"
+                          >
+                            <PlusIcon />
+                            Add
+                          </Button>
+                        </div>
+                      </div>
+                      {addError ? (
+                        <p role="alert" className="text-[11px] text-destructive">
+                          {addError}
+                        </p>
+                      ) : null}
+                      {newPrimary ? (
+                        <p className="text-[10px] text-muted-foreground">
+                          SQLite cannot add a PRIMARY KEY column to an existing
+                          table; applying this will return an unsupported error.
+                        </p>
+                      ) : null}
+                    </div>
                   ) : null}
-                  {newPrimary ? (
-                    <p className="text-[10px] text-muted-foreground">
-                      SQLite cannot add a PRIMARY KEY column to an existing table;
-                      applying this will return an unsupported error.
+                </section>
+
+                <Separator />
+
+                <section className="flex flex-col gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <LinkIcon className="size-3 text-muted-foreground" />
+                    <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Foreign keys
+                    </span>
+                    <span className="text-[10px] text-muted-foreground tabular-nums">
+                      {foreignKeys.length}
+                    </span>
+                  </div>
+
+                  {description?.constraints === undefined ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      Foreign-key inspection is not supported for this object.
                     </p>
-                  ) : null}
-                </div>
-              ) : null}
-
-              <Separator />
-
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-wide uppercase text-muted-foreground">
-                  <LinkIcon className="size-3" />
-                  Foreign keys
-                </div>
-
-                {description?.constraints === undefined ? (
-                  <p className="text-[11px] text-muted-foreground">
-                    Foreign-key inspection is not supported for this object.
-                  </p>
-                ) : foreignKeys.length === 0 ? (
-                  <p className="text-[11px] text-muted-foreground">
-                    No foreign keys.
-                  </p>
-                ) : (
-                  <div className="rounded-md border border-border">
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                            Name
-                          </TableHead>
-                          <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                            Columns
-                          </TableHead>
-                          <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                            References
-                          </TableHead>
-                          {canEdit ? (
-                            <TableHead className="h-7 w-16 px-2 text-[10px] tracking-wide uppercase">
-                              Edit
-                            </TableHead>
-                          ) : null}
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
+                  ) : foreignKeys.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      No foreign keys.
+                    </p>
+                  ) : (
+                    <>
+                      <div
+                        className={cn(
+                          FK_GRID,
+                          "px-1 text-[10px] tracking-wide text-muted-foreground uppercase",
+                        )}
+                      >
+                        <span>Name</span>
+                        <span>Columns</span>
+                        <span>References</span>
+                        <span />
+                      </div>
+                      <div className="flex flex-col">
                         {foreignKeys.map((constraint) => (
-                          <TableRow key={constraint.name}>
-                            <TableCell className="px-2 py-1 font-mono text-[11px]">
+                          <div
+                            key={constraint.name}
+                            className={cn(FK_GRID, "border-t border-border/60 py-1")}
+                          >
+                            <span className="truncate font-mono text-[11px]">
                               {constraint.name}
-                            </TableCell>
-                            <TableCell className="px-2 py-1 font-mono text-[11px]">
+                            </span>
+                            <span className="truncate font-mono text-[11px]">
                               {(constraint.columns ?? []).join(", ") || "-"}
-                            </TableCell>
-                            <TableCell className="px-2 py-1 font-mono text-[11px]">
+                            </span>
+                            <span className="truncate font-mono text-[11px]">
                               {constraint.referencedTable ?? "-"}
                               {constraint.referencedColumns?.length
                                 ? ` (${constraint.referencedColumns.join(", ")})`
                                 : ""}
-                            </TableCell>
-                            {canEdit ? (
-                              <TableCell className="px-2 py-1">
+                            </span>
+                            <div className="flex justify-end">
+                              {canEdit ? (
                                 <Button
-                                  size="xs"
+                                  size="icon-xs"
                                   variant="ghost"
+                                  className="text-muted-foreground hover:text-destructive"
                                   aria-label={`Drop foreign key ${constraint.name}`}
                                   onClick={() =>
                                     void handleDropForeignKey(constraint.name)
                                   }
                                   disabled={fkBusy}
                                 >
-                                  <Trash2Icon className="size-3" />
+                                  <Trash2Icon />
                                 </Button>
-                              </TableCell>
+                              ) : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+
+                  {canEdit ? (
+                    <div className="flex flex-wrap items-end gap-2 border-t border-border/60 pt-2">
+                      <label className="flex flex-col gap-1">
+                        {fieldLabel("Local column")}
+                        <Select
+                          value={fkColumn === "" ? NONE : fkColumn}
+                          onValueChange={(value) =>
+                            setFkColumn(value === NONE ? "" : value)
+                          }
+                          disabled={pending.length > 0}
+                        >
+                          <SelectTrigger
+                            size="sm"
+                            aria-label="Foreign key local column"
+                            className="h-7 w-36 font-mono text-[11px]"
+                          >
+                            <SelectValue placeholder="-" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NONE}>-</SelectItem>
+                            {columns.map((column) => (
+                              <SelectItem key={column.name} value={column.name}>
+                                {column.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        {fieldLabel("References table")}
+                        <Select
+                          value={fkRefTable === "" ? NONE : fkRefTable}
+                          onValueChange={(value) =>
+                            void handleRefTableChange(value === NONE ? "" : value)
+                          }
+                          disabled={pending.length > 0}
+                        >
+                          <SelectTrigger
+                            size="sm"
+                            aria-label="Foreign key referenced table"
+                            className="h-7 w-40 font-mono text-[11px]"
+                          >
+                            <SelectValue placeholder="-" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NONE}>-</SelectItem>
+                            {tableOptions.map((table) => (
+                              <SelectItem key={table.name} value={table.name}>
+                                {table.name}
+                              </SelectItem>
+                            ))}
+                            {fkRefTable &&
+                            !tableOptions.some((table) => table.name === fkRefTable) ? (
+                              <SelectItem value={fkRefTable}>{fkRefTable}</SelectItem>
                             ) : null}
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </div>
-                )}
+                          </SelectContent>
+                        </Select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        {fieldLabel("References column")}
+                        <Select
+                          value={fkRefColumn === "" ? NONE : fkRefColumn}
+                          onValueChange={(value) =>
+                            setFkRefColumn(value === NONE ? "" : value)
+                          }
+                          disabled={pending.length > 0 || refColumnOptions.length === 0}
+                        >
+                          <SelectTrigger
+                            size="sm"
+                            aria-label="Foreign key referenced column"
+                            className="h-7 w-40 font-mono text-[11px]"
+                          >
+                            <SelectValue placeholder="-" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NONE}>-</SelectItem>
+                            {refColumnOptions.map((column) => (
+                              <SelectItem key={column} value={column}>
+                                {column}
+                              </SelectItem>
+                            ))}
+                            {fkRefColumn && !refColumnOptions.includes(fkRefColumn) ? (
+                              <SelectItem value={fkRefColumn}>{fkRefColumn}</SelectItem>
+                            ) : null}
+                          </SelectContent>
+                        </Select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        {fieldLabel("Reference schema")}
+                        <Input
+                          aria-label="Foreign key referenced schema"
+                          value={fkRefSchema}
+                          spellCheck={false}
+                          placeholder="(none)"
+                          className={inputClass("w-28")}
+                          onChange={(event) => setFkRefSchema(event.target.value)}
+                          disabled={pending.length > 0}
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        {fieldLabel("Constraint name")}
+                        <Input
+                          aria-label="Foreign key name"
+                          value={fkName}
+                          spellCheck={false}
+                          placeholder="(generated)"
+                          className={inputClass("w-44")}
+                          onChange={(event) => setFkName(event.target.value)}
+                          disabled={pending.length > 0}
+                        />
+                      </label>
+                      {pending.length > 0 ? (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="mb-0.5">
+                                <Button size="sm" disabled>
+                                  <PlusIcon />
+                                  Add foreign key
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              Apply or discard pending column changes first.
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      ) : (
+                        <Button
+                          size="sm"
+                          className="mb-0.5"
+                          onClick={() => void handleAddForeignKey()}
+                          disabled={fkDisabled}
+                        >
+                          <PlusIcon />
+                          Add foreign key
+                        </Button>
+                      )}
+                    </div>
+                  ) : null}
 
-                {canEdit ? (
-                  <div className="flex flex-wrap items-end gap-2 rounded-md border border-border p-2">
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Local column")}
-                      <select
-                        aria-label="Foreign key local column"
-                        className={selectClass("w-32")}
-                        value={fkColumn}
-                        onChange={(event) => setFkColumn(event.target.value)}
-                        disabled={pending.length > 0}
-                      >
-                        <option value="">-</option>
-                        {columns.map((column) => (
-                          <option key={column.name} value={column.name}>
-                            {column.name}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Reference table")}
-                      <Input
-                        aria-label="Foreign key referenced table"
-                        value={fkRefTable}
-                        spellCheck={false}
-                        className="h-6 w-32 font-mono text-[11px]"
-                        onChange={(event) => setFkRefTable(event.target.value)}
-                        disabled={pending.length > 0}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Reference column")}
-                      <Input
-                        aria-label="Foreign key referenced column"
-                        value={fkRefColumn}
-                        spellCheck={false}
-                        className="h-6 w-32 font-mono text-[11px]"
-                        onChange={(event) => setFkRefColumn(event.target.value)}
-                        disabled={pending.length > 0}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Schema")}
-                      <Input
-                        aria-label="Foreign key referenced schema"
-                        value={fkRefSchema}
-                        spellCheck={false}
-                        placeholder="(none)"
-                        className="h-6 w-24 font-mono text-[11px]"
-                        onChange={(event) => setFkRefSchema(event.target.value)}
-                        disabled={pending.length > 0}
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      {fieldLabel("Name")}
-                      <Input
-                        aria-label="Foreign key name"
-                        value={fkName}
-                        spellCheck={false}
-                        placeholder="(generated)"
-                        className="h-6 w-32 font-mono text-[11px]"
-                        onChange={(event) => setFkName(event.target.value)}
-                        disabled={pending.length > 0}
-                      />
-                    </label>
-                    {pending.length > 0 ? (
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span className="mb-0.5">
-                              <Button size="xs" disabled>
-                                <PlusIcon className="size-3" />
-                                Add foreign key
-                              </Button>
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            Apply or discard pending column changes first.
-                          </TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    ) : (
-                      <Button
-                        size="xs"
-                        className="mb-0.5"
-                        onClick={() => void handleAddForeignKey()}
-                        disabled={fkDisabled}
-                      >
-                        <PlusIcon className="size-3" />
-                        Add foreign key
-                      </Button>
-                    )}
-                  </div>
-                ) : null}
-
-                {fkError ? (
-                  <ErrorBanner
-                    error={fkError}
-                    title="Foreign key change failed"
-                  />
-                ) : null}
+                  {fkNotice ? (
+                    <p role="alert" className="text-[11px] text-destructive">
+                      {fkNotice}
+                    </p>
+                  ) : null}
+                </section>
               </div>
             </div>
-          </div>
           </ResizablePanel>
 
           <ResizableHandle withHandle />
 
           <ResizablePanel defaultSize={32} minSize={15} className="min-h-0">
             <div className="flex h-full flex-col">
-              <div className="flex h-6 shrink-0 items-center justify-between border-b border-border bg-card px-2 text-[10px] tracking-wide uppercase text-muted-foreground">
+              <div className="flex h-7 shrink-0 items-center justify-between border-b border-border px-3 text-[10px] tracking-wide text-muted-foreground uppercase">
                 <span>Generated SQL</span>
                 <span>{pending.length} statement(s)</span>
               </div>

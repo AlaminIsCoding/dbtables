@@ -2,12 +2,14 @@ import { useRef } from "react";
 import { PlugZapIcon, PlayIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { useWorkspace } from "@/app/store";
 import { Button } from "@/components/ui/button";
 import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import { reportError } from "@/lib/notify";
 import { ResultsPanel } from "../results";
 import { SqlEditor, type SqlEditorSelection } from "./SqlEditor";
 import { hasExecutableStatement, resolveRunSql } from "./statement";
@@ -37,6 +39,7 @@ function EditorPanel({
     selectedText: "",
     cursor: 0,
   });
+  const { log } = useWorkspace();
 
   const connected = connectionId !== null;
   const hasStatement = hasExecutableStatement(sql);
@@ -52,12 +55,29 @@ function EditorPanel({
       case "failed":
       case "error":
         toast.error(outcome.error.message);
+        reportError(log, "Query failed", outcome.error);
         return;
       case "outcome_unknown":
         toast.error(outcome.error?.message ?? "The query outcome is unknown.");
+        log(
+          "warning",
+          "Query outcome unknown",
+          outcome.error ? outcome.error.message : undefined,
+        );
         return;
       case "grid":
-      case "partial":
+      case "partial": {
+        const rows = outcome.result.rows?.length ?? 0;
+        log(
+          "success",
+          `${rows} row${rows === 1 ? "" : "s"} returned`,
+          outcome.result.durationMs !== undefined
+            ? `${outcome.result.durationMs} ms`
+            : undefined,
+        );
+        onExecuted(sql);
+        return;
+      }
       case "empty":
       case "statement":
         // A confirmed terminal success is the only path that clears the tab's

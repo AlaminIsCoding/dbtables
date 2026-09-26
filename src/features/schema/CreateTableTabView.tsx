@@ -19,7 +19,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { createOperationId, type QueryError } from "@/domain";
+import { createOperationId } from "@/domain";
+import { reportError } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 import { toQueryError } from "@/services/errors";
 import { describeTable } from "@/services/metadata";
@@ -36,31 +37,11 @@ import {
   type DraftColumn,
   type DraftForeignKey,
 } from "./createTable";
-import { ErrorBanner, SqlPreview } from "./parts";
-
+import { SqlPreview } from "./parts";
+import { NONE, TYPE_OPTIONS } from "./typeOptions";
 export interface CreateTableTabViewProps {
   connectionId: string;
 }
-
-/** Column type choices for the dropdown. */
-const TYPE_OPTIONS = [
-  "INTEGER",
-  "TEXT",
-  "REAL",
-  "BLOB",
-  "NUMERIC",
-  "BOOLEAN",
-  "VARCHAR(255)",
-  "DATE",
-  "DATETIME",
-  "TIMESTAMP",
-  "DECIMAL(10,2)",
-  "JSON",
-  "UUID",
-];
-
-/** Sentinel for a "none" choice, because Radix Select forbids empty values. */
-const NONE = "__none__";
 
 /** Shared column layout so the header and rows stay aligned. */
 const GRID_COLUMNS =
@@ -95,7 +76,7 @@ interface RefTableInfo {
  * the schema refreshed, and the new table opened in place of this tab.
  */
 export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
-  const { activeTabId, closeTab, openTable, refreshSchema, schema } =
+  const { activeTabId, closeTab, openTable, refreshSchema, schema, log } =
     useWorkspace();
 
   const [draft, setDraft] = useState<CreateTableDraft>(() =>
@@ -103,7 +84,6 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
   );
   const [submitted, setSubmitted] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<QueryError | null>(null);
   const [refTables, setRefTables] = useState<Record<string, RefTableInfo>>({});
 
   const validation = useMemo(() => validateCreateTableDraft(draft), [draft]);
@@ -248,10 +228,10 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
     }
     const createTabId = activeTabId;
     setCreating(true);
-    setError(null);
     try {
       await createTable(connectionId, definition);
       toast.success(`Created table ${definition.object.name}`);
+      log("success", `Created table ${definition.object.name}`);
       await refreshSchema();
       openTable(definition.object, "definition");
       if (createTabId) {
@@ -259,8 +239,8 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
       }
     } catch (cause) {
       const normalized = toQueryError(cause);
-      setError(normalized);
       toast.error(normalized.message);
+      reportError(log, `Could not create table ${definition.object.name}`, normalized);
       setCreating(false);
     }
   }, [
@@ -268,6 +248,7 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
     closeTab,
     connectionId,
     draft,
+    log,
     openTable,
     refreshSchema,
   ]);
@@ -288,7 +269,6 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
             onClick={() => {
               setDraft(createEmptyDraft(createOperationId()));
               setSubmitted(false);
-              setError(null);
             }}
             disabled={creating}
           >
@@ -677,10 +657,6 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
                     <li key={message}>{message}</li>
                   ))}
                 </ul>
-              ) : null}
-
-              {error ? (
-                <ErrorBanner error={error} title="Could not create table" />
               ) : null}
             </div>
           </div>

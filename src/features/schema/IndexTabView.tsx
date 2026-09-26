@@ -23,14 +23,7 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { Spinner } from "@/components/ui/spinner";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { Separator } from "@/components/ui/separator";
 import {
   Tooltip,
   TooltipContent,
@@ -41,6 +34,7 @@ import type { IndexInfo, ObjectRef, QueryError, TableDescription } from "@/domai
 import { toQueryError } from "@/services/errors";
 import { describeTable } from "@/services/metadata";
 import { createIndex, dropIndex } from "@/services/schema";
+import { reportError } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 
 import { ErrorBanner, SqlPreview } from "./parts";
@@ -51,15 +45,28 @@ export interface IndexTabViewProps {
   object: ObjectRef;
 }
 
+/** Grid shared by the index header and its rows. */
+const INDEX_GRID =
+  "grid grid-cols-[minmax(10rem,1.4fr)_minmax(9rem,1.2fr)_72px_64px_36px] items-center gap-2";
+
+function fieldLabel(text: string) {
+  return (
+    <span className="text-[10px] tracking-wide text-muted-foreground uppercase">
+      {text}
+    </span>
+  );
+}
+
 /**
  * Index editor for a table or view.
  *
- * Lists inspected indexes (distinguishing "unsupported" from "none"), and
- * creates/drops indexes through the backend. Primary-key indexes cannot be
- * dropped through this adapter.
+ * A flat, borderless layout matching the other schema pages. Lists inspected
+ * indexes (distinguishing "unsupported" from "none"), and creates/drops indexes
+ * through the backend. Primary-key indexes cannot be dropped through this
+ * adapter.
  */
 export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
-  const { refreshSchema } = useWorkspace();
+  const { refreshSchema, log } = useWorkspace();
   const canCreate = object.kind === "table";
 
   const [description, setDescription] = useState<TableDescription | null>(null);
@@ -70,7 +77,6 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
   const [selected, setSelected] = useState<string[]>([]);
   const [unique, setUnique] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<QueryError | null>(null);
   const [busy, setBusy] = useState(false);
   const [dropTarget, setDropTarget] = useState<IndexInfo | null>(null);
 
@@ -95,7 +101,6 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
     setSelected([]);
     setUnique(false);
     setFormError(null);
-    setActionError(null);
     setDropTarget(null);
   }, [connectionId, object.name, object.database, object.schema, object.kind]);
 
@@ -138,10 +143,10 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       return;
     }
     setBusy(true);
-    setActionError(null);
     try {
       await createIndex(connectionId, object, name.trim(), selected, unique);
       toast.success(`Created index ${name.trim()}`);
+      log("success", `Created index ${name.trim()} on ${object.name}`);
       setName("");
       setSelected([]);
       setUnique(false);
@@ -149,7 +154,13 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       await refreshSchema();
       await load();
     } catch (error) {
-      setActionError(toQueryError(error));
+      const normalized = toQueryError(error);
+      toast.error(normalized.message);
+      reportError(
+        log,
+        `Could not create index ${name.trim()} on ${object.name}`,
+        normalized,
+      );
     } finally {
       setBusy(false);
     }
@@ -157,6 +168,7 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
     busy,
     connectionId,
     load,
+    log,
     name,
     object,
     refreshSchema,
@@ -169,18 +181,24 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       return;
     }
     setBusy(true);
-    setActionError(null);
     try {
       await dropIndex(connectionId, object, dropTarget.name);
       toast.success(`Dropped index ${dropTarget.name}`);
+      log("success", `Dropped index ${dropTarget.name} on ${object.name}`);
       await refreshSchema();
       await load();
     } catch (error) {
-      setActionError(toQueryError(error));
+      const normalized = toQueryError(error);
+      toast.error(normalized.message);
+      reportError(
+        log,
+        `Could not drop index ${dropTarget.name} on ${object.name}`,
+        normalized,
+      );
     } finally {
       setBusy(false);
     }
-  }, [busy, connectionId, dropTarget, load, object, refreshSchema]);
+  }, [busy, connectionId, dropTarget, load, log, object, refreshSchema]);
 
   const indexes = description?.indexes;
 
@@ -189,16 +207,18 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       aria-label="Object indexes"
       className="flex min-h-0 flex-1 flex-col bg-background"
     >
-      <header className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-2 text-[11px]">
+      <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-semibold tracking-wide uppercase text-muted-foreground">
+          <span className="shrink-0 font-semibold tracking-wide text-muted-foreground uppercase">
             Indexes
           </span>
-          <span className="truncate font-mono" title={object.name}>
+          <span className="truncate font-mono text-[11px]" title={object.name}>
             {object.name}
           </span>
           {indexes ? (
-            <span className="text-muted-foreground">{indexes.length}</span>
+            <span className="text-[11px] text-muted-foreground tabular-nums">
+              {indexes.length}
+            </span>
           ) : null}
         </div>
         <Button
@@ -226,195 +246,199 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       ) : (
         <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1">
           <ResizablePanel defaultSize={68} minSize={30} className="min-h-0">
-            <div className="h-full overflow-auto p-2">
-              <div className="flex flex-col gap-3">
-              {indexes === undefined ? (
-                <p
-                  role="status"
-                  className="rounded-md border border-dashed border-border px-2 py-3 text-[11px] text-muted-foreground"
-                >
-                  Index inspection is not supported for this object.
-                </p>
-              ) : indexes.length === 0 ? (
-                <p className="rounded-md border border-dashed border-border px-2 py-3 text-[11px] text-muted-foreground">
-                  No indexes.
-                </p>
-              ) : (
-                <div className="rounded-md border border-border">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                          Name
-                        </TableHead>
-                        <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                          Columns
-                        </TableHead>
-                        <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                          Unique
-                        </TableHead>
-                        <TableHead className="h-7 px-2 text-[10px] tracking-wide uppercase">
-                          Primary
-                        </TableHead>
-                        {canCreate ? (
-                          <TableHead className="h-7 w-16 px-2 text-[10px] tracking-wide uppercase">
-                            Edit
-                          </TableHead>
-                        ) : null}
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {indexes.map((index) => (
-                        <TableRow key={index.name}>
-                          <TableCell className="px-2 py-1 font-mono text-[11px]">
-                            {index.name}
-                          </TableCell>
-                          <TableCell className="px-2 py-1 font-mono text-[11px]">
-                            {(index.columns ?? []).join(", ") || "-"}
-                          </TableCell>
-                          <TableCell className="px-2 py-1 text-[11px]">
-                            {index.unique ? "Yes" : "No"}
-                          </TableCell>
-                          <TableCell className="px-2 py-1">
-                            {index.primary ? (
-                              <Badge
-                                variant="outline"
-                                className="h-4 px-1 text-[9px]"
-                              >
-                                <KeyRoundIcon className="size-3" />
-                                PK
-                              </Badge>
-                            ) : (
-                              "-"
-                            )}
-                          </TableCell>
-                          {canCreate ? (
-                            <TableCell className="px-2 py-1">
-                              {index.primary ? (
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="inline-flex">
-                                        <Button
-                                          size="xs"
-                                          variant="ghost"
-                                          disabled
-                                          aria-label={`Drop index ${index.name}`}
-                                        >
-                                          <Trash2Icon className="size-3" />
-                                        </Button>
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent>
-                                      The primary-key index cannot be dropped.
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
-                              ) : (
-                                <Button
-                                  size="xs"
-                                  variant="ghost"
-                                  aria-label={`Drop index ${index.name}`}
-                                  onClick={() => setDropTarget(index)}
-                                  disabled={busy}
-                                >
-                                  <Trash2Icon className="size-3" />
-                                </Button>
-                              )}
-                            </TableCell>
-                          ) : null}
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              )}
+            <div className="h-full overflow-auto p-3">
+              <div className="flex flex-col gap-5">
+                <section className="flex flex-col gap-2">
+                  <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                    Existing indexes
+                  </span>
 
-              {canCreate ? (
-                <div className="flex flex-col gap-1.5 rounded-md border border-border p-2">
-                  <div className="flex flex-wrap items-end gap-2">
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                        Name
-                      </span>
-                      <Input
-                        aria-label="New index name"
-                        value={name}
-                        spellCheck={false}
-                        className="h-6 w-44 font-mono text-[11px]"
-                        onChange={(event) => {
-                          setName(event.target.value);
-                          setFormError(null);
-                        }}
-                      />
-                    </label>
-                    <label className="flex items-center gap-1 pb-1 text-[11px]">
-                      <Checkbox
-                        aria-label="Index is unique"
-                        checked={unique}
-                        onCheckedChange={(checked) => setUnique(checked === true)}
-                      />
-                      Unique
-                    </label>
-                    <Button
-                      size="xs"
-                      className="mb-0.5"
-                      onClick={() => void handleCreate()}
-                      disabled={busy || columns.length === 0}
-                      data-testid="create-index"
+                  {indexes === undefined ? (
+                    <p
+                      role="status"
+                      className="text-[11px] text-muted-foreground"
                     >
-                      <PlusIcon className="size-3" />
-                      Create index
-                    </Button>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                      Columns
-                    </span>
-                    {columns.length === 0 ? (
-                      <span className="text-[11px] text-muted-foreground">-</span>
-                    ) : (
-                      columns.map((column) => (
-                        <label
-                          key={column.name}
-                          className={cn(
-                            "flex items-center gap-1 rounded-sm border border-border px-1.5 py-0.5 font-mono text-[11px]",
-                            selected.includes(column.name) && "bg-muted",
-                          )}
-                        >
-                          <Checkbox
-                            aria-label={`Index column ${column.name}`}
-                            checked={selected.includes(column.name)}
-                            onCheckedChange={() => toggleColumn(column.name)}
-                          />
-                          {column.name}
-                        </label>
-                      ))
-                    )}
-                  </div>
-
-                  {formError ? (
-                    <p role="alert" className="text-[11px] text-destructive">
-                      {formError}
+                      Index inspection is not supported for this object.
                     </p>
-                  ) : null}
+                  ) : indexes.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">
+                      No indexes.
+                    </p>
+                  ) : (
+                    <>
+                      <div
+                        className={cn(
+                          INDEX_GRID,
+                          "px-1 text-[10px] tracking-wide text-muted-foreground uppercase",
+                        )}
+                      >
+                        <span>Name</span>
+                        <span>Columns</span>
+                        <span className="text-center">Unique</span>
+                        <span className="text-center">Primary</span>
+                        <span />
+                      </div>
+                      <div className="flex flex-col">
+                        {indexes.map((index) => (
+                          <div
+                            key={index.name}
+                            className={cn(INDEX_GRID, "border-t border-border/60 py-1")}
+                          >
+                            <span className="truncate font-mono text-[11px]">
+                              {index.name}
+                            </span>
+                            <span className="truncate font-mono text-[11px] text-muted-foreground">
+                              {(index.columns ?? []).join(", ") || "-"}
+                            </span>
+                            <span className="text-center text-[11px] text-muted-foreground">
+                              {index.unique ? "Yes" : "No"}
+                            </span>
+                            <span className="flex justify-center">
+                              {index.primary ? (
+                                <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                                  <KeyRoundIcon className="size-3" />
+                                  PK
+                                </Badge>
+                              ) : (
+                                <span className="text-[11px] text-muted-foreground">-</span>
+                              )}
+                            </span>
+                            <div className="flex justify-end">
+                              {canCreate ? (
+                                index.primary ? (
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <span className="inline-flex">
+                                          <Button
+                                            size="icon-xs"
+                                            variant="ghost"
+                                            disabled
+                                            aria-label={`Drop index ${index.name}`}
+                                          >
+                                            <Trash2Icon />
+                                          </Button>
+                                        </span>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        The primary-key index cannot be dropped.
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                ) : (
+                                  <Button
+                                    size="icon-xs"
+                                    variant="ghost"
+                                    className="text-muted-foreground hover:text-destructive"
+                                    aria-label={`Drop index ${index.name}`}
+                                    onClick={() => setDropTarget(index)}
+                                    disabled={busy}
+                                  >
+                                    <Trash2Icon />
+                                  </Button>
+                                )
+                              ) : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </section>
 
-                  {actionError ? (
-                    <ErrorBanner error={actionError} title="Index operation failed" />
-                  ) : null}
-                </div>
-              ) : null}
+                {canCreate ? (
+                  <>
+                    <Separator />
+
+                    <section className="flex flex-col gap-2">
+                      <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                        New index
+                      </span>
+
+                      <div className="flex flex-wrap items-end gap-2">
+                        <label className="flex flex-col gap-1">
+                          {fieldLabel("Name")}
+                          <Input
+                            aria-label="New index name"
+                            value={name}
+                            spellCheck={false}
+                            placeholder="idx_table_column"
+                            className="h-7 w-56 rounded-sm px-1.5 font-mono text-[11px] focus-visible:ring-1"
+                            onChange={(event) => {
+                              setName(event.target.value);
+                              setFormError(null);
+                            }}
+                          />
+                        </label>
+                        <label className="flex items-center gap-2 pb-2 text-[11px]">
+                          <Checkbox
+                            aria-label="Index is unique"
+                            checked={unique}
+                            onCheckedChange={(checked) => setUnique(checked === true)}
+                          />
+                          Unique
+                        </label>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {fieldLabel("Columns")}
+                        {columns.length === 0 ? (
+                          <span className="text-[11px] text-muted-foreground">-</span>
+                        ) : (
+                          columns.map((column) => {
+                            const isSelected = selected.includes(column.name);
+                            return (
+                              <label
+                                key={column.name}
+                                className={cn(
+                                  "flex cursor-pointer items-center gap-1 rounded-sm px-1.5 py-0.5 font-mono text-[11px] transition-colors",
+                                  isSelected
+                                    ? "bg-primary/15 text-foreground"
+                                    : "bg-muted text-muted-foreground hover:bg-accent",
+                                )}
+                              >
+                                <Checkbox
+                                  aria-label={`Index column ${column.name}`}
+                                  checked={isSelected}
+                                  onCheckedChange={() => toggleColumn(column.name)}
+                                />
+                                {column.name}
+                              </label>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      <div>
+                        <Button
+                          size="sm"
+                          onClick={() => void handleCreate()}
+                          disabled={busy || columns.length === 0}
+                          data-testid="create-index"
+                        >
+                          <PlusIcon />
+                          Create index
+                        </Button>
+                      </div>
+
+                      {formError ? (
+                        <p role="alert" className="text-[11px] text-destructive">
+                          {formError}
+                        </p>
+                      ) : null}
+                    </section>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
           </ResizablePanel>
 
           <ResizableHandle withHandle />
 
           <ResizablePanel defaultSize={32} minSize={15} className="min-h-0">
             <div className="flex h-full flex-col">
-              <div className="flex h-6 shrink-0 items-center justify-between border-b border-border bg-card px-2 text-[10px] tracking-wide uppercase text-muted-foreground">
-                <span>Generated SQL</span>
+              <div className="flex h-7 shrink-0 items-center border-b border-border px-3 text-[10px] tracking-wide text-muted-foreground uppercase">
+                Generated SQL
               </div>
               <SqlPreview
                 statements={indexPreview}

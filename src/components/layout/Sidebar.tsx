@@ -22,7 +22,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Button } from "@/components/ui/button";import {
+import { Button } from "@/components/ui/button";
+import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
@@ -40,6 +41,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ObjectRef } from "@/domain";
+import { reportError } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 import { qualifiedObjectName } from "@/lib/workspace/tabs";
 import { toQueryError } from "@/services/errors";
@@ -60,7 +62,6 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
     refreshSchema,
     openTable,
     openQuery,
-    openCreateTable,
     closeTabsForObject,
     log,
   } = useWorkspace();
@@ -108,7 +109,13 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
       setPendingDrop(null);
       await refreshSchema();
     } catch (error) {
-      toast.error(toQueryError(error).message);
+      const normalized = toQueryError(error);
+      toast.error(normalized.message);
+      reportError(
+        log,
+        `Could not drop table ${qualifiedObjectName(pendingDrop)}`,
+        normalized,
+      );
     } finally {
       setDropping(false);
     }
@@ -146,28 +153,11 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
           </TooltipTrigger>
           <TooltipContent>Refresh schema</TooltipContent>
         </Tooltip>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon-xs" aria-label="Create">
-              <PlusIcon />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-44">
-            <DropdownMenuItem onSelect={() => openCreateTable()}>
-              <TableIcon />
-              New table
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => openQuery()}>
-              <TerminalIcon />
-              New SQL query
-            </DropdownMenuItem>
-            <DropdownMenuItem disabled>
-              <EyeIcon />
-              New view
-              <DropdownMenuShortcut>soon</DropdownMenuShortcut>
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <CreateMenu>
+          <Button variant="ghost" size="icon-xs" aria-label="Create">
+            <PlusIcon />
+          </Button>
+        </CreateMenu>
       </div>
 
       <div className="shrink-0 px-2 pb-2">
@@ -236,6 +226,15 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
           </div>
         )}
       </ScrollArea>
+
+      <div className="flex shrink-0 justify-center p-2">
+        <CreateMenu align="start">
+          <Button variant="outline" size="sm" className="justify-center">
+            <PlusIcon />
+            Add
+          </Button>
+        </CreateMenu>
+      </div>
 
       <AlertDialog
         open={pendingDrop !== null}
@@ -380,5 +379,36 @@ function SchemaItem({
         ) : null}
       </ContextMenuContent>
     </ContextMenu>
+  );
+}
+
+/** Shared "create" dropdown, used by the header and the footer Add button. */
+function CreateMenu({
+  children,
+  align = "end",
+}: {
+  children: React.ReactNode;
+  align?: "start" | "center" | "end";
+}) {
+  const { openCreateTable, openQuery } = useWorkspace();
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
+      <DropdownMenuContent align={align} className="w-44">
+        <DropdownMenuItem onSelect={() => openCreateTable()}>
+          <TableIcon />
+          New table
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => openQuery()}>
+          <TerminalIcon />
+          New SQL query
+        </DropdownMenuItem>
+        <DropdownMenuItem disabled>
+          <EyeIcon />
+          New view
+          <DropdownMenuShortcut>soon</DropdownMenuShortcut>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }

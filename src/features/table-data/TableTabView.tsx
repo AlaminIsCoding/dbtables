@@ -69,6 +69,7 @@ import type {
 } from "@/domain";
 import { cellValueToCopyString } from "@/features/results/cellValue";
 import { copyTextToClipboard } from "@/features/results/clipboard";
+import { reportError } from "@/lib/notify";
 import { describeTable } from "@/services/metadata";
 import type { ChangeGroupResult } from "@/services/tableData";
 
@@ -342,7 +343,13 @@ export function TableTabView({
   useEffect(() => {
     if (staged.applyError) {
       toast.error(staged.applyError.message);
+      reportError(
+        log,
+        `Could not apply changes to ${qualifiedObjectName(object)}`,
+        staged.applyError,
+      );
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [staged.applyError]);
 
   useEffect(() => {
@@ -1069,32 +1076,6 @@ export function TableTabView({
                     {filterNotice}
                   </p>
                 ) : null}
-              </section>
-
-              <Separator />
-
-              <section className="flex flex-col gap-2">
-                <Label className="text-[10px] tracking-wide uppercase">
-                  Row states
-                </Label>
-                <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
-                  <span className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-1 rounded-full bg-emerald-500" />
-                    New row (add values, then Apply)
-                  </span>
-                  <span className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-1 rounded-full bg-primary" />
-                    Edited row
-                  </span>
-                  <span className="flex items-center gap-2">
-                    <span className="inline-block h-3 w-1 rounded-full bg-destructive" />
-                    Staged for delete
-                  </span>
-                  <span className="flex items-center gap-2">
-                    <span className="inline-block size-3 rounded-sm bg-secondary ring-1 ring-border" />
-                    Selected row (clears when you click away)
-                  </span>
-                </div>
               </section>
 
               {staged.staged.length > 0 || staged.applyError || staged.lastGroup ? (
