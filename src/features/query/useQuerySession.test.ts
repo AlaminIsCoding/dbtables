@@ -133,11 +133,8 @@ describe("useQuerySession", () => {
     await openConnected(result);
     executeMock.mockResolvedValue(gridResult());
 
-    act(() => {
-      result.current.setSql("SELECT id FROM users");
-    });
     await act(async () => {
-      await result.current.runQuery();
+      await result.current.runQuery("SELECT id FROM users");
     });
 
     expect(executeMock).toHaveBeenCalledTimes(1);
@@ -156,11 +153,8 @@ describe("useQuerySession", () => {
       message: "connection is not open",
     });
 
-    act(() => {
-      result.current.setSql("SELECT 1");
-    });
     await act(async () => {
-      await result.current.runQuery();
+      await result.current.runQuery("SELECT 1");
     });
 
     expect(result.current.outcome).toEqual({
@@ -173,11 +167,8 @@ describe("useQuerySession", () => {
     const { result } = renderHook(() => useQuerySession());
     await openConnected(result);
 
-    act(() => {
-      result.current.setSql("   ");
-    });
     await act(async () => {
-      await result.current.runQuery();
+      await result.current.runQuery("   ");
     });
 
     expect(executeMock).not.toHaveBeenCalled();
@@ -196,18 +187,15 @@ describe("useQuerySession", () => {
         }),
     );
 
-    act(() => {
-      result.current.setSql("SELECT 1");
-    });
     await act(async () => {
-      void result.current.runQuery();
+      void result.current.runQuery("SELECT 1");
     });
 
     expect(result.current.outcome.kind).toBe("running");
     expect(result.current.isRunning).toBe(true);
 
     await act(async () => {
-      await result.current.runQuery();
+      await result.current.runQuery("SELECT 1");
     });
     expect(executeMock).toHaveBeenCalledTimes(1);
 

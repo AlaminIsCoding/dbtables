@@ -6,6 +6,7 @@ import { cn } from "../../components/ui/cn";
 import type { ObjectRef } from "../../domain";
 import { ResultsPanel } from "../results";
 import { selectStatementFor } from "./objectStatement";
+import { SqlEditor } from "./SqlEditor";
 import {
   useQuerySession,
   type ConnectionStatus,
@@ -16,6 +17,14 @@ import {
 export interface QueryWorkspaceProps {
   /** Query-tab label, shown in the editor header. */
   label: string;
+  /** Controlled SQL text for this tab. */
+  sql: string;
+  /** Replaces this tab's SQL text. */
+  onSqlChange: (sql: string) => void;
+  /** Whether this tab has edits that have not been executed. */
+  dirty?: boolean;
+  /** Called with the executed text when a run is started. */
+  onExecuted?: (sql: string) => void;
   className?: string;
 }
 
@@ -88,19 +97,45 @@ function ObjectList({
   );
 }
 
-function EditorPane({ session, label }: { session: QuerySession; label: string }) {
+function EditorPane({
+  session,
+  label,
+  sql,
+  onSqlChange,
+  dirty,
+  onExecuted,
+}: {
+  session: QuerySession;
+  label: string;
+  sql: string;
+  onSqlChange: (sql: string) => void;
+  dirty: boolean;
+  onExecuted?: (sql: string) => void;
+}) {
   const [filePath, setFilePath] = useState("");
   const baseId = useId();
   const filePathId = `${baseId}-file-path`;
-  const sqlId = `${baseId}-sql`;
   const { connection } = session;
   const connected = connection.status === "connected";
+  const canRun = session.canRun && sql.trim().length > 0;
+
+  function run() {
+    if (!canRun) {
+      return;
+    }
+    onExecuted?.(sql);
+    void session.runQuery(sql);
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex h-7 shrink-0 items-center justify-between border-b border-border px-2 text-[11px] text-muted-foreground">
         <span>SQL editor · {label}</span>
-        <span>Read-only</span>
+        {dirty ? (
+          <span role="status" aria-live="polite" className="text-foreground">
+            Unsaved changes
+          </span>
+        ) : null}
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-auto p-2">
@@ -168,36 +203,25 @@ function EditorPane({ session, label }: { session: QuerySession; label: string }
             <ObjectList
               state={connected ? connection.objects : EMPTY_OBJECTS}
               disabled={!connected}
-              onPick={(object) => session.setSql(selectStatementFor(object))}
+              onPick={(object) => onSqlChange(selectStatementFor(object))}
             />
           </div>
         </div>
 
-        <label htmlFor={sqlId} className="text-[11px] font-medium">
-          SQL
-        </label>
-        <textarea
-          id={sqlId}
-          aria-label="SQL editor"
-          value={session.sql}
-          onChange={(event) => session.setSql(event.target.value)}
-          rows={6}
-          spellCheck={false}
-          placeholder="SELECT * FROM table_name;"
-          className="min-h-24 w-full resize-y rounded-md border border-input bg-background p-2 font-mono text-xs leading-5 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-        />
+        <span className="text-[11px] font-medium">SQL</span>
+        <SqlEditor value={sql} onChange={onSqlChange} onRun={run} />
 
         <div className="flex items-center justify-between gap-2">
           <Button
-            onClick={() => {
-              void session.runQuery();
-            }}
-            disabled={!session.canRun}
+            onClick={run}
+            disabled={!canRun}
+            aria-keyshortcuts="Control+Enter Meta+Enter"
+            title="Run (Ctrl/Cmd+Enter)"
           >
             {session.isRunning ? "Running…" : "Run"}
           </Button>
           <span className="text-[11px] text-muted-foreground">
-            Results are capped for responsiveness.
+            {dirty ? "Unsaved changes" : "Current SQL"} · Ctrl/Cmd+Enter to run
           </span>
         </div>
       </div>
@@ -206,16 +230,35 @@ function EditorPane({ session, label }: { session: QuerySession; label: string }
 }
 
 /**
- * Query tab workspace: SQLite connection controls, object list, SQL editor, and
- * the results pane, all driven by {@link useQuerySession}.
+ * Query tab workspace: SQLite connection controls, object list, the CodeMirror
+ * SQL editor, and the results pane.
+ *
+ * Editor text arrives as a controlled prop from the tab strip; connection and
+ * query execution state stay in {@link useQuerySession}.
  */
-export function QueryWorkspace({ label, className }: QueryWorkspaceProps) {
+export function QueryWorkspace({
+  label,
+  sql,
+  onSqlChange,
+  dirty = false,
+  onExecuted,
+  className,
+}: QueryWorkspaceProps) {
   const session = useQuerySession();
 
   return (
     <SplitPane
       className={className}
-      start={<EditorPane session={session} label={label} />}
+      start={
+        <EditorPane
+          session={session}
+          label={label}
+          sql={sql}
+          onSqlChange={onSqlChange}
+          dirty={dirty}
+          onExecuted={onExecuted}
+        />
+      }
       end={<ResultsPanel outcome={session.outcome} />}
       startLabel="Editor"
       endLabel="Results"

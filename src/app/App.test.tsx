@@ -73,7 +73,8 @@ describe("App workspace shell", () => {
     expect(
       screen.getByRole("tab", { name: "Query 1" }).getAttribute("aria-selected"),
     ).toBe("true");
-    expect(screen.getByRole("tab", { name: "Query 2" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "New query tab" })).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Query 2" })).toBeNull();
     expect(screen.getByText("SQL editor · Query 1")).toBeTruthy();
     expect(screen.getByText("No results yet")).toBeTruthy();
     expect(
@@ -82,11 +83,12 @@ describe("App workspace shell", () => {
     expect(screen.getByRole("contentinfo")).toBeTruthy();
   });
 
-  it("switches the query workspace when a query tab is selected", () => {
+  it("opens and switches query tabs", () => {
     render(<App />);
 
     expect(screen.getByText("SQL editor · Query 1")).toBeTruthy();
 
+    fireEvent.click(screen.getByRole("button", { name: "New query tab" }));
     fireEvent.click(screen.getByRole("tab", { name: "Query 2" }));
 
     expect(screen.getByText("SQL editor · Query 2")).toBeTruthy();

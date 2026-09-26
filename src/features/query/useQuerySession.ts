@@ -47,33 +47,32 @@ export interface QuerySession {
   connection: ConnectionStatus;
   /** Current query outcome rendered by the results pane. */
   outcome: QueryOutcome;
-  /** SQL text the user is editing. */
-  sql: string;
   /** Whether a query is currently executing. */
   isRunning: boolean;
   /** Whether a query can be started right now. */
   canRun: boolean;
-  setSql: (sql: string) => void;
   openDatabase: (filePath: string) => Promise<void>;
   disconnectDatabase: () => Promise<void>;
   refreshObjects: () => Promise<void>;
-  runQuery: () => Promise<void>;
+  /** Executes the supplied statement and records the outcome. */
+  runQuery: (statement: string) => Promise<void>;
 }
 
 /**
- * Owns connection and query state for one workspace tab.
+ * Owns connection and query *execution* state for one workspace tab.
  *
- * All database work goes through the typed service facade, so the component
- * tree never touches Tauri commands directly. Query execution is awaited
- * asynchronously; React updates to `running` before the call so the editor and
- * connection controls stay interactive while the backend works.
+ * Editor text and tab state belong to {@link useQueryTabs}; this hook is only
+ * told which statement to run. All database work goes through the typed service
+ * facade, so the component tree never touches Tauri commands directly. Query
+ * execution is awaited asynchronously; React updates to `running` before the
+ * call so the editor and connection controls stay interactive while the backend
+ * works.
  */
 export function useQuerySession(): QuerySession {
   const [connection, setConnection] = useState<ConnectionStatus>({
     status: "disconnected",
   });
   const [outcome, setOutcome] = useState<QueryOutcome>(idleOutcome);
-  const [sql, setSql] = useState("");
   const [isRunning, setIsRunning] = useState(false);
 
   const connectionIdRef = useRef<string | null>(null);
@@ -171,14 +170,14 @@ export function useQuerySession(): QuerySession {
     await loadObjects(connectionId);
   }, [loadObjects]);
 
-  const runQuery = useCallback(async () => {
+  const runQuery = useCallback(async (statement: string) => {
     const connectionId = connectionIdRef.current;
     if (!connectionId || runningRef.current) {
       return;
     }
 
-    const statement = sql.trim();
-    if (statement.length === 0) {
+    const trimmed = statement.trim();
+    if (trimmed.length === 0) {
       setOutcome(commandErrorOutcome(EMPTY_SQL_ERROR));
       return;
     }
@@ -190,7 +189,7 @@ export function useQuerySession(): QuerySession {
     try {
       const result = await executeQuery(connectionId, {
         operationId: createOperationId(),
-        sql: statement,
+        sql: trimmed,
       });
       setOutcome(resultOutcome(result));
     } catch (error) {
@@ -199,15 +198,13 @@ export function useQuerySession(): QuerySession {
       runningRef.current = false;
       setIsRunning(false);
     }
-  }, [sql]);
+  }, []);
 
   return {
     connection,
     outcome,
-    sql,
     isRunning,
     canRun: connection.status === "connected" && !isRunning,
-    setSql,
     openDatabase,
     disconnectDatabase,
     refreshObjects,

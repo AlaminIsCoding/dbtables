@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -43,6 +44,35 @@ function gridResult(): QueryResult {
   };
 }
 
+/** Wraps the workspace with the controlled editor state the tab strip owns. */
+function Harness({
+  label = "Query 1",
+  initialSql = "",
+}: {
+  label?: string;
+  initialSql?: string;
+}) {
+  const [sql, setSql] = useState(initialSql);
+  const [dirty, setDirty] = useState(initialSql.length > 0);
+
+  return (
+    <QueryWorkspace
+      label={label}
+      sql={sql}
+      dirty={dirty}
+      onSqlChange={(next) => {
+        setSql(next);
+        setDirty(true);
+      }}
+      onExecuted={() => setDirty(false)}
+    />
+  );
+}
+
+function editorText(): string {
+  return screen.getByTestId("sql-editor").textContent ?? "";
+}
+
 async function openDatabase() {
   connectMock.mockResolvedValue("sqlite-1");
   listObjectsMock.mockResolvedValue([{ name: "users", kind: "table" }]);
@@ -63,11 +93,12 @@ describe("QueryWorkspace", () => {
   });
 
   it("renders connection controls with Run disabled before connecting", () => {
-    render(<QueryWorkspace label="Query 1" />);
+    render(<Harness />);
 
     expect(screen.getByText("SQL editor · Query 1")).toBeTruthy();
     expect(screen.getByText("Not connected")).toBeTruthy();
     expect(screen.getByLabelText("SQLite file")).toBeTruthy();
+    expect(screen.getByLabelText("SQL editor")).toBeTruthy();
     expect(
       (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement).disabled,
     ).toBe(true);
@@ -75,27 +106,22 @@ describe("QueryWorkspace", () => {
   });
 
   it("lists objects and loads a selected object into the editor", async () => {
-    render(<QueryWorkspace label="Query 1" />);
+    render(<Harness />);
     await openDatabase();
 
     fireEvent.click(screen.getByRole("button", { name: /users/i }));
 
-    expect(
-      (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
-    ).toBe('SELECT * FROM "users";');
+    expect(editorText()).toContain('SELECT * FROM "users";');
     expect(
       (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement).disabled,
     ).toBe(false);
   });
 
   it("runs the editor SQL and forwards the outcome to the results pane", async () => {
-    render(<QueryWorkspace label="Query 1" />);
+    render(<Harness initialSql="SELECT id FROM users" />);
     await openDatabase();
     executeMock.mockResolvedValue(gridResult());
 
-    fireEvent.change(screen.getByLabelText("SQL editor"), {
-      target: { value: "SELECT id FROM users" },
-    });
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     await act(async () => {
@@ -107,8 +133,24 @@ describe("QueryWorkspace", () => {
     expect(screen.getByTestId("results-panel").textContent).toBe("grid");
   });
 
+  it("clears the unsaved marker when the tab's SQL is executed", async () => {
+    render(<Harness initialSql="SELECT 1" />);
+    await openDatabase();
+    executeMock.mockResolvedValue(gridResult());
+
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+  });
+
   it("keeps the workspace usable while a slow query runs", async () => {
-    render(<QueryWorkspace label="Query 1" />);
+    render(<Harness initialSql="SELECT pg_sleep(10)" />);
     await openDatabase();
 
     let resolveQuery: ((value: QueryResult) => void) | undefined;
@@ -119,9 +161,6 @@ describe("QueryWorkspace", () => {
         }),
     );
 
-    fireEvent.change(screen.getByLabelText("SQL editor"), {
-      target: { value: "SELECT pg_sleep(10)" },
-    });
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     expect(screen.getByTestId("results-panel").textContent).toBe("running");
