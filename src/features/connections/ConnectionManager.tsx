@@ -14,9 +14,19 @@ import {
   validateDraft,
   type ProfileDraft,
 } from "./profileDraft";
-import { useConnectionManager, type ActiveConnection } from "./useConnectionManager";
+import {
+  useConnectionManager,
+  type ActiveConnection,
+  type ConnectionManagerController,
+} from "./useConnectionManager";
 
 export interface ConnectionManagerProps {
+  /**
+   * Shared controller. Supplying one lets a parent (for example the sidebar)
+   * drive the connection lifecycle for more than one child; when omitted the
+   * manager creates and owns its own controller.
+   */
+  controller?: ConnectionManagerController;
   className?: string;
 }
 
@@ -75,15 +85,13 @@ function ActiveTarget({
   );
 }
 
-/**
- * Connection manager: saved-profile list, create/edit form, and connection
- * lifecycle controls with an active-target indicator.
- *
- * The single active connection is replaced when another profile is connected or
- * removed, and every backend call goes through {@link useConnectionManager}.
- */
-export function ConnectionManager({ className }: ConnectionManagerProps) {
-  const controller = useConnectionManager();
+function ConnectionManagerView({
+  controller,
+  className,
+}: {
+  controller: ConnectionManagerController;
+  className?: string;
+}) {
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [formError, setFormError] = useState<QueryError | null>(null);
 
@@ -260,4 +268,31 @@ export function ConnectionManager({ className }: ConnectionManagerProps) {
       </div>
     </section>
   );
+}
+
+/** Connection manager that owns its own controller lifecycle. */
+function OwnedConnectionManager({ className }: { className?: string }) {
+  const controller = useConnectionManager();
+  return <ConnectionManagerView controller={controller} className={className} />;
+}
+
+/**
+ * Connection manager: saved-profile list, create/edit form, and connection
+ * lifecycle controls with an active-target indicator.
+ *
+ * The single active connection is replaced when another profile is connected or
+ * removed, and every backend call goes through the shared controller. When no
+ * controller is supplied, this component creates and owns one.
+ */
+export function ConnectionManager({
+  controller,
+  className,
+}: ConnectionManagerProps) {
+  if (controller) {
+    return (
+      <ConnectionManagerView controller={controller} className={className} />
+    );
+  }
+
+  return <OwnedConnectionManager className={className} />;
 }

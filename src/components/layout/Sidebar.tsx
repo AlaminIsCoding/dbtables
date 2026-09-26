@@ -1,12 +1,24 @@
-import { ConnectionManager } from "../../features/connections";
+import {
+  ConnectionManager,
+  useConnectionManager,
+} from "../../features/connections";
+import { ExplorerPanel, toExplorerTarget } from "../../features/explorer";
 import { cn } from "../ui/cn";
 
 export interface SidebarProps {
   className?: string;
 }
 
-/** Explorer/connections sidebar for the desktop workspace. */
+/**
+ * Explorer/connections sidebar for the desktop workspace.
+ *
+ * The sidebar owns the single active connection and shares it with both the
+ * connection manager and the explorer, so switching connections scopes the
+ * explorer to the new target and never leaves stale objects visible.
+ */
 export function Sidebar({ className }: SidebarProps) {
+  const connections = useConnectionManager();
+
   return (
     <aside
       aria-label="Workspace navigation"
@@ -15,16 +27,8 @@ export function Sidebar({ className }: SidebarProps) {
         className,
       )}
     >
-      <ConnectionManager />
-
-      <h2 className="flex h-8 items-center border-t border-sidebar-border px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-        Explorer
-      </h2>
-      <div className="flex-1 overflow-auto px-3 py-2">
-        <p className="text-xs text-muted-foreground">
-          Connect to a database to browse schemas, tables, and views.
-        </p>
-      </div>
+      <ConnectionManager controller={connections} />
+      <ExplorerPanel target={toExplorerTarget(connections.active)} />
     </aside>
   );
 }

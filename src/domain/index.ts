@@ -156,6 +156,102 @@ export interface ColumnInfo {
   nullable?: boolean;
 }
 
+/**
+ * Database/catalog and schema scope to list objects in.
+ *
+ * Both fields are optional; an absent field means "the connection's default
+ * scope" or "all scopes", depending on the engine's capability. SQLite exposes
+ * neither, MySQL exposes databases/catalogs, and PostgreSQL exposes schemas.
+ */
+export interface ObjectScope {
+  /** Database/catalog to list, when applicable. */
+  database?: string;
+  /** Schema to list, when applicable. */
+  schema?: string;
+}
+
+/**
+ * Database/catalog and schema names a connection can address.
+ *
+ * An engine that exposes neither reports this as an `unsupported` error rather
+ * than an empty listing, so the UI can hide a scope picker instead of guessing.
+ * When present, empty vectors mean "this engine has no such namespace", not
+ * "none exist".
+ */
+export interface ScopeListing {
+  /** Database/catalog names, when the engine exposes separate catalogs. */
+  databases?: string[];
+  /** Schema names, when the engine exposes named schemas. */
+  schemas?: string[];
+}
+
+/** Kind of table constraint reported by metadata inspection. */
+export type ConstraintKind =
+  | "primary_key"
+  | "foreign_key"
+  | "unique"
+  | "check";
+
+/**
+ * Normalized description of a table index.
+ *
+ * `columns` is in index order. Expression indexes keep their ordinal position
+ * with adapter placeholder text, so the list length reflects the width.
+ */
+export interface IndexInfo {
+  /** Index name as reported by the engine. */
+  name: string;
+  /** Indexed columns in order. */
+  columns?: string[];
+  /** Whether the index enforces uniqueness. */
+  unique: boolean;
+  /** Whether the index backs the primary key. */
+  primary: boolean;
+}
+
+/**
+ * Normalized description of a table constraint.
+ *
+ * A foreign key carries its referenced target so the UI can show a relationship
+ * without a second engine call. `definition` carries engine text for check
+ * constraints when the engine reports it.
+ */
+export interface ConstraintInfo {
+  /** Constraint name, or a deterministic adapter-generated label. */
+  name: string;
+  /** Kind of constraint. */
+  kind: ConstraintKind;
+  /** Constrained columns in order. */
+  columns?: string[];
+  /** For a foreign key: referenced schema, when the engine reports one. */
+  referencedSchema?: string;
+  /** For a foreign key: referenced table. */
+  referencedTable?: string;
+  /** For a foreign key: referenced columns, in the same order as `columns`. */
+  referencedColumns?: string[];
+  /** Engine text for a check constraint, when available. */
+  definition?: string;
+}
+
+/**
+ * Normalized description of a table or view.
+ *
+ * `indexes` and `constraints` distinguish "not supported" from "none exist":
+ * `undefined` means the adapter does not expose that metadata for the object,
+ * while `[]` means it was inspected and the engine reported none. A UI must
+ * never render an unsupported category as an empty success.
+ */
+export interface TableDescription {
+  /** Column metadata in ordinal order. */
+  columns: ColumnInfo[];
+  /** Column names that make up the primary key; empty when unknown or absent. */
+  primaryKeyColumns?: string[];
+  /** Indexes when the adapter can report them; absent when unsupported. */
+  indexes?: IndexInfo[];
+  /** Constraints when the adapter can report them; absent when unsupported. */
+  constraints?: ConstraintInfo[];
+}
+
 /** Normalized category for a database or application error. */
 export type ErrorCategory =
   | "connection"
