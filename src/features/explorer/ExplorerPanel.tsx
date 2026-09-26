@@ -1,4 +1,5 @@
 import { cn } from "../../components/ui/cn";
+import type { ObjectRef } from "../../domain";
 import { ExplorerTree } from "./ExplorerTree";
 import { ObjectDetail } from "./ObjectDetail";
 import type { ExplorerTarget } from "./target";
@@ -7,6 +8,8 @@ import { useExplorer } from "./useExplorer";
 export interface ExplorerPanelProps {
   /** Active connection the explorer is scoped to. */
   target: ExplorerTarget;
+  /** Opens the read-only table data browser for a selected object. */
+  onBrowseTable?: (object: ObjectRef) => void;
   className?: string;
 }
 
@@ -17,7 +20,11 @@ export interface ExplorerPanelProps {
  * connection when the target changes so stale metadata is never shown under a
  * new connection.
  */
-export function ExplorerPanel({ target, className }: ExplorerPanelProps) {
+export function ExplorerPanel({
+  target,
+  onBrowseTable,
+  className,
+}: ExplorerPanelProps) {
   const controller = useExplorer(target);
 
   return (
@@ -26,6 +33,7 @@ export function ExplorerPanel({ target, className }: ExplorerPanelProps) {
       <ObjectDetail
         object={controller.selected}
         state={controller.detail}
+        onBrowseTable={onBrowseTable}
         className="max-h-72 shrink-0 overflow-auto"
       />
     </div>

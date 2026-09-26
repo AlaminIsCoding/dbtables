@@ -312,6 +312,95 @@ export interface QueryResult {
   error?: QueryError;
 }
 
+/** Comparison used by a {@link TableFilter}. */
+export type FilterOperator =
+  | "equal"
+  | "not_equal"
+  | "less_than"
+  | "less_than_or_equal"
+  | "greater_than"
+  | "greater_than_or_equal"
+  | "like"
+  | "in"
+  | "is_null"
+  | "is_not_null";
+
+/**
+ * A single table filter: an identifier column plus bound comparison values.
+ *
+ * `column` is an identifier the backend validates against table metadata and
+ * quotes with engine-specific rules; it is never raw SQL. `values` are bound
+ * parameters, so they must not contain SQL fragments. One value is expected for
+ * the comparison operators, one or more for `in`, and none for the null checks.
+ */
+export interface TableFilter {
+  /** Column identifier to compare. */
+  column: string;
+  /** Comparison to apply. */
+  operator: FilterOperator;
+  /** Bound values for the comparison. */
+  values?: CellValue[];
+}
+
+/** Sort direction for a {@link SortKey}. */
+export type SortDirection = "ascending" | "descending";
+
+/**
+ * A sort instruction: an identifier column plus a direction.
+ *
+ * As with {@link TableFilter}, `column` is an identifier validated by the
+ * backend rather than interpolated SQL text.
+ */
+export interface SortKey {
+  /** Column identifier to order by. */
+  column: string;
+  /** Direction to sort in. */
+  direction: SortDirection;
+}
+
+/** Request for one bounded page of table rows. */
+export interface TablePageRequest {
+  /** Caller-supplied stable identifier echoed in the page. */
+  operationId: string;
+  /** Table or view to page. */
+  object: ObjectRef;
+  /** Maximum rows to return; the backend clamps this to its own ceiling. */
+  limit: number;
+  /** Rows to skip before the returned window. */
+  offset?: number;
+  /** Filters applied with engine-side semantics where possible. */
+  filters?: TableFilter[];
+  /** Deterministic ordering, applied in order. */
+  sort?: SortKey[];
+}
+
+/** One bounded page of rows from a table or view. */
+export interface TablePage {
+  /** Stable identifier matching the originating request. */
+  operationId: string;
+  /** Column metadata in result order. */
+  columns: ColumnInfo[];
+  /** Rows in the requested window. */
+  rows?: Row[];
+  /**
+   * Column names forming a safe row identity (primary key preferred).
+   *
+   * An empty/absent list means the backend could not determine one; callers
+   * must not offer safe update/delete for these rows.
+   */
+  rowIdentity?: string[];
+  /** Offset of the first returned row. */
+  offset: number;
+  /** Requested limit echoed for the caller. */
+  limit: number;
+  /** Total matching rows when the engine can report it without a full scan. */
+  totalRows?: number;
+  /** Whether a further page may exist beyond this window. */
+  truncated: boolean;
+  /** Offset to request next, when more rows may exist. */
+  nextOffset?: number;
+}
+
 /**
  * Outcome of a successful CSV export written by the backend.
  *

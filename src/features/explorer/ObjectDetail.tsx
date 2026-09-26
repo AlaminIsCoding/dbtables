@@ -15,6 +15,8 @@ export interface ObjectDetailProps {
   object: ObjectRef | null;
   /** Detail loading/ready/error state for the selected object. */
   state: ExplorerDetailState;
+  /** Opens the read-only table data browser for the selected object. */
+  onBrowseTable?: (object: ObjectRef) => void;
   className?: string;
 }
 
@@ -129,9 +131,11 @@ function ConstraintRow({ constraint }: { constraint: ConstraintInfo }) {
 function Description({
   object,
   description,
+  onBrowseTable,
 }: {
   object: ObjectRef;
   description: TableDescription;
+  onBrowseTable?: (object: ObjectRef) => void;
 }) {
   const primaryKey = description.primaryKeyColumns ?? [];
   const scope = scopeText(object);
@@ -139,9 +143,20 @@ function Description({
   return (
     <div className="flex flex-col gap-2 p-2">
       <div>
-        <p className="truncate text-xs font-semibold">
-          {qualifiedObjectName(object)}
-        </p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="truncate text-xs font-semibold">
+            {qualifiedObjectName(object)}
+          </p>
+          {onBrowseTable ? (
+            <button
+              type="button"
+              onClick={() => onBrowseTable(object)}
+              className="shrink-0 rounded-sm border border-input px-1.5 py-0.5 text-[10px] hover:bg-accent"
+            >
+              Browse data
+            </button>
+          ) : null}
+        </div>
         <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
           {object.kind}
           {scope ? ` · ${scope}` : ""}
@@ -224,7 +239,12 @@ function Description({
  * Absent index/constraint metadata is presented as "not supported" so an engine
  * limitation is never mistaken for an object that has none.
  */
-export function ObjectDetail({ object, state, className }: ObjectDetailProps) {
+export function ObjectDetail({
+  object,
+  state,
+  onBrowseTable,
+  className,
+}: ObjectDetailProps) {
   return (
     <section
       aria-label="Object details"
@@ -252,7 +272,11 @@ export function ObjectDetail({ object, state, className }: ObjectDetailProps) {
           <p className="text-[11px] text-destructive">{state.error.message}</p>
         </div>
       ) : state.status === "ready" ? (
-        <Description object={object} description={state.description} />
+        <Description
+          object={object}
+          description={state.description}
+          onBrowseTable={onBrowseTable}
+        />
       ) : (
         <p className="px-3 pb-2 text-[11px] text-muted-foreground">
           Select a table or view to see its columns, keys, indexes, and

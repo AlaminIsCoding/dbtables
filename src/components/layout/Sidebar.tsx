@@ -2,7 +2,9 @@ import {
   ConnectionManager,
   useConnectionManager,
 } from "../../features/connections";
+import type { ObjectRef } from "../../domain";
 import { ExplorerPanel, toExplorerTarget } from "../../features/explorer";
+import { useTableDataSession } from "../../features/table-data";
 import { cn } from "../ui/cn";
 
 export interface SidebarProps {
@@ -14,10 +16,18 @@ export interface SidebarProps {
  *
  * The sidebar owns the single active connection and shares it with both the
  * connection manager and the explorer, so switching connections scopes the
- * explorer to the new target and never leaves stale objects visible.
+ * explorer to the new target and never leaves stale objects visible. Selecting
+ * a table's "Browse data" action opens the read-only browser in the workspace.
  */
 export function Sidebar({ className }: SidebarProps) {
   const connections = useConnectionManager();
+  const tableData = useTableDataSession();
+  const target = toExplorerTarget(connections.active);
+
+  const onBrowseTable =
+    target.status === "connected"
+      ? (object: ObjectRef) => tableData.open(target.connectionId, object)
+      : undefined;
 
   return (
     <aside
@@ -28,7 +38,7 @@ export function Sidebar({ className }: SidebarProps) {
       )}
     >
       <ConnectionManager controller={connections} />
-      <ExplorerPanel target={toExplorerTarget(connections.active)} />
+      <ExplorerPanel target={target} onBrowseTable={onBrowseTable} />
     </aside>
   );
 }
