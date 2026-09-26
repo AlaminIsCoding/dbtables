@@ -1,50 +1,16 @@
 import { useCallback, useState } from "react";
-import type { GridSelection, Item } from "@glideapps/glide-data-grid";
+import type { GridSelection } from "@glideapps/glide-data-grid";
 
-import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
-import type { CellValue } from "../../domain";
-import { createMockResultSet } from "./mockResult";
+import type { QueryError, QueryResult } from "../../domain";
 import { ResultGrid } from "./ResultGrid";
-import { isResultSetEmpty, type ResultSet } from "./resultSet";
+import { queryResultToResultSet } from "./resultSet";
+import type { QueryOutcome } from "./queryOutcome";
 
-/** Prototype-only sample states so the loading and empty views are reviewable. */
-type DemoState = "sample" | "loading" | "empty";
-
-const SAMPLE_RESULT: ResultSet = createMockResultSet();
-
-const DEMO_STATES: readonly { value: DemoState; label: string }[] = [
-  { value: "sample", label: "Sample" },
-  { value: "empty", label: "Empty" },
-  { value: "loading", label: "Loading" },
-];
-
-function summarize(
-  state: DemoState,
-  result: ResultSet,
-  editedCount: number,
-): string {
-  if (state === "loading") {
-    return "Running…";
-  }
-  if (state === "empty") {
-    return "0 rows";
-  }
-
-  const parts = [
-    `${result.rows.length} rows`,
-    `${result.columns.length} columns`,
-    "mock data",
-  ];
-
-  if (result.truncated) {
-    parts.push("partial");
-  }
-  if (editedCount > 0) {
-    parts.push(`${editedCount} local edit${editedCount === 1 ? "" : "s"} (not saved)`);
-  }
-
-  return parts.join(" · ");
+export interface ResultsPanelProps {
+  /** Current query outcome, including idle/running/error states. */
+  outcome: QueryOutcome;
+  className?: string;
 }
 
 function selectionLabel(selection: GridSelection): string | null {
@@ -55,6 +21,45 @@ function selectionLabel(selection: GridSelection): string | null {
 
   const [col, row] = cell;
   return `R${row + 1} · C${col + 1}`;
+}
+
+/** One-line summary shown in the results header for every outcome. */
+export function summarizeOutcome(outcome: QueryOutcome): string {
+  switch (outcome.kind) {
+    case "idle":
+      return "No query run";
+    case "running":
+      return "Running…";
+    case "cancelled":
+      return "Cancelled";
+    case "failed":
+      return `Failed · ${outcome.error.category}`;
+    case "error":
+      return `Error · ${outcome.error.category}`;
+    case "outcome_unknown":
+      return "Outcome unknown";
+    case "statement": {
+      const affected = outcome.result.affectedRows;
+      if (affected === undefined) {
+        return "Statement completed";
+      }
+      return `${affected} row${affected === 1 ? "" : "s"} affected`;
+    }
+    case "grid":
+    case "empty": {
+      const result = outcome.result;
+      const rows = result.rows?.length ?? 0;
+      const columns = result.columns?.length ?? 0;
+      const parts = [`${rows} rows`, `${columns} columns`];
+      if (result.truncated) {
+        parts.push("partial");
+      }
+      if (result.durationMs !== undefined) {
+        parts.push(`${result.durationMs} ms`);
+      }
+      return parts.join(" · ");
+    }
+  }
 }
 
 function LoadingState() {
@@ -75,111 +80,157 @@ function LoadingState() {
   );
 }
 
-function EmptyState() {
+function IdleState() {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
-      <p className="text-sm font-medium">Query returned no rows</p>
+      <p className="text-sm font-medium">No results yet</p>
       <p className="max-w-xs text-xs text-muted-foreground">
-        The result set is empty. Loading and empty states are part of the grid
-        prototype.
+        Open a SQLite database and run a query to see results here.
       </p>
     </div>
   );
 }
 
-/**
- * Results pane wiring the Glide prototype to a normalized result set.
- *
- * Mock rows render by default; the state controls let the loading and empty
- * views be inspected during the manual evaluation. Edits stay in React state
- * and are never persisted.
- */
-export function ResultsPanel({ className }: { className?: string }) {
-  const [demoState, setDemoState] = useState<DemoState>("sample");
-  const [result, setResult] = useState<ResultSet>(SAMPLE_RESULT);
-  const [editedCount, setEditedCount] = useState(0);
-  const [selected, setSelected] = useState<string | null>(null);
-
-  const handleCellEdit = useCallback((location: Item, value: CellValue) => {
-    const [col, row] = location;
-    setResult((current) => ({
-      ...current,
-      rows: current.rows.map((cells, rowIndex) =>
-        rowIndex === row
-          ? cells.map((cell, colIndex) => (colIndex === col ? value : cell))
-          : cells,
-      ),
-    }));
-    setEditedCount((count) => count + 1);
-  }, []);
-
-  const handleCellsEdit = useCallback(
-    (edits: readonly { location: Item; value: CellValue }[]) => {
-      setResult((current) => {
-        const nextRows = current.rows.map((cells) => [...cells]);
-        for (const { location, value } of edits) {
-          const [col, row] = location;
-          const target = nextRows[row];
-          if (target) {
-            target[col] = value;
-          }
-        }
-        return { ...current, rows: nextRows };
-      });
-      setEditedCount((count) => count + edits.length);
-    },
-    [],
+function EmptyState({ columns }: { columns: number }) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
+      <p className="text-sm font-medium">Query returned no rows</p>
+      <p className="max-w-xs text-xs text-muted-foreground">
+        {columns > 0
+          ? `The result has ${columns} column${columns === 1 ? "" : "s"} but no rows.`
+          : "The statement completed without returning rows."}
+      </p>
+    </div>
   );
+}
+
+function StatementState({ result }: { result: QueryResult }) {
+  const affected = result.affectedRows;
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
+      <p className="text-sm font-medium">Statement completed</p>
+      <p className="max-w-xs text-xs text-muted-foreground">
+        {affected === undefined
+          ? "The statement completed successfully."
+          : `${affected} row${affected === 1 ? "" : "s"} affected.`}
+      </p>
+    </div>
+  );
+}
+
+function ErrorState({ error, title }: { error: QueryError; title: string }) {
+  return (
+    <div
+      role="alert"
+      className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center"
+    >
+      <p className="text-sm font-medium text-destructive">{title}</p>
+      <p className="max-w-sm text-xs text-muted-foreground">{error.message}</p>
+      {error.engineDetail && (
+        <p className="max-w-sm font-mono text-[10px] text-muted-foreground/80">
+          {error.engineDetail}
+        </p>
+      )}
+      <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {error.category}
+      </p>
+    </div>
+  );
+}
+
+function CancelledState() {
+  return (
+    <div
+      role="status"
+      className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center"
+    >
+      <p className="text-sm font-medium">Query cancelled</p>
+      <p className="max-w-xs text-xs text-muted-foreground">
+        The operation stopped before completion. Cancellation is not proof that a
+        server-side write was rolled back.
+      </p>
+    </div>
+  );
+}
+
+function UncertainState({ error }: { error?: QueryError }) {
+  return (
+    <div
+      role="alert"
+      className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center"
+    >
+      <p className="text-sm font-medium text-destructive">Outcome unknown</p>
+      <p className="max-w-sm text-xs text-muted-foreground">
+        {error?.message ??
+          "The connection was lost before the write outcome could be confirmed."}
+      </p>
+      <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {error?.category ?? "transport"}
+      </p>
+    </div>
+  );
+}
+
+function renderBody(
+  outcome: QueryOutcome,
+  onSelectionChange: (selection: GridSelection) => void,
+) {
+  switch (outcome.kind) {
+    case "idle":
+      return <IdleState />;
+    case "running":
+      return <LoadingState />;
+    case "grid": {
+      const result = queryResultToResultSet(outcome.result);
+      return (
+        <ResultGrid result={result} onSelectionChange={onSelectionChange} />
+      );
+    }
+    case "empty":
+      return <EmptyState columns={outcome.result.columns?.length ?? 0} />;
+    case "statement":
+      return <StatementState result={outcome.result} />;
+    case "failed":
+      return <ErrorState error={outcome.error} title="Query failed" />;
+    case "error":
+      return <ErrorState error={outcome.error} title="Backend error" />;
+    case "cancelled":
+      return <CancelledState />;
+    case "outcome_unknown":
+      return <UncertainState error={outcome.error} />;
+  }
+}
+
+/**
+ * Results pane for a real query run.
+ *
+ * Renders each normalized outcome distinctly: idle, running, grid, empty,
+ * statement-only, failed, command error, cancelled, and uncertain. The grid is
+ * read-only here; this slice exposes no table editing.
+ */
+export function ResultsPanel({ outcome, className }: ResultsPanelProps) {
+  const [selected, setSelected] = useState<string | null>(null);
 
   const handleSelectionChange = useCallback((selection: GridSelection) => {
     setSelected(selectionLabel(selection));
   }, []);
-
-  const showGrid = demoState === "sample" && !isResultSetEmpty(result);
 
   return (
     <div className={cn("flex h-full min-h-0 flex-col", className)}>
       <div className="flex h-7 shrink-0 items-center justify-between gap-2 border-b border-border px-2 text-[11px] text-muted-foreground">
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0">Results</span>
-          <span className="truncate" data-testid="results-summary">
-            {summarize(demoState, result, editedCount)}
+          <span className="truncate" data-testid="results-summary" role="status">
+            {summarizeOutcome(outcome)}
           </span>
-          {selected && <span className="shrink-0">{selected}</span>}
-        </div>
-
-        <div
-          role="group"
-          aria-label="Sample result state"
-          className="flex shrink-0 items-center gap-0.5"
-        >
-          {DEMO_STATES.map(({ value, label }) => (
-            <Button
-              key={value}
-              size="sm"
-              variant={demoState === value ? "secondary" : "ghost"}
-              className="h-5 px-1.5 text-[10px]"
-              aria-pressed={demoState === value}
-              onClick={() => setDemoState(value)}
-            >
-              {label}
-            </Button>
-          ))}
+          {selected && outcome.kind === "grid" && (
+            <span className="shrink-0">{selected}</span>
+          )}
         </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        {demoState === "loading" && <LoadingState />}
-        {demoState === "empty" && <EmptyState />}
-        {showGrid && (
-          <ResultGrid
-            result={result}
-            onCellEdit={handleCellEdit}
-            onCellsEdit={handleCellsEdit}
-            onSelectionChange={handleSelectionChange}
-          />
-        )}
-        {demoState === "sample" && !showGrid && <EmptyState />}
+        {renderBody(outcome, handleSelectionChange)}
       </div>
     </div>
   );

@@ -3,6 +3,8 @@ pub mod commands;
 pub mod database;
 pub mod domain;
 
+use database::SqliteAdapter;
+
 /// Product name, used as the desktop window title and in diagnostics.
 pub const APP_NAME: &str = "dbtables";
 
@@ -10,7 +12,18 @@ pub const APP_NAME: &str = "dbtables";
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![commands::status::app_status])
+        // The adapter owns the open connections for the process lifetime.
+        // Tauri manages it so command handlers can share one registry without
+        // exposing driver-native handles to the frontend.
+        .manage(SqliteAdapter::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::status::app_status,
+            commands::connections::connect_sqlite,
+            commands::connections::disconnect_connection,
+            commands::connections::connection_state,
+            commands::metadata::list_objects,
+            commands::queries::execute_query,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the dbtables application");
 }

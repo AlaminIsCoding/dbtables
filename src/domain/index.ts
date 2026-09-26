@@ -66,6 +66,33 @@ export type ConnectionDescriptor =
   | ({ engine: "mysql" } & ServerConnection)
   | ({ engine: "postgres" } & ServerConnection);
 
+/** Reported state of a connection known to the backend adapter. */
+export type ConnectionState =
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "failed";
+
+/** Kind of database object exposed by metadata listing. */
+export type ObjectKind = "table" | "view";
+
+/**
+ * Stable, engine-neutral reference to a database object.
+ *
+ * `database` and `schema` are absent for engines that do not expose them, such
+ * as SQLite.
+ */
+export interface ObjectRef {
+  /** Database/catalog that contains the object, when the engine exposes one. */
+  database?: string;
+  /** Schema that contains the object, when the engine exposes one. */
+  schema?: string;
+  /** Object name. */
+  name: string;
+  /** Whether the object is a table or a view. */
+  kind: ObjectKind;
+}
+
 /** State of a long-running operation. */
 export type OperationState =
   | "queued"

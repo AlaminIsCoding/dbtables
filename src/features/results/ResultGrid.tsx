@@ -141,8 +141,10 @@ export function ResultGrid({
         columns={columns}
         rows={rows.length}
         getCellContent={getCellContent}
-        onCellEdited={handleCellEdited}
-        onCellsEdited={handleCellsEdited}
+        // Editing stays disabled unless a caller supplies a handler; the
+        // read-only query slice never writes result edits back.
+        onCellEdited={onCellEdit ? handleCellEdited : undefined}
+        onCellsEdited={onCellsEdit ? handleCellsEdited : undefined}
         onGridSelectionChange={onSelectionChange}
         getCellsForSelection
         copyHeaders

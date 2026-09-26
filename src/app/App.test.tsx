@@ -61,27 +61,23 @@ describe("App workspace shell", () => {
       screen.getByRole("tab", { name: "Query 1" }).getAttribute("aria-selected"),
     ).toBe("true");
     expect(screen.getByRole("tab", { name: "Query 2" })).toBeTruthy();
-    expect(screen.getByText("SQL editor")).toBeTruthy();
-    expect(
-      screen.getByRole("region", {
-        name: /Query results grid: 120 rows, 11 columns/,
-      }),
-    ).toBeTruthy();
+    expect(screen.getByText("SQL editor · Query 1")).toBeTruthy();
+    expect(screen.getByText("No results yet")).toBeTruthy();
     expect(
       screen.getByRole("separator", { name: "Resize editor and results" }),
     ).toBeTruthy();
     expect(screen.getByRole("contentinfo")).toBeTruthy();
   });
 
-  it("switches the editor placeholder when a query tab is selected", () => {
+  it("switches the query workspace when a query tab is selected", () => {
     render(<App />);
 
-    expect(screen.getByText(/-- Query 1/)).toBeTruthy();
+    expect(screen.getByText("SQL editor · Query 1")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("tab", { name: "Query 2" }));
 
-    expect(screen.getByText(/-- Query 2/)).toBeTruthy();
-    expect(screen.queryByText(/-- Query 1/)).toBeNull();
+    expect(screen.getByText("SQL editor · Query 2")).toBeTruthy();
+    expect(screen.queryByText("SQL editor · Query 1")).toBeNull();
   });
 
   it("shows a pending state then the backend response", async () => {

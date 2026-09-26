@@ -1,15 +1,17 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { QueryResult } from "../../domain";
 import { ResultsPanel } from "./ResultsPanel";
+import type { QueryOutcome } from "./queryOutcome";
 
 const glide = vi.hoisted(() => ({
   props: undefined as
     | {
-        onCellEdited: (
-          cell: readonly [number, number],
-          value: unknown,
-        ) => void;
+        rows: number;
+        columns: { title: string }[];
+        onCellEdited?: unknown;
+        onCellsEdited?: unknown;
       }
     | undefined,
 }));
@@ -27,53 +29,150 @@ vi.mock("@glideapps/glide-data-grid", () => ({
   },
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  glide.props = undefined;
+});
+
+function resultWith(overrides: Partial<QueryResult> = {}): QueryResult {
+  return {
+    operationId: "op-1",
+    state: "succeeded",
+    truncated: false,
+    ...overrides,
+  };
+}
+
+function renderOutcome(outcome: QueryOutcome) {
+  return render(<ResultsPanel outcome={outcome} />);
+}
 
 describe("ResultsPanel", () => {
-  it("renders the mock result summary and grid by default", () => {
-    render(<ResultsPanel />);
+  it("shows an idle prompt before any query runs", () => {
+    renderOutcome({ kind: "idle" });
 
-    expect(screen.getByTestId("results-summary").textContent).toContain("120 rows");
-    expect(screen.getByTestId("results-summary").textContent).toContain("11 columns");
-    expect(
-      screen.getByRole("region", {
-        name: /Query results grid: 120 rows, 11 columns/,
-      }),
-    ).toBeTruthy();
+    expect(screen.getByText("No results yet")).toBeTruthy();
+    expect(screen.getByTestId("results-summary").textContent).toContain(
+      "No query run",
+    );
   });
 
-  it("shows the empty sample state", () => {
-    render(<ResultsPanel />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Empty" }));
-
-    expect(screen.getByText("Query returned no rows")).toBeTruthy();
-    expect(screen.queryByRole("region")).toBeNull();
-  });
-
-  it("shows the loading sample state", () => {
-    render(<ResultsPanel />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Loading" }));
+  it("shows a distinct running state", () => {
+    renderOutcome({ kind: "running" });
 
     expect(screen.getByText("Running query…")).toBeTruthy();
-    expect(screen.queryByRole("region")).toBeNull();
+    expect(screen.getByTestId("results-summary").textContent).toContain(
+      "Running",
+    );
   });
 
-  it("counts local grid edits without persisting them", () => {
-    render(<ResultsPanel />);
+  it("renders a grid success with a read-only Glide instance", () => {
+    renderOutcome({
+      kind: "grid",
+      result: resultWith({
+        columns: [{ name: "id" }, { name: "name" }],
+        rows: [
+          [
+            { type: "integer", value: 1 },
+            { type: "text", value: "alice" },
+          ],
+          [
+            { type: "integer", value: 2 },
+            { type: "text", value: "bob" },
+          ],
+        ],
+        durationMs: 5,
+      }),
+    });
 
-    act(() => {
-      glide.props?.onCellEdited([1, 0], {
-        kind: "text",
-        data: "Renamed",
-        displayData: "Renamed",
-        allowOverlay: true,
-      });
+    expect(glide.props?.rows).toBe(2);
+    expect(glide.props?.onCellEdited).toBeUndefined();
+    expect(glide.props?.onCellsEdited).toBeUndefined();
+    expect(
+      screen.getByRole("region", {
+        name: /Query results grid: 2 rows, 2 columns/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByTestId("results-summary").textContent).toBe(
+      "2 rows · 2 columns · 5 ms",
+    );
+  });
+
+  it("marks a truncated result as partial", () => {
+    renderOutcome({
+      kind: "grid",
+      result: resultWith({
+        columns: [{ name: "id" }],
+        rows: [[{ type: "integer", value: 1 }]],
+        truncated: true,
+      }),
     });
 
     expect(screen.getByTestId("results-summary").textContent).toContain(
-      "1 local edit (not saved)",
+      "partial",
     );
+  });
+
+  it("shows an empty-result state for a successful query with no rows", () => {
+    renderOutcome({
+      kind: "empty",
+      result: resultWith({ columns: [{ name: "id" }], rows: [] }),
+    });
+
+    expect(screen.getByText("Query returned no rows")).toBeTruthy();
+    expect(screen.getByTestId("results-summary").textContent).toContain(
+      "0 rows · 1 columns",
+    );
+  });
+
+  it("shows a statement outcome for a result with no columns", () => {
+    renderOutcome({
+      kind: "statement",
+      result: resultWith({ affectedRows: 3 }),
+    });
+
+    expect(screen.getByText("Statement completed")).toBeTruthy();
+    expect(screen.getByText("3 rows affected.")).toBeTruthy();
+  });
+
+  it("shows a failed query as an alert with its category", () => {
+    renderOutcome({
+      kind: "failed",
+      error: {
+        category: "syntax",
+        message: "the SQL statement has a syntax error",
+        engineDetail: "near WHERE: syntax error",
+      },
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Query failed");
+    expect(alert.textContent).toContain("syntax error");
+    expect(alert.textContent).toContain("syntax");
+  });
+
+  it("shows a command-level error distinctly from a failed query", () => {
+    renderOutcome({
+      kind: "error",
+      error: { category: "connection", message: "connection is not open" },
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Backend error");
+    expect(alert.textContent).toContain("connection is not open");
+  });
+
+  it("shows cancelled and uncertain outcomes distinctly", () => {
+    renderOutcome({ kind: "cancelled" });
+    expect(screen.getByText("Query cancelled")).toBeTruthy();
+
+    cleanup();
+
+    renderOutcome({
+      kind: "outcome_unknown",
+      error: { category: "transport", message: "connection lost" },
+    });
+    expect(screen.getByRole("alert").textContent).toContain("Outcome unknown");
+    expect(screen.getByRole("alert").textContent).toContain("connection lost");
   });
 });

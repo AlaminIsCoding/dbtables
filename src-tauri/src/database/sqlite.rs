@@ -1,21 +1,25 @@
 //! Read-only SQLite adapter backed by `rusqlite`.
 //!
-//! This module implements the metadata half of the shared
+//! This module implements the metadata and query half of the shared
 //! [`DatabaseAdapter`] contract for local SQLite files:
 //!
 //! - Connect to an existing file, report its state, and disconnect.
 //! - List base tables and views, excluding SQLite's internal `sqlite_*` objects.
 //! - Describe an object's columns and primary key using table-valued pragmas.
+//! - Execute a single SQL statement and return a normalized, capped result with
+//!   column metadata, rows, affected-row count, duration, and structured errors.
 //!
-//! The read-only SQLite slice deliberately implements only these operations.
-//! SQL execution, table paging, and staged changes arrive in later tasks and
-//! report [`ErrorCategory::Unsupported`] until then, so no write path is exposed
-//! and [`Self::capabilities`] reports only what the adapter can honor today.
+//! Table paging and staged changes arrive in later tasks and report
+//! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
+//! [`Self::capabilities`] reports only what the adapter can honor today.
 //!
 //! Design rules:
 //!
 //! - Connections are opened with `SQLITE_OPEN_READ_ONLY`. The adapter cannot
-//!   create a database file or mutate an existing one.
+//!   create a database file or mutate an existing one, so any write statement a
+//!   caller attempts fails at the driver with a normalized permission error.
+//! - Parameters supplied with a request are bound as parameters; caller text is
+//!   never concatenated into the statement.
 //! - Driver-native [`rusqlite::Connection`] handles never leave this module.
 //!   Callers receive opaque, serializable [`ConnectionId`] tokens.
 //! - Object names are never interpolated into SQL. `describe_table` binds the
@@ -32,8 +36,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::database::{
@@ -42,9 +47,16 @@ use crate::database::{
     ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
-    ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory, OperationId,
-    QueryError, QueryRequest, QueryResult,
+    CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
+    OperationId, QueryError, QueryRequest, QueryResult, Row,
 };
+
+/// Upper bound on rows the adapter returns for one statement.
+///
+/// The application applies its own (smaller) default cap; this ceiling keeps a
+/// caller that bypasses the application from loading an unbounded result into
+/// memory. Rows beyond the cap are skipped and the result is marked truncated.
+const MAX_RESULT_ROWS: u32 = 10_000;
 
 /// State and driver handle for one open connection.
 struct ConnectionSlot {
@@ -127,6 +139,9 @@ fn categorize(code: ErrorCode) -> ErrorCategory {
         ErrorCode::PermissionDenied | ErrorCode::ReadOnly => ErrorCategory::Permission,
         ErrorCode::CannotOpen | ErrorCode::NotADatabase => ErrorCategory::Connection,
         ErrorCode::OperationInterrupted => ErrorCategory::Cancelled,
+        // SQLITE_ERROR is the generic statement error (for example a missing
+        // table or column); treat it as validation rather than internal.
+        ErrorCode::Unknown => ErrorCategory::Validation,
         _ => ErrorCategory::Internal,
     }
 }
@@ -148,6 +163,7 @@ fn safe_failure_message(code: ErrorCode) -> &'static str {
             "the SQLite database file could not be opened"
         }
         ErrorCode::OperationInterrupted => "the SQLite operation was interrupted",
+        ErrorCode::Unknown => "the SQLite statement could not be executed",
         _ => "the SQLite operation failed",
     }
 }
@@ -167,9 +183,23 @@ fn map_error(error: rusqlite::Error) -> QueryError {
             }
             mapped
         }
+        // SQLite reports a parse/prepare failure with the offending offset when
+        // built against a modern SQLite, which the `bundled` feature provides.
+        rusqlite::Error::SqlInputError {
+            error,
+            msg,
+            offset,
+            ..
+        } => QueryError::new(ErrorCategory::Syntax, "the SQL statement has a syntax error")
+            .with_code(error.extended_code.to_string())
+            .with_engine_detail(format!("{msg} (at offset {offset})")),
         rusqlite::Error::InvalidQuery => QueryError::new(
             ErrorCategory::Validation,
             "the SQLite statement is not a valid read-only query",
+        ),
+        rusqlite::Error::MultipleStatement => QueryError::new(
+            ErrorCategory::Validation,
+            "run a single SQL statement at a time",
         ),
         rusqlite::Error::QueryReturnedNoRows => QueryError::new(
             ErrorCategory::Validation,
@@ -210,15 +240,133 @@ fn open_read_only(path: &str) -> Result<Connection, QueryError> {
     Ok(connection)
 }
 
+/// Binds normalized request parameters as SQLite values.
+///
+/// Values are passed to the driver as bound parameters; caller text is never
+/// concatenated into the statement.
+fn bind_parameters(parameters: &[CellValue]) -> Vec<Value> {
+    parameters.iter().map(cell_to_value).collect()
+}
+
+/// Converts a normalized cell value into a bound SQLite value.
+fn cell_to_value(value: &CellValue) -> Value {
+    match value {
+        CellValue::Null => Value::Null,
+        // SQLite has no boolean type; store the conventional 0/1 integer.
+        CellValue::Boolean(value) => Value::Integer(i64::from(*value)),
+        CellValue::Integer(value) => Value::Integer(*value),
+        CellValue::Float(value) => Value::Real(*value),
+        // Exact numerics stay text so SQLite's numeric affinity can convert
+        // them without the adapter losing precision first.
+        CellValue::Decimal(value) => Value::Text(value.clone()),
+        CellValue::Text(value) => Value::Text(value.clone()),
+        CellValue::Bytes(value) => Value::Blob(value.clone()),
+    }
+}
+
+/// Converts a driver value reference into a normalized cell value.
+fn cell_from_value_ref(value: ValueRef<'_>) -> CellValue {
+    match value {
+        ValueRef::Null => CellValue::Null,
+        ValueRef::Integer(value) => CellValue::Integer(value),
+        ValueRef::Real(value) => CellValue::Float(value),
+        ValueRef::Text(bytes) => CellValue::Text(String::from_utf8_lossy(bytes).into_owned()),
+        ValueRef::Blob(bytes) => CellValue::Bytes(bytes.to_vec()),
+    }
+}
+
+/// Whole milliseconds elapsed since `started`, saturating instead of wrapping.
+fn elapsed_millis(started: Instant) -> u64 {
+    let millis = started.elapsed().as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// Executes one statement on an open handle and normalizes the outcome.
+///
+/// Completed outcomes (including a failed preparation or step) come back as a
+/// [`QueryResult`] so the caller can render the state and error. The wrapper
+/// always reports a duration, even for failures.
+fn run_statement(handle: &Connection, request: &QueryRequest) -> QueryResult {
+    let started = Instant::now();
+    let mut result = match execute_statement(handle, request) {
+        Ok(result) => result,
+        Err(error) => QueryResult::failed(request.operation_id.clone(), error),
+    };
+    result.duration_ms = Some(elapsed_millis(started));
+    result
+}
+
+/// Prepares and runs a statement, returning a successful normalized result.
+///
+/// Errors here are statement-level failures (bad SQL, a read-only write, a
+/// missing table) and are mapped onto the normalized error model. Connection
+/// errors never reach this function because the caller resolves the handle
+/// first.
+fn execute_statement(
+    handle: &Connection,
+    request: &QueryRequest,
+) -> Result<QueryResult, QueryError> {
+    let mut statement = handle.prepare(&request.sql).map_err(map_error)?;
+    let parameters = bind_parameters(&request.parameters);
+    let cap = request
+        .max_rows
+        .unwrap_or(MAX_RESULT_ROWS)
+        .min(MAX_RESULT_ROWS) as usize;
+
+    // A statement with no result columns is a non-row command (for example an
+    // INSERT or DDL). The read-only connection rejects any mutation, but a
+    // plain statement such as a PRAGMA still reports its affected-row count.
+    if statement.column_count() == 0 {
+        let affected = statement
+            .execute(rusqlite::params_from_iter(parameters.iter()))
+            .map_err(map_error)?;
+        let mut result = QueryResult::succeeded(request.operation_id.clone());
+        result.affected_rows = Some(affected as u64);
+        return Ok(result);
+    }
+
+    let columns: Vec<ColumnInfo> = statement
+        .column_names()
+        .into_iter()
+        .map(ColumnInfo::named)
+        .collect();
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    let mut cursor = statement
+        .query(rusqlite::params_from_iter(parameters.iter()))
+        .map_err(map_error)?;
+
+    while let Some(row) = cursor.next().map_err(map_error)? {
+        if rows.len() >= cap {
+            truncated = true;
+            break;
+        }
+
+        let mut cells = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            cells.push(cell_from_value_ref(row.get_ref(index).map_err(map_error)?));
+        }
+        rows.push(cells);
+    }
+
+    let mut result = QueryResult::succeeded(request.operation_id.clone());
+    result.columns = columns;
+    result.rows = rows;
+    result.truncated = truncated;
+    Ok(result)
+}
+
 impl DatabaseAdapter for SqliteAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Sqlite
     }
 
     fn capabilities(&self) -> EngineCapabilities {
-        // This slice implements connect/disconnect and metadata inspection only.
-        // Reporting every other operation as unsupported keeps the capability
-        // flags honest rather than advertising behavior the adapter lacks.
+        // This slice implements connect/disconnect, metadata inspection, and
+        // read-only SQL execution. Transaction, cancellation, and multi-scope
+        // flags stay `false` so the UI never advertises behavior the adapter
+        // cannot honor yet.
         EngineCapabilities::default()
     }
 
@@ -438,14 +586,17 @@ impl DatabaseAdapter for SqliteAdapter {
     fn execute<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: QueryRequest,
+        request: QueryRequest,
     ) -> AdapterFuture<'a, Result<QueryResult, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |_| {
-                Err(unsupported_error(
-                    "SQL execution is not implemented in this slice",
-                ))
-            })
+            if request.sql.trim().is_empty() {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    "the SQL statement is empty",
+                ));
+            }
+
+            self.with_connection(connection, |handle| Ok(run_statement(handle, &request)))
         })
     }
 
@@ -528,7 +679,7 @@ mod fixture_tests {
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
         CellValue, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory, OperationId,
-        QueryRequest,
+        OperationState, QueryRequest,
     };
 
     /// Minimal executor for the immediately-ready futures the adapter returns.
@@ -564,6 +715,10 @@ mod fixture_tests {
         );
         CREATE VIEW active_users AS
             SELECT id, name FROM users WHERE name IS NOT NULL;
+        INSERT INTO users (id, name, email, balance) VALUES
+            (1, 'alice', 'alice@example.com', 10.50),
+            (2, 'bob', NULL, 20.00),
+            (3, 'carol', 'carol@example.com', NULL);
     ";
 
     /// A freshly created SQLite file removed when the test ends.
@@ -840,17 +995,17 @@ mod fixture_tests {
     }
 
     #[test]
-    fn read_only_slice_does_not_expose_sql_or_writes() {
+    fn read_only_slice_exposes_reads_but_not_writes() {
         let fixture = TempDatabase::new();
         let adapter = SqliteAdapter::new();
         let connection = connected(&adapter, &fixture);
 
-        let execute = block_on(adapter.execute(
+        let select = block_on(adapter.execute(
             &connection,
             QueryRequest::new("op-select", "SELECT * FROM users"),
         ))
-        .expect_err("SQL execution belongs to a later slice");
-        assert_eq!(execute.category, ErrorCategory::Unsupported);
+        .expect("SQL execution is implemented for the read-only slice");
+        assert_eq!(select.state, crate::domain::OperationState::Succeeded);
 
         let change = PendingChange::insert(vec![RowKey::new("id", CellValue::Integer(99))]);
         let apply = block_on(adapter.apply_change(
@@ -870,6 +1025,193 @@ mod fixture_tests {
         let cancelled = block_on(adapter.cancel(&connection, &OperationId::new("op-select")))
             .expect_err("SQLite cancellation is unsupported");
         assert_eq!(cancelled.category, ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn execute_returns_normalized_columns_rows_and_duration() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-select", "SELECT id, name FROM users ORDER BY id"),
+        ))
+        .expect("select should return a result");
+
+        assert_eq!(result.state, OperationState::Succeeded);
+        let names: Vec<&str> = result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names, ["id", "name"]);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(result.rows[0][0], CellValue::Integer(1));
+        assert_eq!(result.rows[1][0], CellValue::Integer(2));
+        assert!(!result.truncated);
+        assert!(result.duration_ms.is_some());
+    }
+
+    #[test]
+    fn execute_returns_an_empty_succeeded_result_for_a_query_with_no_rows() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-empty", "SELECT id, name FROM users WHERE 0"),
+        ))
+        .expect("an empty select should return a result");
+
+        assert_eq!(result.state, OperationState::Succeeded);
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.rows.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn execute_maps_syntax_errors_to_failed_results() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-bad", "SELECT FROM WHERE"),
+        ))
+        .expect("invalid SQL still produces a result");
+
+        assert_eq!(result.state, OperationState::Failed);
+        assert!(!result.state.is_success());
+        let error = result.error.expect("failed result should carry an error");
+        assert_eq!(error.category, ErrorCategory::Syntax);
+    }
+
+    #[test]
+    fn execute_maps_a_missing_table_to_a_validation_error() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-missing", "SELECT * FROM does_not_exist"),
+        ))
+        .expect("a missing table still produces a result");
+
+        assert_eq!(result.state, OperationState::Failed);
+        let error = result.error.expect("failed result should carry an error");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn execute_caps_rows_and_marks_the_result_truncated() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-cap", "SELECT id FROM users ORDER BY id").with_max_rows(2),
+        ))
+        .expect("capped select should return a result");
+
+        assert_eq!(result.state, OperationState::Succeeded);
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn execute_binds_parameters_and_normalizes_scalar_values() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let bound = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-param", "SELECT name FROM users WHERE id = ?")
+                .with_parameters(vec![CellValue::Integer(2)]),
+        ))
+        .expect("a bound select should return a result");
+        assert_eq!(
+            bound.rows,
+            vec![vec![CellValue::Text("bob".to_string())]]
+        );
+
+        let scalars = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new(
+                "op-scalars",
+                "SELECT NULL AS missing, x'0102' AS data, 1 AS one, 1.5 AS real",
+            ),
+        ))
+        .expect("scalar select should return a result");
+        assert_eq!(scalars.rows.len(), 1);
+        assert_eq!(scalars.rows[0][0], CellValue::Null);
+        assert_eq!(scalars.rows[0][1], CellValue::Bytes(vec![1, 2]));
+        assert_eq!(scalars.rows[0][2], CellValue::Integer(1));
+        assert_eq!(scalars.rows[0][3], CellValue::Float(1.5));
+    }
+
+    #[test]
+    fn execute_rejects_multiple_statements() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("op-many", "SELECT 1; SELECT 2"),
+        ))
+        .expect("multiple statements still produce a result");
+
+        assert_eq!(result.state, OperationState::Failed);
+        let error = result.error.expect("failed result should carry an error");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn execute_rejects_blank_sql_before_touching_the_connection() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let error = block_on(adapter.execute(&connection, QueryRequest::new("op-blank", "   ")))
+            .expect_err("blank SQL is a precondition failure");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn execute_blocks_writes_on_a_read_only_connection() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let result = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new(
+                "op-write",
+                "INSERT INTO users (id, name) VALUES (100, 'mallory')",
+            ),
+        ))
+        .expect("a rejected write still produces a result");
+
+        assert_eq!(result.state, OperationState::Failed);
+        assert!(!result.state.is_success());
+        let error = result.error.expect("failed result should carry an error");
+        assert_eq!(error.category, ErrorCategory::Permission);
+    }
+
+    #[test]
+    fn execute_on_an_unknown_connection_is_a_connection_error() {
+        let adapter = SqliteAdapter::new();
+        let unknown = ConnectionId::new("does-not-exist");
+
+        let error = block_on(adapter.execute(&unknown, QueryRequest::new("op", "SELECT 1")))
+            .expect_err("an unknown connection must not execute");
+        assert_eq!(error.category, ErrorCategory::Connection);
     }
 
     #[test]
