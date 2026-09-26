@@ -8,7 +8,12 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { connectProfile, listConnectionProfiles } from "@/services/connections";
+import {
+  connectProfile,
+  connectProfileDatabase,
+  listConnectionProfiles,
+  listProfileDatabases,
+} from "@/services/connections";
 import { listObjects, listScopes } from "@/services/metadata";
 
 // The store lists saved profiles on mount; keep the shell test independent of
@@ -22,6 +27,8 @@ vi.mock("@/services/connections", () => ({
   deleteConnectionProfile: vi.fn(),
   testConnectionProfile: vi.fn(),
   connectProfile: vi.fn(),
+  connectProfileDatabase: vi.fn(),
+  listProfileDatabases: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/services/metadata", () => ({
@@ -32,15 +39,20 @@ vi.mock("@/services/metadata", () => ({
 import App from "./App";
 
 const connectMock = vi.mocked(connectProfile);
+const connectDatabaseMock = vi.mocked(connectProfileDatabase);
 const listProfilesMock = vi.mocked(listConnectionProfiles);
+const listProfileDatabasesMock = vi.mocked(listProfileDatabases);
 const listObjectsMock = vi.mocked(listObjects);
 const listScopesMock = vi.mocked(listScopes);
 
 afterEach(() => {
   cleanup();
   connectMock.mockReset();
+  connectDatabaseMock.mockReset();
   listProfilesMock.mockReset();
   listProfilesMock.mockResolvedValue([]);
+  listProfileDatabasesMock.mockReset();
+  listProfileDatabasesMock.mockResolvedValue([]);
   listObjectsMock.mockClear();
   listScopesMock.mockReset();
   listScopesMock.mockResolvedValue({ databases: [], schemas: [] });
@@ -165,6 +177,47 @@ describe("App workspace shell", () => {
       expect(listObjectsMock).toHaveBeenCalledWith("conn-1", {
         database: "analytics",
       }),
+    );
+  });
+
+  it("reconnects a PostgreSQL profile to the chosen database", async () => {
+    const postgresProfile = {
+      id: "p3",
+      name: "pg",
+      descriptor: {
+        engine: "postgres" as const,
+        host: "localhost",
+        port: 5432,
+        username: "postgres",
+        tls: "preferred" as const,
+      },
+    };
+    listProfilesMock.mockResolvedValue([postgresProfile]);
+    connectMock.mockResolvedValue("conn-1");
+    connectDatabaseMock.mockResolvedValue("conn-2");
+    listProfileDatabasesMock.mockResolvedValue(["analytics", "reporting"]);
+    render(<App />);
+
+    const trigger = await screen.findByRole("button", { name: /^Connection:/ });
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "pg" }));
+    await waitFor(() => expect(connectMock).toHaveBeenCalledWith("p3"));
+
+    // PostgreSQL databases are fetched from the server for the picker.
+    await waitFor(() =>
+      expect(listProfileDatabasesMock).toHaveBeenCalledWith({
+        id: "p3",
+        name: "pg",
+        descriptor: postgresProfile.descriptor,
+      }),
+    );
+
+    const picker = await screen.findByRole("dialog");
+    fireEvent.click(within(picker).getByRole("button", { name: "analytics" }));
+
+    // Switching database reconnects the profile against the chosen database.
+    await waitFor(() =>
+      expect(connectDatabaseMock).toHaveBeenCalledWith("p3", "analytics"),
     );
   });
 

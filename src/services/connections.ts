@@ -16,6 +16,7 @@ export const SAVE_CONNECTION_PROFILE_COMMAND = "save_connection_profile";
 export const DELETE_CONNECTION_PROFILE_COMMAND = "delete_connection_profile";
 export const TEST_CONNECTION_PROFILE_COMMAND = "test_connection_profile";
 export const CONNECT_PROFILE_COMMAND = "connect_profile";
+export const CONNECT_PROFILE_DATABASE_COMMAND = "connect_profile_database";
 export const LIST_PROFILE_DATABASES_COMMAND = "list_profile_databases";
 
 /**
@@ -119,6 +120,23 @@ export async function testConnectionProfile(
  */
 export async function connectProfile(profileId: string): Promise<string> {
   return invoke<string>(CONNECT_PROFILE_COMMAND, { profileId });
+}
+
+/**
+ * Opens a saved profile against a specific database.
+ *
+ * A PostgreSQL connection is bound to one database, so choosing a different
+ * database opens a new connection with that database. The backend resolves the
+ * profile's saved secret; no password crosses this boundary.
+ */
+export async function connectProfileDatabase(
+  profileId: string,
+  database: string,
+): Promise<string> {
+  return invoke<string>(CONNECT_PROFILE_DATABASE_COMMAND, {
+    profileId,
+    database,
+  });
 }
 
 /**

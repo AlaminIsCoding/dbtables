@@ -59,8 +59,8 @@ export function TopBar({
   const {
     connections,
     connectionId,
-    scopes,
-    scope,
+    databases,
+    currentDatabase,
     openQuery,
     unread,
     messagesOpen,
@@ -81,12 +81,6 @@ export function TopBar({
   const activeEngine: EngineId | undefined = activeProfile?.descriptor.engine;
   const connecting = connections.active.status === "connecting";
 
-  const databases = scopes?.databases ?? [];
-  const profileDatabase =
-    activeProfile && activeProfile.descriptor.engine !== "sqlite"
-      ? activeProfile.descriptor.database
-      : undefined;
-  const currentDatabase = scope.database ?? profileDatabase;
   const databaseLabel = currentDatabase ?? activeProfile?.name ?? "Open database";
 
   return (

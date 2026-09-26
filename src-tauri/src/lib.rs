@@ -42,6 +42,7 @@ pub fn run() {
             commands::connections::delete_connection_profile,
             commands::connections::test_connection_profile,
             commands::connections::connect_profile,
+            commands::connections::connect_profile_database,
             commands::connections::list_profile_databases,
             commands::metadata::list_objects,
             commands::metadata::list_scopes,

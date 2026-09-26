@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ConnectionProfile, EngineId, QueryError } from "../../domain";
 import {
   connectProfile,
+  connectProfileDatabase,
   deleteConnectionProfile,
   disconnectConnection,
   listConnectionProfiles,
@@ -18,11 +19,21 @@ export type ProfileListState =
   | { status: "ready"; profiles: ConnectionProfile[] }
   | { status: "error"; error: QueryError };
 
-/** Lifecycle of the single active profile connection. */
+/**
+ * Lifecycle of the single active profile connection.
+ *
+ * `database` is present when the connection was opened against a specific
+ * database (PostgreSQL, which binds one connection to one database).
+ */
 export type ActiveConnection =
   | { status: "disconnected" }
-  | { status: "connecting"; profileId: string }
-  | { status: "connected"; profileId: string; connectionId: string }
+  | { status: "connecting"; profileId: string; database?: string }
+  | {
+      status: "connected";
+      profileId: string;
+      connectionId: string;
+      database?: string;
+    }
   | { status: "error"; error: QueryError };
 
 /**
@@ -69,8 +80,16 @@ export interface ConnectionManagerController {
     input: ConnectionProfileInput,
     targetId: string | null,
   ) => Promise<void>;
-  /** Connects a saved profile, replacing any current connection. */
-  connect: (profileId: string) => Promise<void>;
+  /**
+   * Connects a saved profile, replacing any current connection.
+   *
+   * Supplying `options.database` opens the profile against that database, which
+   * some engines (PostgreSQL) require in order to switch databases.
+   */
+  connect: (
+    profileId: string,
+    options?: { database?: string },
+  ) => Promise<void>;
   /** Closes the active connection. */
   disconnect: () => Promise<void>;
   /** Clears a displayed test result. */
@@ -96,6 +115,7 @@ export function useConnectionManager(): ConnectionManagerController {
 
   const connectionIdRef = useRef<string | null>(null);
   const activeProfileRef = useRef<string | null>(null);
+  const activeDatabaseRef = useRef<string | null>(null);
 
   const reload = useCallback(async () => {
     setProfiles({ status: "loading" });
@@ -115,6 +135,7 @@ export function useConnectionManager(): ConnectionManagerController {
     const connectionId = connectionIdRef.current;
     connectionIdRef.current = null;
     activeProfileRef.current = null;
+    activeDatabaseRef.current = null;
     if (connectionId) {
       try {
         await disconnectConnection(connectionId);
@@ -126,23 +147,28 @@ export function useConnectionManager(): ConnectionManagerController {
   }, []);
 
   const connect = useCallback(
-    async (profileId: string) => {
+    async (profileId: string, options?: { database?: string }) => {
+      const database = options?.database;
       if (
         activeProfileRef.current === profileId &&
-        connectionIdRef.current !== null
+        connectionIdRef.current !== null &&
+        activeDatabaseRef.current === (database ?? null)
       ) {
         return;
       }
 
       setTest({ status: "idle" });
       await closeActive();
-      setActive({ status: "connecting", profileId });
+      setActive({ status: "connecting", profileId, database });
 
       try {
-        const connectionId = await connectProfile(profileId);
+        const connectionId = database
+          ? await connectProfileDatabase(profileId, database)
+          : await connectProfile(profileId);
         connectionIdRef.current = connectionId;
         activeProfileRef.current = profileId;
-        setActive({ status: "connected", profileId, connectionId });
+        activeDatabaseRef.current = database ?? null;
+        setActive({ status: "connected", profileId, connectionId, database });
       } catch (error) {
         setActive({ status: "error", error: toQueryError(error) });
       }

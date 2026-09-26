@@ -35,7 +35,8 @@ export function DatabasePickerDialog({
   onOpenChange,
   onDatabaseChosen,
 }: DatabasePickerDialogProps) {
-  const { connections, scopes, scope, setScope } = useWorkspace();
+  const { connections, databases, currentDatabase, openDatabase } =
+    useWorkspace();
 
   const profiles =
     connections.profiles.status === "ready" ? connections.profiles.profiles : [];
@@ -48,13 +49,12 @@ export function DatabasePickerDialog({
     (profile) => profile.id === activeProfileId,
   );
 
-  const databases = scopes?.databases ?? [];
-  const current = scope.database;
+  const current = currentDatabase;
 
   function choose(database: string) {
-    setScope({ ...scope, database });
     onDatabaseChosen?.(database);
     onOpenChange(false);
+    void openDatabase(database);
   }
 
   return (

@@ -75,6 +75,27 @@ pub async fn connect_profile(
     Ok(connection)
 }
 
+/// Opens a saved profile against a specific database.
+///
+/// A PostgreSQL connection is bound to one database, so switching databases
+/// opens a new connection with the chosen database. The profile's saved secret
+/// is resolved in the backend; no password crosses this boundary.
+#[tauri::command]
+pub async fn connect_profile_database(
+    profiles: State<'_, ProfileService>,
+    state: State<'_, DatabaseState>,
+    profile_id: ProfileId,
+    database: String,
+) -> Result<ConnectionId, QueryError> {
+    let engine = profiles.descriptor_for(&profile_id)?.engine();
+    let adapter = state.adapter(engine);
+    let connection = profiles
+        .connect_database(adapter, &profile_id, &database)
+        .await?;
+    state.record(&connection, engine);
+    Ok(connection)
+}
+
 /// Opens a local SQLite file read-only and returns its opaque connection token.
 ///
 /// The file path is non-secret profile data; the command returns no driver

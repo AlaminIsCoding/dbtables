@@ -12,17 +12,21 @@ import { useTheme } from "./useTheme";
 
 function Shell() {
   const { theme, toggleTheme } = useTheme();
-  const { connectionId, scopes, scope, connections } = useWorkspace();
+  const { connectionId, connections, databases, currentDatabase } =
+    useWorkspace();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
   const [databaseOpen, setDatabaseOpen] = useState(false);
   // Connection id whose automatic database prompt the user dismissed.
   const [dismissedId, setDismissedId] = useState<string | null>(null);
 
+  const connecting = connections.active.status === "connecting";
   const connected = connectionId !== null;
-  const showConnections = !connected || connectionsOpen;
+  // "Engaged" includes the connecting window so the shell does not flash the
+  // connections page while a connection is being replaced.
+  const engaged = connected || connecting;
+  const showConnections = !engaged || connectionsOpen;
 
-  const databases = scopes?.databases ?? [];
   const profiles =
     connections.profiles.status === "ready" ? connections.profiles.profiles : [];
   const activeProfileId =
@@ -38,19 +42,20 @@ function Shell() {
     activeProfile.descriptor.engine !== "sqlite" &&
     Boolean(activeProfile.descriptor.database);
 
-  // Prompt for a database once a multi-database connection has no selection yet.
+  // Prompt for a database once a connection with selectable databases has no
+  // selection yet.
   useEffect(() => {
     if (!connectionId || databases.length === 0) {
       return;
     }
-    if (scope.database || hasDefaultDatabase || dismissedId === connectionId) {
+    if (currentDatabase || hasDefaultDatabase || dismissedId === connectionId) {
       return;
     }
     setDatabaseOpen(true);
   }, [
     connectionId,
     databases.length,
-    scope.database,
+    currentDatabase,
     hasDefaultDatabase,
     dismissedId,
   ]);
@@ -78,7 +83,7 @@ function Shell() {
         <div className="flex min-h-0 flex-1">
           {showConnections ? (
             <ConnectionsPage
-              onClose={connected ? () => setConnectionsOpen(false) : undefined}
+              onClose={engaged ? () => setConnectionsOpen(false) : undefined}
             />
           ) : (
             <>

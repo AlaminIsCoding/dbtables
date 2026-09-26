@@ -33,6 +33,7 @@ import {
   type WorkspaceTab,
   type WorkspaceTabsState,
 } from "@/lib/workspace/tabs";
+import { listProfileDatabases } from "@/services/connections";
 import { toQueryError } from "@/services/errors";
 import { listObjects, listScopes } from "@/services/metadata";
 import { countTableRows } from "@/services/schema";
@@ -69,6 +70,17 @@ export interface WorkspaceValue {
   scope: ObjectScope;
   /** Selects a database/schema scope and reloads the object list. */
   setScope: (scope: ObjectScope) => void;
+  /** Databases selectable on the active connection, for the database picker. */
+  databases: string[];
+  /** Currently open database, when the engine exposes a database selection. */
+  currentDatabase: string | null;
+  /**
+   * Opens a database by name.
+   *
+   * Engines that address several databases on one connection switch scope;
+   * engines that bind one database per connection (PostgreSQL) reconnect.
+   */
+  openDatabase: (database: string) => Promise<void>;
   /** Row counts keyed by table name; absent while unknown. */
   rowCounts: Record<string, number>;
   /** Reloads the schema listing and row counts. */
@@ -145,6 +157,83 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       ? connections.active.connectionId
       : null;
 
+  const activeProfileId =
+    connections.active.status === "connected" ||
+    connections.active.status === "connecting"
+      ? connections.active.profileId
+      : null;
+  const activeProfile = useMemo(
+    () =>
+      connections.profiles.status === "ready"
+        ? connections.profiles.profiles.find(
+            (profile) => profile.id === activeProfileId,
+          )
+        : undefined,
+    [connections.profiles, activeProfileId],
+  );
+  const activeEngine = activeProfile?.descriptor.engine;
+
+  // PostgreSQL binds one connection to one database, so its database list is
+  // fetched from the server rather than read from connection scopes.
+  const [serverDatabases, setServerDatabases] = useState<string[]>([]);
+  const databaseTokenRef = useRef(0);
+  const serverDatabaseProfileId =
+    activeEngine === "postgres" ? activeProfile?.id : undefined;
+
+  useEffect(() => {
+    if (!serverDatabaseProfileId || !activeProfile) {
+      setServerDatabases([]);
+      return;
+    }
+    const token = databaseTokenRef.current + 1;
+    databaseTokenRef.current = token;
+    void (async () => {
+      try {
+        const names = await listProfileDatabases({
+          id: activeProfile.id,
+          name: activeProfile.name,
+          descriptor: activeProfile.descriptor,
+        });
+        if (databaseTokenRef.current === token) {
+          setServerDatabases(names);
+        }
+      } catch {
+        if (databaseTokenRef.current === token) {
+          setServerDatabases([]);
+        }
+      }
+    })();
+    // Refetch only when the active server profile changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverDatabaseProfileId]);
+
+  const databases = useMemo(() => {
+    if (activeEngine === "mysql") {
+      return scopes?.databases ?? [];
+    }
+    if (activeEngine === "postgres") {
+      return serverDatabases;
+    }
+    return [];
+  }, [activeEngine, scopes, serverDatabases]);
+
+  const currentDatabase = useMemo(() => {
+    if (activeEngine === "mysql") {
+      return scope.database ?? null;
+    }
+    if (activeEngine === "postgres") {
+      const activeDatabase =
+        connections.active.status === "connected" ||
+        connections.active.status === "connecting"
+          ? connections.active.database
+          : undefined;
+      return activeDatabase ?? activeProfile?.descriptor.database ?? null;
+    }
+    return null;
+  }, [activeEngine, scope.database, connections.active, activeProfile]);
+
+
+
   const log = useCallback(
     (level: MessageLevel, text: string, detail?: string) => {
       messageIdRef.current += 1;
@@ -220,6 +309,20 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       void refreshSchema();
     },
     [refreshSchema],
+  );
+
+  const openDatabase = useCallback(
+    async (database: string) => {
+      if (!activeProfile) {
+        return;
+      }
+      if (activeProfile.descriptor.engine === "mysql") {
+        setScope({ ...scopeRef.current, database });
+        return;
+      }
+      await connections.connect(activeProfile.id, { database });
+    },
+    [activeProfile, connections, setScope],
   );
 
   // Reset schema and tabs whenever the active connection changes.
@@ -303,6 +406,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       scopes,
       scope,
       setScope,
+      databases,
+      currentDatabase,
+      openDatabase,
       rowCounts,
       refreshSchema,
       tabs: tabsState.tabs,
@@ -331,6 +437,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       scopes,
       scope,
       setScope,
+      databases,
+      currentDatabase,
+      openDatabase,
       rowCounts,
       refreshSchema,
       tabsState.tabs,

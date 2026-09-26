@@ -10,7 +10,9 @@ use serde::Deserialize;
 
 use crate::application::connections;
 use crate::database::{ConnectionId, ConnectionSecret, ConnectionTest, DatabaseAdapter};
-use crate::domain::{ConnectionDescriptor, ConnectionProfile, ProfileId, QueryError};
+use crate::domain::{
+    ConnectionDescriptor, ConnectionProfile, ErrorCategory, ProfileId, QueryError,
+};
 use crate::persistence::{
     apply_secret_edit, remove_profile, ProfileRepository, SecretRef, SecretStore,
 };
@@ -198,6 +200,44 @@ impl ProfileService {
             self.secrets.get(&SecretRef::for_profile(id))?
         };
         connections::connect(adapter, &profile.descriptor, secret.as_ref()).await
+    }
+
+    /// Opens a saved server profile against a specific database.
+    ///
+    /// A PostgreSQL connection is bound to one database, so reaching another
+    /// requires a new connection with the descriptor's database overridden. The
+    /// saved secret is resolved exactly as [`ProfileService::connect`] does, and
+    /// SQLite profiles are rejected because they cannot switch databases.
+    pub async fn connect_database(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        id: &ProfileId,
+        database: &str,
+    ) -> Result<ConnectionId, QueryError> {
+        let database = database.trim();
+        if database.is_empty() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                "a database name is required",
+            ));
+        }
+
+        let profile = self.repository.get(id)?.ok_or_else(|| {
+            QueryError::new(
+                ErrorCategory::Validation,
+                format!("profile `{id}` does not exist"),
+            )
+        })?;
+        if matches!(&profile.descriptor, ConnectionDescriptor::Sqlite(_)) {
+            return Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "a SQLite profile cannot switch databases",
+            ));
+        }
+
+        let descriptor = profile.descriptor.with_database(database);
+        let secret = self.secrets.get(&SecretRef::for_profile(id))?;
+        connections::connect(adapter, &descriptor, secret.as_ref()).await
     }
 
     fn resolve_input_secret(

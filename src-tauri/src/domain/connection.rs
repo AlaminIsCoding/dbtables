@@ -49,6 +49,25 @@ impl ConnectionDescriptor {
             Self::Sqlite(_) => None,
         }
     }
+
+    /// Returns a copy of this descriptor targeting `database`.
+    ///
+    /// Used to reconnect a server profile to a chosen database (PostgreSQL binds
+    /// one connection to a single database). SQLite has a single fixed file, so
+    /// a SQLite descriptor is returned unchanged.
+    pub fn with_database(&self, database: impl Into<String>) -> Self {
+        match self {
+            Self::MySql(connection) => Self::MySql(ServerConnection {
+                database: Some(database.into()),
+                ..connection.clone()
+            }),
+            Self::Postgres(connection) => Self::Postgres(ServerConnection {
+                database: Some(database.into()),
+                ..connection.clone()
+            }),
+            Self::Sqlite(_) => self.clone(),
+        }
+    }
 }
 
 /// Connection settings for a local SQLite database file.
@@ -315,6 +334,32 @@ mod tests {
                 serde_json::json!(expected)
             );
         }
+    }
+
+    #[test]
+    fn with_database_overrides_server_descriptors_and_leaves_sqlite_unchanged() {
+        let postgres = ConnectionDescriptor::Postgres(sample_server());
+        let overridden = postgres.with_database("analytics");
+        assert_eq!(
+            overridden.server().and_then(|server| server.database.as_deref()),
+            Some("analytics")
+        );
+        // Other fields are preserved.
+        assert_eq!(overridden.server().map(|server| server.port), Some(5432));
+
+        let mysql = ConnectionDescriptor::MySql(sample_server());
+        assert_eq!(
+            mysql
+                .with_database("reporting")
+                .server()
+                .and_then(|server| server.database.as_deref()),
+            Some("reporting")
+        );
+
+        let sqlite = ConnectionDescriptor::Sqlite(SqliteConnection {
+            file_path: "C:/data/app.sqlite".to_string(),
+        });
+        assert_eq!(sqlite.with_database("ignored"), sqlite);
     }
 
     fn sqlite_profile(name: &str) -> ConnectionProfile {
