@@ -9,13 +9,21 @@
 use crate::database::{
     ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, DatabaseAdapter,
 };
-use crate::domain::{ConnectionDescriptor, ErrorCategory, QueryError, SqliteConnection};
+use crate::domain::{ConnectionDescriptor, ErrorCategory, QueryError, ServerConnection, SqliteConnection};
 
 /// Builds a SQLite connection descriptor for a local database file path.
 pub fn sqlite_descriptor(file_path: impl Into<String>) -> ConnectionDescriptor {
     ConnectionDescriptor::Sqlite(SqliteConnection {
         file_path: file_path.into(),
     })
+}
+
+/// Builds a MySQL connection descriptor from secret-free server settings.
+///
+/// The password is not part of the descriptor; it is resolved from protected
+/// storage and supplied to [`connect`]/[`test_connection`] separately.
+pub fn mysql_descriptor(connection: ServerConnection) -> ConnectionDescriptor {
+    ConnectionDescriptor::MySql(connection)
 }
 
 /// Confirms a descriptor targets the engine served by `adapter`.
@@ -75,10 +83,39 @@ pub async fn connection_state(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_engine, sqlite_descriptor};
-    use crate::database::SqliteAdapter;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use super::{connect, ensure_engine, mysql_descriptor, sqlite_descriptor};
+    use crate::application::queries::execute_query;
+    use crate::database::testing::FakeAdapter;
+    use crate::database::{ConnectionSecret, SqliteAdapter};
     use crate::domain::connection::{ServerConnection, TlsMode};
-    use crate::domain::{ConnectionDescriptor, EngineId, ErrorCategory};
+    use crate::domain::{
+        ConnectionDescriptor, EngineId, ErrorCategory, OperationState, QueryRequest,
+    };
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn mysql_server() -> ServerConnection {
+        ServerConnection {
+            host: "db.example.com".to_string(),
+            port: 3306,
+            database: Some("app".to_string()),
+            username: "app_user".to_string(),
+            tls: TlsMode::Disabled,
+        }
+    }
 
     #[test]
     fn sqlite_descriptor_carries_the_file_path() {
@@ -86,6 +123,22 @@ mod tests {
 
         assert_eq!(descriptor.engine(), EngineId::Sqlite);
         assert_eq!(descriptor.sqlite_file_path(), Some("C:/data/app.sqlite"));
+    }
+
+    #[test]
+    fn mysql_descriptor_carries_server_settings_without_secrets() {
+        let descriptor = mysql_descriptor(mysql_server());
+
+        assert_eq!(descriptor.engine(), EngineId::MySql);
+        let server = descriptor.server().expect("MySQL descriptor hold server settings");
+        assert_eq!(server.host, "db.example.com");
+        assert_eq!(server.port, 3306);
+        assert_eq!(server.database.as_deref(), Some("app"));
+        assert_eq!(server.username, "app_user");
+
+        let serialized = serde_json::to_string(&descriptor).expect("descriptor should serialize");
+        assert!(!serialized.to_lowercase().contains("password"));
+        assert!(!serialized.to_lowercase().contains("secret"));
     }
 
     #[test]
@@ -101,5 +154,24 @@ mod tests {
 
         let error = ensure_engine(&adapter, &descriptor).expect_err("mismatch must fail");
         assert_eq!(error.category, ErrorCategory::Configuration);
+    }
+
+    #[test]
+    fn mysql_connect_and_query_flow_works_through_the_services() {
+        let adapter = FakeAdapter::new(EngineId::MySql);
+        let descriptor = mysql_descriptor(mysql_server());
+        let secret = ConnectionSecret::new("test-only-value");
+
+        let connection = block_on(connect(&adapter, &descriptor, Some(&secret)))
+            .expect("MySQL connect should succeed through the application service");
+
+        let result = block_on(execute_query(
+            &adapter,
+            &connection,
+            QueryRequest::new("op", "SELECT id, name FROM users"),
+        ))
+        .expect("MySQL query should run through the application service");
+        assert_eq!(result.state, OperationState::Succeeded);
+        assert!(!result.rows.is_empty());
     }
 }

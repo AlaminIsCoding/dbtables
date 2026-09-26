@@ -38,9 +38,11 @@ use crate::domain::{
     QueryError, QueryRequest, QueryResult, Row,
 };
 
+pub mod mysql;
 pub mod sqlite;
 pub mod testing;
 
+pub use mysql::MySqlAdapter;
 pub use sqlite::SqliteAdapter;
 
 /// Future returned by every adapter operation.

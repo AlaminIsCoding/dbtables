@@ -1,0 +1,1271 @@
+//! Read-only MySQL adapter backed by the pure-Rust `mysql` crate.
+//!
+//! This module implements the metadata and query half of the shared
+//! [`DatabaseAdapter`] contract for MySQL servers:
+//!
+//! - Test a server connection, open one, report state, and disconnect.
+//! - List the databases (schemas) a connection can address.
+//! - List base tables and views in a database and describe their columns and
+//!   primary key from `information_schema`.
+//! - Execute a single SQL statement and return a normalized, capped result with
+//!   column metadata, rows, affected-row count, duration, and structured errors.
+//!
+//! Table paging and staged changes arrive in later tasks and report
+//! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
+//! [`Self::capabilities`] reports only what the adapter can honor today.
+//!
+//! Design rules:
+//!
+//! - The session is switched to `READ ONLY` after connecting, so a statement
+//!   issued through this connection cannot mutate the database. A rejected write
+//!   fails at the server with a normalized permission error.
+//! - Parameters supplied with a request are bound as parameters; caller text is
+//!   never concatenated into the statement. Object/database names are always
+//!   bound values in `information_schema` predicates, never interpolated.
+//! - Driver-native [`mysql::Conn`] handles never leave this module. Callers
+//!   receive opaque, serializable [`ConnectionId`] tokens.
+//! - Credentials enter only through [`ConnectionSecret`] and are placed in the
+//!   driver options; they are never added to errors, logs, or the connection id.
+//!
+//! **Driver decision:** the synchronous `mysql` crate (rust-mysql-simple) is used
+//! instead of an async SQLx pool. It maps directly onto the adapter's
+//! per-connection model, supports prepared statements and TLS, and needs no
+//! async runtime to test — matching the `rusqlite` choice made for SQLite. SQLx
+//! remains a candidate for the PostgreSQL adapter.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use mysql::consts::{ColumnFlags, ColumnType};
+use mysql::prelude::{Protocol, Queryable};
+use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
+
+use crate::database::{
+    AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
+    ConnectionState, ConnectionTest, DatabaseAdapter, ObjectKind, ObjectRef, ObjectScope,
+    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
+};
+use crate::domain::{
+    CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
+    OperationId, QueryError, QueryRequest, QueryResult, Row, ServerConnection, TlsMode,
+};
+
+/// Upper bound on rows the adapter returns for one statement.
+///
+/// The application applies its own (smaller) default cap; this ceiling keeps a
+/// caller that bypasses the application from loading an unbounded result into
+/// memory. Rows beyond the cap are skipped and the result is marked truncated.
+const MAX_RESULT_ROWS: u32 = 10_000;
+
+/// How long the driver waits for the TCP connection and TLS handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The MySQL server's `binary` character set id, which marks BLOB/BINARY columns.
+const BINARY_CHARSET_ID: u16 = 63;
+
+/// State and driver handle for one open connection.
+struct ConnectionSlot {
+    state: ConnectionState,
+    handle: Option<Conn>,
+    /// Default database selected by the descriptor, if any.
+    default_database: Option<String>,
+}
+
+/// MySQL adapter implementing the shared database boundary.
+///
+/// The adapter owns all [`mysql::Conn`] handles for its lifetime. Each is
+/// addressed through an opaque [`ConnectionId`] so no driver object can cross
+/// the Tauri IPC boundary. Each connection has its own lock, so a long-running
+/// statement on one connection does not block another.
+pub struct MySqlAdapter {
+    connections: Mutex<HashMap<ConnectionId, Arc<Mutex<ConnectionSlot>>>>,
+    next_connection: AtomicU64,
+}
+
+impl Default for MySqlAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MySqlAdapter {
+    /// Creates an adapter with no open connections.
+    pub fn new() -> Self {
+        Self {
+            connections: Mutex::new(HashMap::new()),
+            next_connection: AtomicU64::new(0),
+        }
+    }
+
+    fn connection_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ConnectionId, Arc<Mutex<ConnectionSlot>>>> {
+        self.connections
+            .lock()
+            .expect("MySQL adapter connection state poisoned")
+    }
+
+    /// Resolves the per-connection slot or reports an unknown-token error.
+    fn connection_slot(
+        &self,
+        connection: &ConnectionId,
+    ) -> Result<Arc<Mutex<ConnectionSlot>>, QueryError> {
+        self.connection_map()
+            .get(connection)
+            .cloned()
+            .ok_or_else(|| connection_error(connection))
+    }
+
+    /// Runs `use_connection` against an open connection or reports a normalized
+    /// connection error for an unknown/closed token.
+    ///
+    /// Only the target connection's lock is held, so independent connections can
+    /// be used concurrently.
+    fn with_connection<T>(
+        &self,
+        connection: &ConnectionId,
+        use_connection: impl FnOnce(&mut Conn, Option<&str>) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        let slot = self.connection_slot(connection)?;
+        let mut slot = slot
+            .lock()
+            .expect("MySQL connection state must not be poisoned");
+        let database = slot.default_database.clone();
+        let state = slot.state;
+        match (state, slot.handle.as_mut()) {
+            (ConnectionState::Connected, Some(handle)) => {
+                use_connection(handle, database.as_deref())
+            }
+            _ => Err(connection_error(connection)),
+        }
+    }
+}
+
+/// Error for an unknown or already-closed connection token.
+fn connection_error(connection: &ConnectionId) -> QueryError {
+    QueryError::new(
+        ErrorCategory::Connection,
+        format!("connection `{connection}` is not open"),
+    )
+}
+
+/// Error for invalid or mismatched adapter configuration.
+fn configuration_error(message: impl Into<String>) -> QueryError {
+    QueryError::new(ErrorCategory::Configuration, message)
+}
+
+/// Error for a capability that is not implemented in this slice.
+fn unsupported_error(message: impl Into<String>) -> QueryError {
+    QueryError::new(ErrorCategory::Unsupported, message)
+}
+
+/// Extracts the server settings from a MySQL descriptor or reports a mismatch.
+fn mysql_server(descriptor: &ConnectionDescriptor) -> Result<&ServerConnection, QueryError> {
+    match descriptor {
+        ConnectionDescriptor::MySql(server) => Ok(server),
+        other => Err(configuration_error(format!(
+            "the MySQL adapter cannot serve a {} connection",
+            other.engine()
+        ))),
+    }
+}
+
+/// Maps a requested TLS mode onto the driver's SSL options.
+///
+/// The driver only has an "require TLS" switch: a set [`SslOpts`] makes the
+/// connection mandatory. `Preferred` therefore requests TLS with certificate and
+/// domain verification disabled; it does not fall back to plaintext.
+fn ssl_opts_for(mode: TlsMode) -> Option<SslOpts> {
+    match mode {
+        TlsMode::Disabled => None,
+        TlsMode::Preferred | TlsMode::Required => Some(
+            SslOpts::default()
+                .with_danger_accept_invalid_certs(true)
+                .with_danger_skip_domain_validation(true),
+        ),
+        // Verify the certificate chain but not that the certificate matches the
+        // host name; the descriptor carries no custom root certificate.
+        TlsMode::VerifyCa => Some(SslOpts::default().with_danger_skip_domain_validation(true)),
+        // Verify both the chain and the server identity.
+        TlsMode::VerifyFull => Some(SslOpts::default()),
+    }
+}
+
+/// Builds driver options from a descriptor and its resolved secret.
+///
+/// The password is taken from [`ConnectionSecret`] and never added anywhere
+/// else. Host/port are validated so a blank host fails before any I/O.
+fn build_opts(
+    server: &ServerConnection,
+    secret: Option<&ConnectionSecret>,
+) -> Result<Opts, QueryError> {
+    let host = server.host.trim();
+    if host.is_empty() {
+        return Err(configuration_error("a MySQL host is required"));
+    }
+    if server.port == 0 {
+        return Err(configuration_error("a MySQL port is required"));
+    }
+
+    let builder = OptsBuilder::new()
+        .ip_or_hostname(Some(host))
+        .tcp_port(server.port)
+        .user(Some(server.username.as_str()))
+        .pass(secret.map(ConnectionSecret::expose))
+        .db_name(server.database.as_deref())
+        // Connecting through a named pipe on Windows is surprising; always use
+        // TCP so the host/port in the descriptor are what is addressed.
+        .prefer_socket(false)
+        .tcp_connect_timeout(Some(CONNECT_TIMEOUT))
+        .ssl_opts(ssl_opts_for(server.tls));
+
+    Ok(Opts::from(builder))
+}
+
+/// Opens a connection and switches the session to read-only.
+///
+/// `SET SESSION TRANSACTION READ ONLY` makes every subsequent transaction
+/// (including autocommit statements) reject writes, so a raw write statement
+/// fails at the server rather than mutating data.
+fn open_read_only(
+    descriptor: &ConnectionDescriptor,
+    secret: Option<&ConnectionSecret>,
+) -> Result<Conn, QueryError> {
+    let server = mysql_server(descriptor)?;
+    let opts = build_opts(server, secret)?;
+    let mut handle = Conn::new(opts).map_err(map_error)?;
+    handle
+        .query_drop("SET SESSION TRANSACTION READ ONLY")
+        .map_err(map_error)?;
+    Ok(handle)
+}
+
+/// Normalized category for a MySQL server error code/SQLSTATE.
+fn categorize_mysql(code: u16, state: &str) -> ErrorCategory {
+    match code {
+        1045 | 1251 | 1698 => ErrorCategory::Authentication,
+        1044 | 1142 | 1143 | 1207 | 1227 | 1290 | 1370 => ErrorCategory::Permission,
+        1048 | 1062 | 1216 | 1217 | 1451 | 1452 | 1557 | 1586 | 3819 => ErrorCategory::Constraint,
+        1205 | 1213 => ErrorCategory::Locking,
+        1064 | 1149 => ErrorCategory::Syntax,
+        1046 | 1049 | 1051 | 1054 | 1109 | 1110 | 1113 | 1146 => ErrorCategory::Validation,
+        _ => categorize_sqlstate(state),
+    }
+}
+
+/// Normalized category for a SQLSTATE class, used when the code is not known.
+fn categorize_sqlstate(state: &str) -> ErrorCategory {
+    if state.starts_with("28") {
+        ErrorCategory::Authentication
+    } else if state.starts_with("23") {
+        ErrorCategory::Constraint
+    } else if state.starts_with("08") {
+        ErrorCategory::Connection
+    } else if state.starts_with("40") {
+        ErrorCategory::Locking
+    } else if state.starts_with("22") {
+        ErrorCategory::Validation
+    } else if state.starts_with("42") || state.starts_with("HY") {
+        ErrorCategory::Validation
+    } else {
+        ErrorCategory::Internal
+    }
+}
+
+/// Safe, user-facing summary for a normalized category.
+///
+/// The raw server message is preserved separately in `engine_detail`; this text
+/// is generic so it never needs to include a host, user, or credential.
+fn safe_failure_message(category: ErrorCategory) -> &'static str {
+    match category {
+        ErrorCategory::Authentication => "the MySQL server rejected the credentials",
+        ErrorCategory::Permission => "the MySQL user does not have permission for this operation",
+        ErrorCategory::Configuration => "the MySQL connection configuration is invalid",
+        ErrorCategory::Syntax => "the SQL statement has a syntax error",
+        ErrorCategory::Validation => "the MySQL statement could not be executed",
+        ErrorCategory::Constraint => "a MySQL constraint was violated",
+        ErrorCategory::Locking => "the MySQL operation was blocked by a lock or deadlock",
+        ErrorCategory::Timeout => "the MySQL operation timed out",
+        ErrorCategory::Connection | ErrorCategory::Transport => {
+            "the MySQL server could not be reached"
+        }
+        _ => "the MySQL operation failed",
+    }
+}
+
+/// Maps a driver error onto the normalized error model.
+///
+/// `engine_detail` carries the driver's own message for diagnostics. The
+/// password is never part of a driver message because it is only supplied
+/// through [`OptsBuilder::pass`]; connection ids and engine messages are safe.
+fn map_error(error: mysql::Error) -> QueryError {
+    match error {
+        mysql::Error::MySqlError(server) => {
+            let category = categorize_mysql(server.code, &server.state);
+            QueryError::new(category, safe_failure_message(category))
+                .with_code(server.code.to_string())
+                .with_engine_detail(server.message)
+        }
+        mysql::Error::DriverError(driver) => {
+            let category = categorize_driver_error(&driver);
+            QueryError::new(category, safe_failure_message(category))
+                .with_engine_detail(driver.to_string())
+        }
+        mysql::Error::IoError(ref io) => {
+            QueryError::new(ErrorCategory::Connection, safe_failure_message(ErrorCategory::Connection))
+                .with_engine_detail(io.to_string())
+        }
+        mysql::Error::CodecError(ref codec) => QueryError::new(
+            ErrorCategory::Connection,
+            safe_failure_message(ErrorCategory::Connection),
+        )
+        .with_engine_detail(codec.to_string()),
+        mysql::Error::TlsError(ref tls) => QueryError::new(
+            ErrorCategory::Connection,
+            "the MySQL TLS handshake failed",
+        )
+        .with_engine_detail(tls.to_string()),
+        other @ (mysql::Error::UrlError(_)
+        | mysql::Error::FromValueError(_)
+        | mysql::Error::FromRowError(_)) => QueryError::new(
+            ErrorCategory::Internal,
+            "the MySQL driver could not process the request",
+        )
+        .with_engine_detail(other.to_string()),
+    }
+}
+
+/// Normalized category for a driver-level (non-server) error.
+fn categorize_driver_error(error: &mysql::DriverError) -> ErrorCategory {
+    match error {
+        mysql::DriverError::Timeout | mysql::DriverError::ConnectTimeout => ErrorCategory::Timeout,
+        mysql::DriverError::ReadOnlyTransNotSupported => ErrorCategory::Configuration,
+        mysql::DriverError::CouldNotConnect(_)
+        | mysql::DriverError::SetupError
+        | mysql::DriverError::PacketOutOfSync
+        | mysql::DriverError::PacketTooLarge
+        | mysql::DriverError::UnexpectedPacket
+        | mysql::DriverError::UnsupportedProtocol(_)
+        | mysql::DriverError::Protocol41NotSet
+        | mysql::DriverError::TlsNotSupported => ErrorCategory::Connection,
+        _ => ErrorCategory::Internal,
+    }
+}
+
+/// Normalized column metadata for a MySQL result column.
+fn column_info(column: &Column) -> ColumnInfo {
+    ColumnInfo {
+        name: column.name_str().into_owned(),
+        type_name: Some(column_type_name(column.column_type())),
+        nullable: Some(!column.flags().contains(ColumnFlags::NOT_NULL_FLAG)),
+    }
+}
+
+/// Whether a result column carries binary data (BLOB/BINARY vs TEXT).
+fn column_is_binary(column: &Column) -> bool {
+    column.character_set() == BINARY_CHARSET_ID
+}
+
+/// Short engine type name for a column, for example `LONG` or `VAR_STRING`.
+fn column_type_name(column_type: ColumnType) -> String {
+    let raw = format!("{column_type:?}");
+    raw.strip_prefix("MYSQL_TYPE_").unwrap_or(&raw).to_string()
+}
+
+/// Converts a normalized cell value into a bound MySQL parameter.
+fn cell_to_value(value: &CellValue) -> Value {
+    match value {
+        CellValue::Null => Value::NULL,
+        // MySQL has no boolean type; the conventional TINYINT(1) is stored.
+        CellValue::Boolean(value) => Value::Int(i64::from(*value)),
+        CellValue::Integer(value) => Value::Int(*value),
+        CellValue::Float(value) => Value::Double(*value),
+        // Exact numerics and text bind as bytes; the server coerces to the
+        // target column type without the adapter losing precision first.
+        CellValue::Decimal(value) => Value::Bytes(value.clone().into_bytes()),
+        CellValue::Text(value) => Value::Bytes(value.clone().into_bytes()),
+        CellValue::Bytes(value) => Value::Bytes(value.clone()),
+    }
+}
+
+/// Converts a driver value into a normalized cell value.
+fn cell_from_value(value: Value, binary: bool) -> CellValue {
+    match value {
+        Value::NULL => CellValue::Null,
+        Value::Int(value) => CellValue::Integer(value),
+        Value::UInt(value) => match i64::try_from(value) {
+            Ok(signed) => CellValue::Integer(signed),
+            // Larger than i64; keep the exact value as text.
+            Err(_) => CellValue::Decimal(value.to_string()),
+        },
+        Value::Float(value) => CellValue::Float(f64::from(value)),
+        Value::Double(value) => CellValue::Float(value),
+        Value::Bytes(bytes) => {
+            if binary {
+                CellValue::Bytes(bytes)
+            } else {
+                // MySQL text protocol encodes all text as bytes.
+                CellValue::Text(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+        Value::Date(year, month, day, hour, minute, second, micros) => {
+            let mut text =
+                format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}");
+            if micros > 0 {
+                text.push_str(&format!(".{micros:06}"));
+            }
+            CellValue::Text(text)
+        }
+        Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let sign = if negative { "-" } else { "" };
+            let total_hours = days * 24 + u32::from(hours);
+            let mut text = format!("{sign}{total_hours:02}:{minutes:02}:{seconds:02}");
+            if micros > 0 {
+                text.push_str(&format!(".{micros:06}"));
+            }
+            CellValue::Text(text)
+        }
+    }
+}
+
+/// Converts one driver row into normalized cells using the result's column kinds.
+fn row_to_cells(values: Vec<Value>, binary_columns: &[bool]) -> Row {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            cell_from_value(value, binary_columns.get(index).copied().unwrap_or(false))
+        })
+        .collect()
+}
+
+/// Resolves the database to use for metadata queries.
+///
+/// Preference order: the explicit scope, the connection's default database, then
+/// the session's current database. Reports a validation error when none exist so
+/// the UI can ask for a scope instead of guessing.
+fn resolve_database(
+    handle: &mut Conn,
+    default: Option<&str>,
+    requested: Option<&str>,
+) -> Result<String, QueryError> {
+    if let Some(database) = requested.map(str::trim).filter(|name| !name.is_empty()) {
+        return Ok(database.to_string());
+    }
+    if let Some(database) = default.map(str::trim).filter(|name| !name.is_empty()) {
+        return Ok(database.to_string());
+    }
+
+    let current: Option<Option<String>> = handle.query_first("SELECT DATABASE()").map_err(map_error)?;
+    if let Some(database) = current.flatten().filter(|name| !name.is_empty()) {
+        return Ok(database);
+    }
+
+    Err(QueryError::new(
+        ErrorCategory::Validation,
+        "a MySQL database is required for this operation",
+    ))
+}
+
+/// Whole milliseconds elapsed since `started`, saturating instead of wrapping.
+fn elapsed_millis(started: Instant) -> u64 {
+    let millis = started.elapsed().as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// Executes one statement on an open handle and normalizes the outcome.
+///
+/// Completed outcomes (including a failed preparation or step) come back as a
+/// [`QueryResult`] so the caller can render the state and error. The wrapper
+/// always reports a duration, even for failures.
+fn run_statement(handle: &mut Conn, request: &QueryRequest) -> QueryResult {
+    let started = Instant::now();
+    let mut result = match execute_statement(handle, request) {
+        Ok(result) => result,
+        Err(error) => QueryResult::failed(request.operation_id.clone(), error),
+    };
+    result.duration_ms = Some(elapsed_millis(started));
+    result
+}
+
+/// Prepares and runs a statement, returning a successful normalized result.
+///
+/// A statement with no bound parameters uses the text protocol, which accepts
+/// more statement forms (for example `SHOW`), while parameterized statements use
+/// the binary protocol so caller values are always bound. Caller text is never
+/// concatenated into the statement.
+fn execute_statement(
+    handle: &mut Conn,
+    request: &QueryRequest,
+) -> Result<QueryResult, QueryError> {
+    let cap = request
+        .max_rows
+        .unwrap_or(MAX_RESULT_ROWS)
+        .min(MAX_RESULT_ROWS) as usize;
+
+    if request.parameters.is_empty() {
+        let result = handle.query_iter(&request.sql).map_err(map_error)?;
+        collect_result(result, request.operation_id.clone(), cap)
+    } else {
+        let parameters: Vec<Value> = request.parameters.iter().map(cell_to_value).collect();
+        let result = handle
+            .exec_iter(&request.sql, parameters)
+            .map_err(map_error)?;
+        collect_result(result, request.operation_id.clone(), cap)
+    }
+}
+
+/// Consumes a driver result set into the normalized [`QueryResult`] shape.
+///
+/// The generic over the protocol lets the text and binary paths share one
+/// implementation. Non-row statements report their affected-row count; row
+/// statements report columns and rows and leave `affected_rows` unset.
+fn collect_result<T: Protocol>(
+    mut result: mysql::QueryResult<'_, '_, '_, T>,
+    operation_id: OperationId,
+    cap: usize,
+) -> Result<QueryResult, QueryError> {
+    let binary_columns: Vec<bool> = result
+        .columns()
+        .as_ref()
+        .iter()
+        .map(column_is_binary)
+        .collect();
+    let columns: Vec<ColumnInfo> = result.columns().as_ref().iter().map(column_info).collect();
+    let is_row_statement = !columns.is_empty();
+    let affected_rows = result.affected_rows();
+
+    let mut rows = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = result.next() {
+        let row = row.map_err(map_error)?;
+        if rows.len() >= cap {
+            truncated = true;
+            break;
+        }
+        rows.push(row_to_cells(row.unwrap(), &binary_columns));
+    }
+
+    let mut normalized = QueryResult::succeeded(operation_id);
+    normalized.columns = columns;
+    normalized.rows = rows;
+    normalized.truncated = truncated;
+    if !is_row_statement {
+        normalized.affected_rows = Some(affected_rows);
+    }
+    Ok(normalized)
+}
+
+impl DatabaseAdapter for MySqlAdapter {
+    fn engine(&self) -> EngineId {
+        EngineId::MySql
+    }
+
+    fn capabilities(&self) -> EngineCapabilities {
+        // This slice implements connect/disconnect, metadata inspection, and
+        // read-only SQL execution over TLS-capable connections. Transaction,
+        // cancellation, and staged-change flags stay `false` so the UI never
+        // advertises behavior the adapter cannot honor yet. MySQL treats a
+        // database as its schema, so `schemas` stays `false` while
+        // `multiple_databases` reflects the database picker `list_scopes` feeds.
+        EngineCapabilities {
+            transactions: false,
+            ddl_transactions: false,
+            savepoints: false,
+            cancellation: false,
+            schemas: false,
+            multiple_databases: true,
+            tls: true,
+        }
+    }
+
+    fn test_connection<'a>(
+        &'a self,
+        descriptor: &'a ConnectionDescriptor,
+        secret: Option<&'a ConnectionSecret>,
+    ) -> AdapterFuture<'a, Result<ConnectionTest, QueryError>> {
+        Box::pin(async move {
+            let server = mysql_server(descriptor)?;
+            let opts = build_opts(server, secret)?;
+            let mut handle = Conn::new(opts).map_err(map_error)?;
+            let version: Option<String> =
+                handle.query_first("SELECT VERSION()").map_err(map_error)?;
+            // The handle is dropped here; `test_connection` must not retain it.
+            Ok(ConnectionTest {
+                engine: EngineId::MySql,
+                server_version: version,
+            })
+        })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        descriptor: &'a ConnectionDescriptor,
+        secret: Option<&'a ConnectionSecret>,
+    ) -> AdapterFuture<'a, Result<ConnectionId, QueryError>> {
+        Box::pin(async move {
+            let default_database = mysql_server(descriptor)?.database.clone();
+            let handle = open_read_only(descriptor, secret)?;
+
+            let sequence = self.next_connection.fetch_add(1, Ordering::SeqCst) + 1;
+            let connection = ConnectionId::new(format!("mysql-{sequence}"));
+
+            self.connection_map().insert(
+                connection.clone(),
+                Arc::new(Mutex::new(ConnectionSlot {
+                    state: ConnectionState::Connected,
+                    handle: Some(handle),
+                    default_database,
+                })),
+            );
+
+            Ok(connection)
+        })
+    }
+
+    fn disconnect<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let mut slot = slot
+                .lock()
+                .expect("MySQL connection state must not be poisoned");
+            slot.state = ConnectionState::Disconnected;
+            slot.handle = None;
+            Ok(())
+        })
+    }
+
+    fn connection_state<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+    ) -> AdapterFuture<'a, Result<ConnectionState, QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let slot = slot
+                .lock()
+                .expect("MySQL connection state must not be poisoned");
+            Ok(slot.state)
+        })
+    }
+
+    fn list_objects<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        scope: &'a ObjectScope,
+    ) -> AdapterFuture<'a, Result<Vec<ObjectRef>, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, default_database| {
+                let database =
+                    resolve_database(handle, default_database, scope.database.as_deref())?;
+                let rows: Vec<(String, String)> = handle
+                    .exec(
+                        "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.tables \
+                         WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+                        (database.as_str(),),
+                    )
+                    .map_err(map_error)?;
+
+                let mut objects = Vec::with_capacity(rows.len());
+                for (name, table_type) in rows {
+                    let kind = if table_type.eq_ignore_ascii_case("VIEW") {
+                        ObjectKind::View
+                    } else {
+                        ObjectKind::Table
+                    };
+                    objects.push(ObjectRef {
+                        database: Some(database.clone()),
+                        schema: None,
+                        name,
+                        kind,
+                    });
+                }
+                Ok(objects)
+            })
+        })
+    }
+
+    fn list_scopes<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+    ) -> AdapterFuture<'a, Result<ScopeListing, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, _default_database| {
+                // MySQL exposes databases (a synonym for schemas) on one
+                // connection; there is no separate schema namespace.
+                let rows: Vec<(String,)> = handle
+                    .exec(
+                        "SELECT SCHEMA_NAME FROM information_schema.schemata ORDER BY SCHEMA_NAME",
+                        (),
+                    )
+                    .map_err(map_error)?;
+
+                Ok(ScopeListing {
+                    databases: rows.into_iter().map(|(name,)| name).collect(),
+                    schemas: Vec::new(),
+                })
+            })
+        })
+    }
+
+    fn describe_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+    ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, default_database| {
+                let database =
+                    resolve_database(handle, default_database, object.database.as_deref())?;
+
+                let rows: Vec<(String, String, String)> = handle
+                    .exec(
+                        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
+                         FROM information_schema.columns \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                         ORDER BY ORDINAL_POSITION",
+                        (database.as_str(), object.name.as_str()),
+                    )
+                    .map_err(map_error)?;
+
+                if rows.is_empty() {
+                    return Err(QueryError::new(
+                        ErrorCategory::Validation,
+                        format!(
+                            "`{}` is not a table or view in this MySQL database",
+                            object.name
+                        ),
+                    ));
+                }
+
+                let mut columns = Vec::with_capacity(rows.len());
+                for (name, column_type, is_nullable) in rows {
+                    let nullable = match is_nullable.as_str() {
+                        "YES" => Some(true),
+                        "NO" => Some(false),
+                        _ => None,
+                    };
+                    columns.push(ColumnInfo {
+                        name,
+                        type_name: Some(column_type),
+                        nullable,
+                    });
+                }
+
+                let keys: Vec<(String,)> = handle
+                    .exec(
+                        "SELECT COLUMN_NAME FROM information_schema.key_column_usage \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                         AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
+                        (database.as_str(), object.name.as_str()),
+                    )
+                    .map_err(map_error)?;
+
+                Ok(TableDescription {
+                    columns,
+                    primary_key_columns: keys.into_iter().map(|(name,)| name).collect(),
+                })
+            })
+        })
+    }
+
+    fn fetch_table_page<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        _request: TablePageRequest,
+    ) -> AdapterFuture<'a, Result<TablePage, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |_handle, _database| {
+                Err(unsupported_error(
+                    "table data browsing is not implemented in this slice",
+                ))
+            })
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        request: QueryRequest,
+    ) -> AdapterFuture<'a, Result<QueryResult, QueryError>> {
+        Box::pin(async move {
+            if request.sql.trim().is_empty() {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    "the SQL statement is empty",
+                ));
+            }
+
+            self.with_connection(connection, |handle, _database| {
+                Ok(run_statement(handle, &request))
+            })
+        })
+    }
+
+    fn apply_change<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        _request: ChangeRequest,
+    ) -> AdapterFuture<'a, Result<ChangeResult, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |_handle, _database| {
+                Err(unsupported_error(
+                    "this connection is read-only and does not support data changes",
+                ))
+            })
+        })
+    }
+
+    fn cancel<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _operation: &'a OperationId,
+    ) -> AdapterFuture<'a, Result<CancelOutcome, QueryError>> {
+        Box::pin(async move {
+            Err(unsupported_error(
+                "the MySQL driver does not support query cancellation in this slice",
+            ))
+        })
+    }
+
+    fn begin_transaction<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+    ) -> AdapterFuture<'a, Result<TransactionId, QueryError>> {
+        Box::pin(async move {
+            Err(unsupported_error(
+                "explicit transactions are not implemented for MySQL in this slice",
+            ))
+        })
+    }
+
+    fn commit<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _transaction: &'a TransactionId,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(unsupported_error(
+                "explicit transactions are not implemented for MySQL in this slice",
+            ))
+        })
+    }
+
+    fn rollback<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _transaction: &'a TransactionId,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(unsupported_error(
+                "explicit transactions are not implemented for MySQL in this slice",
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use super::{
+        build_opts, categorize_mysql, cell_from_value, cell_to_value, mysql_server, ssl_opts_for,
+        MySqlAdapter,
+    };
+    use crate::database::{ConnectionId, ConnectionSecret, DatabaseAdapter};
+    use crate::domain::connection::{ServerConnection, TlsMode};
+    use crate::domain::{
+        CellValue, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory, QueryRequest,
+    };
+    use mysql::Value;
+
+    /// Minimal executor for the immediately-ready futures the adapter returns.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn server(tls: TlsMode) -> ServerConnection {
+        ServerConnection {
+            host: "db.example.com".to_string(),
+            port: 3307,
+            database: Some("app".to_string()),
+            username: "app_user".to_string(),
+            tls,
+        }
+    }
+
+    #[test]
+    fn engine_and_capabilities_report_only_the_implemented_slice() {
+        let adapter = MySqlAdapter::new();
+
+        assert_eq!(adapter.engine(), EngineId::MySql);
+        assert_eq!(
+            adapter.capabilities(),
+            EngineCapabilities {
+                transactions: false,
+                ddl_transactions: false,
+                savepoints: false,
+                cancellation: false,
+                schemas: false,
+                multiple_databases: true,
+                tls: true,
+            }
+        );
+    }
+
+    #[test]
+    fn non_mysql_descriptors_are_rejected_before_connecting() {
+        let descriptor = ConnectionDescriptor::Sqlite(
+            crate::domain::connection::SqliteConnection {
+                file_path: "C:/data/app.sqlite".to_string(),
+            },
+        );
+
+        let error = mysql_server(&descriptor).expect_err("a SQLite descriptor must be rejected");
+        assert_eq!(error.category, ErrorCategory::Configuration);
+
+        let adapter = MySqlAdapter::new();
+        let error = block_on(adapter.test_connection(&descriptor, None))
+            .expect_err("the adapter must reject another engine before I/O");
+        assert_eq!(error.category, ErrorCategory::Configuration);
+    }
+
+    #[test]
+    fn build_opts_translates_descriptor_fields() {
+        let descriptor = server(TlsMode::Disabled);
+        let opts = build_opts(&descriptor, None).expect("valid settings should build options");
+
+        assert_eq!(opts.get_ip_or_hostname(), "db.example.com");
+        assert_eq!(opts.get_tcp_port(), 3307);
+        assert_eq!(opts.get_user(), Some("app_user"));
+        assert_eq!(opts.get_db_name(), Some("app"));
+        assert!(opts.get_ssl_opts().is_none());
+        // The named-pipe preference must be off so the host/port are addressed.
+        assert!(!opts.get_prefer_socket());
+    }
+
+    #[test]
+    fn build_opts_forwards_a_secret_without_exposing_it_elsewhere() {
+        let descriptor = server(TlsMode::Disabled);
+        let secret = ConnectionSecret::new("test-only-value");
+        let opts = build_opts(&descriptor, Some(&secret)).expect("options should build");
+
+        assert!(opts.get_pass().is_some());
+    }
+
+    #[test]
+    fn build_opts_rejects_blank_hosts_and_zero_ports() {
+        let mut blank = server(TlsMode::Disabled);
+        blank.host = "   ".to_string();
+        assert_eq!(
+            build_opts(&blank, None).expect_err("blank host must fail").category,
+            ErrorCategory::Configuration
+        );
+
+        let mut zero_port = server(TlsMode::Disabled);
+        zero_port.port = 0;
+        assert_eq!(
+            build_opts(&zero_port, None)
+                .expect_err("zero port must fail")
+                .category,
+            ErrorCategory::Configuration
+        );
+    }
+
+    #[test]
+    fn tls_modes_select_driver_ssl_options() {
+        assert!(ssl_opts_for(TlsMode::Disabled).is_none());
+
+        let preferred = ssl_opts_for(TlsMode::Preferred).expect("preferred should request TLS");
+        assert!(preferred.accept_invalid_certs());
+        assert!(preferred.skip_domain_validation());
+
+        let required = ssl_opts_for(TlsMode::Required).expect("required should request TLS");
+        assert!(required.accept_invalid_certs());
+
+        let verify_ca = ssl_opts_for(TlsMode::VerifyCa).expect("verify_ca should request TLS");
+        assert!(!verify_ca.accept_invalid_certs());
+        assert!(verify_ca.skip_domain_validation());
+
+        let verify_full =
+            ssl_opts_for(TlsMode::VerifyFull).expect("verify_full should request TLS");
+        assert!(!verify_full.accept_invalid_certs());
+        assert!(!verify_full.skip_domain_validation());
+    }
+
+    #[test]
+    fn server_error_codes_map_to_normalized_categories() {
+        let cases = [
+            (1045, "28000", ErrorCategory::Authentication),
+            (1142, "42000", ErrorCategory::Permission),
+            (1290, "HY000", ErrorCategory::Permission),
+            (1062, "23000", ErrorCategory::Constraint),
+            (1213, "40001", ErrorCategory::Locking),
+            (1064, "42000", ErrorCategory::Syntax),
+            (1146, "42S02", ErrorCategory::Validation),
+            (9999, "08001", ErrorCategory::Connection),
+            (9999, "22007", ErrorCategory::Validation),
+        ];
+
+        for (code, state, expected) in cases {
+            assert_eq!(categorize_mysql(code, state), expected, "code {code}");
+        }
+    }
+
+    #[test]
+    fn cell_values_convert_both_directions() {
+        assert_eq!(cell_to_value(&CellValue::Null), Value::NULL);
+        assert_eq!(cell_to_value(&CellValue::Boolean(true)), Value::Int(1));
+        assert_eq!(cell_to_value(&CellValue::Integer(42)), Value::Int(42));
+        assert_eq!(cell_to_value(&CellValue::Float(1.5)), Value::Double(1.5));
+        assert_eq!(
+            cell_to_value(&CellValue::Decimal("12.50".to_string())),
+            Value::Bytes(b"12.50".to_vec())
+        );
+
+        assert_eq!(cell_from_value(Value::NULL, false), CellValue::Null);
+        assert_eq!(cell_from_value(Value::Int(-3), false), CellValue::Integer(-3));
+        assert_eq!(cell_from_value(Value::UInt(3), false), CellValue::Integer(3));
+        assert_eq!(
+            cell_from_value(Value::Bytes(b"hello".to_vec()), false),
+            CellValue::Text("hello".to_string())
+        );
+        assert_eq!(
+            cell_from_value(Value::Bytes(vec![0, 159, 146, 150]), true),
+            CellValue::Bytes(vec![0, 159, 146, 150])
+        );
+        assert_eq!(
+            cell_from_value(Value::UInt(u64::MAX), false),
+            CellValue::Decimal(u64::MAX.to_string())
+        );
+        assert_eq!(
+            cell_from_value(Value::Date(2024, 5, 6, 7, 8, 9, 0), false),
+            CellValue::Text("2024-05-06 07:08:09".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_connections_are_connection_errors_without_a_server() {
+        let adapter = MySqlAdapter::new();
+        let unknown = ConnectionId::new("does-not-exist");
+
+        assert_eq!(
+            block_on(adapter.connection_state(&unknown))
+                .expect_err("unknown state must fail")
+                .category,
+            ErrorCategory::Connection
+        );
+        assert_eq!(
+            block_on(adapter.disconnect(&unknown))
+                .expect_err("unknown disconnect must fail")
+                .category,
+            ErrorCategory::Connection
+        );
+        assert_eq!(
+            block_on(adapter.execute(
+                &unknown,
+                QueryRequest::new("op", "SELECT 1"),
+            ))
+            .expect_err("unknown execute must fail")
+            .category,
+            ErrorCategory::Connection
+        );
+    }
+
+    #[test]
+    fn execute_rejects_blank_sql_before_touching_the_connection() {
+        let adapter = MySqlAdapter::new();
+        let unknown = ConnectionId::new("does-not-exist");
+
+        let error = block_on(adapter.execute(&unknown, QueryRequest::new("op-blank", "   ")))
+            .expect_err("blank SQL is a precondition failure");
+        assert_eq!(error.category, ErrorCategory::Validation);
+        assert_eq!(
+            block_on(adapter.connection_state(&unknown))
+                .expect_err("state remains unknown")
+                .category,
+            ErrorCategory::Connection
+        );
+    }
+
+    #[test]
+    fn a_fresh_adapter_is_disconnected_and_unsupported_for_writes() {
+        let adapter = MySqlAdapter::new();
+        let unknown = ConnectionId::new("missing");
+
+        // Staged changes and paging report Unsupported for a live connection;
+        // with an unknown token the connection error takes precedence.
+        assert_eq!(
+            adapter.capabilities().transactions,
+            false,
+            "transactions are not implemented in this slice"
+        );
+        assert_eq!(
+            block_on(adapter.cancel(&unknown, &crate::domain::OperationId::new("op")))
+                .expect_err("cancellation is unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+    }
+}
+
+/// Integration tests that only run when a disposable MySQL server is configured.
+///
+/// Set `DBTABLES_MYSQL_TEST_HOST` (and optionally `_PORT`, `_DATABASE`, `_USER`,
+/// `_PASSWORD`, `_TLS`) to enable them. When the host is absent every test
+/// returns early, so the default `cargo test` run needs no server. No test prints
+/// a password.
+#[cfg(test)]
+mod integration_tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use super::MySqlAdapter;
+    use crate::database::{
+        ConnectionId, ConnectionSecret, ConnectionState, DatabaseAdapter, ObjectScope,
+    };
+    use crate::domain::connection::{ServerConnection, TlsMode};
+    use crate::domain::{
+        ConnectionDescriptor, EngineId, ErrorCategory, OperationState, QueryRequest,
+    };
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn env_value(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|value| !value.is_empty())
+    }
+
+    /// Returns the configured descriptor and secret, or `None` to skip.
+    fn configured() -> Option<(ConnectionDescriptor, Option<ConnectionSecret>)> {
+        let host = env_value("DBTABLES_MYSQL_TEST_HOST")?;
+        let port = env_value("DBTABLES_MYSQL_TEST_PORT")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3306);
+        let tls = match env_value("DBTABLES_MYSQL_TEST_TLS").as_deref() {
+            Some("preferred") => TlsMode::Preferred,
+            Some("required") => TlsMode::Required,
+            Some("verify_ca") => TlsMode::VerifyCa,
+            Some("verify_full") => TlsMode::VerifyFull,
+            _ => TlsMode::Disabled,
+        };
+        let server = ServerConnection {
+            host,
+            port,
+            database: env_value("DBTABLES_MYSQL_TEST_DATABASE"),
+            username: env_value("DBTABLES_MYSQL_TEST_USER").unwrap_or_else(|| "root".to_string()),
+            tls,
+        };
+        let secret = env_value("DBTABLES_MYSQL_TEST_PASSWORD").map(ConnectionSecret::new);
+        Some((ConnectionDescriptor::MySql(server), secret))
+    }
+
+    #[test]
+    fn connect_lists_metadata_and_runs_a_query() {
+        let Some((descriptor, secret)) = configured() else {
+            return;
+        };
+        let adapter = MySqlAdapter::new();
+
+        let test = block_on(adapter.test_connection(&descriptor, secret.as_ref()))
+            .expect("test connection should succeed");
+        assert_eq!(test.engine, EngineId::MySql);
+
+        let connection = block_on(adapter.connect(&descriptor, secret.as_ref()))
+            .expect("connect should succeed");
+        assert_eq!(
+            block_on(adapter.connection_state(&connection)).expect("state should resolve"),
+            ConnectionState::Connected
+        );
+
+        let scopes = block_on(adapter.list_scopes(&connection)).expect("scopes should list");
+        assert!(!scopes.databases.is_empty());
+
+        let scope = if let Some(database) = descriptor.server().and_then(|s| s.database.clone()) {
+            ObjectScope {
+                database: Some(database),
+                schema: None,
+            }
+        } else {
+            ObjectScope {
+                database: scopes.databases.first().cloned(),
+                schema: None,
+            }
+        };
+        let objects = block_on(adapter.list_objects(&connection, &scope))
+            .expect("object listing should succeed");
+        if let Some(first) = objects.first() {
+            let description = block_on(adapter.describe_table(&connection, first))
+                .expect("description should succeed");
+            assert!(!description.columns.is_empty());
+        }
+
+        let selected = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("it-select", "SELECT 1 AS one"),
+        ))
+        .expect("select should return a result");
+        assert_eq!(selected.state, OperationState::Succeeded);
+        assert_eq!(selected.rows.len(), 1);
+
+        let invalid = block_on(adapter.execute(
+            &connection,
+            QueryRequest::new("it-invalid", "SELECT FROM WHERE"),
+        ))
+        .expect("invalid SQL still produces a result");
+        assert_eq!(invalid.state, OperationState::Failed);
+        assert_eq!(
+            invalid.error.expect("failure should carry an error").category,
+            ErrorCategory::Syntax
+        );
+
+        block_on(adapter.disconnect(&connection)).expect("disconnect should succeed");
+        assert_eq!(
+            block_on(adapter.connection_state(&connection)).expect("state should resolve"),
+            ConnectionState::Disconnected
+        );
+    }
+
+    #[test]
+    fn bad_credentials_are_reported_as_authentication_failures() {
+        let Some((descriptor, _secret)) = configured() else {
+            return;
+        };
+        let adapter = MySqlAdapter::new();
+        let wrong = ConnectionSecret::new("definitely-not-the-password");
+
+        let error = block_on(adapter.test_connection(&descriptor, Some(&wrong)))
+            .expect_err("bad credentials must fail");
+        assert_eq!(error.category, ErrorCategory::Authentication);
+
+        let unknown = ConnectionId::new("never-opened");
+        assert_eq!(
+            block_on(adapter.connection_state(&unknown))
+                .expect_err("unknown connection must fail")
+                .category,
+            ErrorCategory::Connection
+        );
+    }
+}
