@@ -221,7 +221,149 @@ pub struct ObjectScope {
     pub schema: Option<String>,
 }
 
+/// Kind of table constraint reported by metadata inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintKind {
+    /// The table's primary key.
+    PrimaryKey,
+    /// A foreign key referencing another table.
+    ForeignKey,
+    /// A unique constraint.
+    Unique,
+    /// A check constraint.
+    Check,
+}
+
+/// Normalized description of a table index.
+///
+/// `columns` is in index order. Expression indexes (where an engine exposes no
+/// column name for a key part) keep their ordinal position by using the
+/// adapter's placeholder text, so the list length still reflects the width.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexInfo {
+    /// Index name as reported by the engine.
+    pub name: String,
+    /// Indexed columns in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// Whether the index enforces uniqueness.
+    pub unique: bool,
+    /// Whether the index backs the primary key.
+    #[serde(default)]
+    pub primary: bool,
+}
+
+impl IndexInfo {
+    /// Creates index metadata.
+    pub fn new(name: impl Into<String>, columns: Vec<String>, unique: bool, primary: bool) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            unique,
+            primary,
+        }
+    }
+}
+
+/// Normalized description of a table constraint.
+///
+/// A foreign key carries the referenced table/columns so the UI can show a
+/// relationship without a second engine call. `definition` carries engine text
+/// for check constraints and expression details when the engine reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConstraintInfo {
+    /// Constraint name as reported by the engine, or a deterministic label the
+    /// adapter generates when the engine does not name it.
+    pub name: String,
+    /// Kind of constraint.
+    pub kind: ConstraintKind,
+    /// Constrained columns in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// For a foreign key: referenced schema, when the engine reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referenced_schema: Option<String>,
+    /// For a foreign key: referenced table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referenced_table: Option<String>,
+    /// For a foreign key: referenced columns, in the same order as `columns`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub referenced_columns: Vec<String>,
+    /// Engine text for a check constraint, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+impl ConstraintInfo {
+    /// Creates a constraint of `kind` with its columns and no extra details.
+    ///
+    /// Used for kinds whose engine metadata carries nothing beyond name and
+    /// columns (for example a MySQL `CHECK` constraint when the engine does not
+    /// expose its clause through the queried view).
+    pub fn of_kind(name: impl Into<String>, kind: ConstraintKind, columns: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            columns,
+            referenced_schema: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+            definition: None,
+        }
+    }
+
+    /// Creates a primary-key constraint.
+    pub fn primary_key(name: impl Into<String>, columns: Vec<String>) -> Self {
+        Self::of_kind(name, ConstraintKind::PrimaryKey, columns)
+    }
+
+    /// Creates a unique constraint.
+    pub fn unique(name: impl Into<String>, columns: Vec<String>) -> Self {
+        Self::of_kind(name, ConstraintKind::Unique, columns)
+    }
+
+    /// Creates a foreign-key constraint with its referenced target.
+    pub fn foreign_key(
+        name: impl Into<String>,
+        columns: Vec<String>,
+        referenced_schema: Option<String>,
+        referenced_table: impl Into<String>,
+        referenced_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: ConstraintKind::ForeignKey,
+            columns,
+            referenced_schema,
+            referenced_table: Some(referenced_table.into()),
+            referenced_columns,
+            definition: None,
+        }
+    }
+
+    /// Creates a check constraint carrying its engine text.
+    pub fn check(name: impl Into<String>, definition: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: ConstraintKind::Check,
+            columns: Vec::new(),
+            referenced_schema: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+            definition: Some(definition.into()),
+        }
+    }
+}
+
 /// Normalized description of a table or view.
+///
+/// `indexes` and `constraints` distinguish "not supported" from "none exist":
+/// `None` means the adapter does not expose that metadata for the object, while
+/// `Some(vec![])` means it was inspected and the engine reported none. An
+/// adapter must never return an empty vector to imply support it does not have.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableDescription {
@@ -233,6 +375,38 @@ pub struct TableDescription {
     /// needs before it may offer safe row targeting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primary_key_columns: Vec<String>,
+    /// Indexes when the adapter can report them; `None` when unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexes: Option<Vec<IndexInfo>>,
+    /// Constraints when the adapter can report them; `None` when unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<Vec<ConstraintInfo>>,
+}
+
+impl TableDescription {
+    /// Creates a description with columns and primary key and no optional
+    /// metadata. An adapter that inspected indexes/constraints attaches them
+    /// with [`TableDescription::with_indexes`]/[`TableDescription::with_constraints`].
+    pub fn new(columns: Vec<ColumnInfo>, primary_key_columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            primary_key_columns,
+            indexes: None,
+            constraints: None,
+        }
+    }
+
+    /// Attaches inspected index metadata.
+    pub fn with_indexes(mut self, indexes: Vec<IndexInfo>) -> Self {
+        self.indexes = Some(indexes);
+        self
+    }
+
+    /// Attaches inspected constraint metadata.
+    pub fn with_constraints(mut self, constraints: Vec<ConstraintInfo>) -> Self {
+        self.constraints = Some(constraints);
+        self
+    }
 }
 
 /// Database/catalog and schema names a connection can address.
@@ -725,7 +899,13 @@ pub trait DatabaseAdapter: Send + Sync {
         connection: &'a ConnectionId,
     ) -> AdapterFuture<'a, Result<ScopeListing, QueryError>>;
 
-    /// Describes the columns and primary key of a table or view.
+    /// Describes the columns, primary key, indexes, and constraints of a table
+    /// or view.
+    ///
+    /// [`TableDescription::indexes`] and [`TableDescription::constraints`] are
+    /// `None` when the adapter cannot inspect that category and `Some(vec![])`
+    /// when it did and found none, so unsupported metadata is never presented
+    /// as an empty success.
     fn describe_table<'a>(
         &'a self,
         connection: &'a ConnectionId,
@@ -802,9 +982,9 @@ pub trait DatabaseAdapter: Send + Sync {
 mod tests {
     use super::{
         CancelOutcome, ChangeOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-        ConnectionState, FilterOperator, ObjectKind, ObjectRef, PendingChange, RowIdentity, RowKey,
-        ScopeListing, SortDirection, SortKey, TableDescription, TableFilter, TablePageRequest,
-        TransactionId,
+        ConnectionState, ConstraintInfo, FilterOperator, IndexInfo, ObjectKind, ObjectRef,
+        PendingChange, RowIdentity, RowKey, ScopeListing, SortDirection, SortKey, TableDescription,
+        TableFilter, TablePageRequest, TransactionId,
     };
     use crate::domain::{CellValue, ColumnInfo, OperationId};
 
@@ -888,15 +1068,59 @@ mod tests {
 
     #[test]
     fn table_description_uses_camel_case_and_omits_empty_primary_key() {
-        let description = TableDescription {
-            columns: vec![ColumnInfo::named("id")],
-            primary_key_columns: Vec::new(),
-        };
+        let description = TableDescription::new(vec![ColumnInfo::named("id")], Vec::new());
         let value =
             serde_json::to_value(&description).expect("description should serialize");
 
         assert_eq!(value["columns"][0]["name"], "id");
         assert!(value.get("primaryKeyColumns").is_none());
+        assert!(
+            value.get("indexes").is_none(),
+            "an uninspected index list must be absent, not an empty success"
+        );
+        assert!(
+            value.get("constraints").is_none(),
+            "an uninspected constraint list must be absent, not an empty success"
+        );
+    }
+
+    #[test]
+    fn table_description_serializes_inspected_indexes_and_constraints() {
+        let description = TableDescription::new(
+            vec![ColumnInfo::named("id"), ColumnInfo::named("email")],
+            vec!["id".to_string()],
+        )
+        .with_indexes(vec![
+            IndexInfo::new("users_pkey", vec!["id".to_string()], true, true),
+            IndexInfo::new("users_email_idx", vec!["email".to_string()], false, false),
+        ])
+        .with_constraints(vec![
+            ConstraintInfo::primary_key("users_pkey", vec!["id".to_string()]),
+            ConstraintInfo::unique("users_email_key", vec!["email".to_string()]),
+            ConstraintInfo::foreign_key(
+                "users_team_fkey",
+                vec!["team_id".to_string()],
+                None,
+                "teams",
+                vec!["id".to_string()],
+            ),
+            ConstraintInfo::check("users_email_check", "email <> ''"),
+        ]);
+
+        let value = serde_json::to_value(&description).expect("description should serialize");
+
+        assert_eq!(value["primaryKeyColumns"][0], "id");
+        assert_eq!(value["indexes"][0]["name"], "users_pkey");
+        assert_eq!(value["indexes"][0]["unique"], true);
+        assert_eq!(value["indexes"][0]["primary"], true);
+        assert_eq!(value["indexes"][1]["columns"][0], "email");
+        assert_eq!(value["constraints"][0]["kind"], "primary_key");
+        assert_eq!(value["constraints"][1]["kind"], "unique");
+        assert_eq!(value["constraints"][2]["kind"], "foreign_key");
+        assert_eq!(value["constraints"][2]["referencedTable"], "teams");
+        assert_eq!(value["constraints"][2]["referencedColumns"][0], "id");
+        assert_eq!(value["constraints"][3]["kind"], "check");
+        assert_eq!(value["constraints"][3]["definition"], "email <> ''");
     }
 
     fn users_object() -> ObjectRef {

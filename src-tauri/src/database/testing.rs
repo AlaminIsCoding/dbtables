@@ -16,9 +16,10 @@ use crate::domain::{
 
 use super::{
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef,
-    ObjectScope, PendingChange, RowIdentity, ScopeListing, SortDirection, TableDescription,
-    TableFilter, TablePage, TablePageRequest, TransactionId,
+    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter,
+    FilterOperator, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, RowIdentity,
+    ScopeListing, SortDirection, TableDescription, TableFilter, TablePage, TablePageRequest,
+    TransactionId,
 };
 
 /// Small deterministic table the fake exposes for paging and writes.
@@ -31,6 +32,8 @@ struct FakeTable {
     primary_key: Vec<String>,
     rows: Vec<Row>,
     next_id: i64,
+    indexes: Vec<IndexInfo>,
+    constraints: Vec<ConstraintInfo>,
 }
 
 impl Default for FakeTable {
@@ -55,6 +58,14 @@ impl Default for FakeTable {
                 vec![CellValue::Integer(3), CellValue::Text("carol".to_string())],
             ],
             next_id: 4,
+            indexes: vec![
+                IndexInfo::new("users_pkey", vec!["id".to_string()], true, true),
+                IndexInfo::new("users_name_idx", vec!["name".to_string()], false, false),
+            ],
+            constraints: vec![ConstraintInfo::primary_key(
+                "users_pkey",
+                vec!["id".to_string()],
+            )],
         }
     }
 }
@@ -344,7 +355,15 @@ impl FakeAdapter {
     /// Removes the fake table's primary key, modeling a table that cannot be
     /// targeted safely for update/delete.
     pub fn without_primary_key(self) -> Self {
-        self.state().table.primary_key.clear();
+        {
+            let mut state = self.state();
+            state.table.primary_key.clear();
+            state.table.indexes.retain(|index| !index.primary);
+            state
+                .table
+                .constraints
+                .retain(|constraint| constraint.kind != ConstraintKind::PrimaryKey);
+        }
         self
     }
 
@@ -355,7 +374,18 @@ impl FakeAdapter {
         S: Into<String>,
     {
         let primary_key: Vec<String> = columns.into_iter().map(Into::into).collect();
-        self.state().table.primary_key = primary_key;
+        {
+            let mut state = self.state();
+            state
+                .table
+                .constraints
+                .retain(|constraint| constraint.kind != ConstraintKind::PrimaryKey);
+            state.table.constraints.push(ConstraintInfo::primary_key(
+                "users_pkey",
+                primary_key.clone(),
+            ));
+            state.table.primary_key = primary_key;
+        }
         self
     }
 
@@ -591,10 +621,11 @@ impl DatabaseAdapter for FakeAdapter {
             }
 
             let table = &self.state().table;
-            Ok(TableDescription {
-                columns: table.columns.clone(),
-                primary_key_columns: table.primary_key.clone(),
-            })
+            Ok(
+                TableDescription::new(table.columns.clone(), table.primary_key.clone())
+                    .with_indexes(table.indexes.clone())
+                    .with_constraints(table.constraints.clone()),
+            )
         })
     }
 
@@ -990,8 +1021,9 @@ mod contract_tests {
     use super::FakeAdapter;
     use crate::database::{
         CancelOutcome, ChangeOutcome, ChangeRequest, ConnectionId, ConnectionSecret,
-        ConnectionState, DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef, ObjectScope,
-        PendingChange, RowIdentity, RowKey, SortDirection, SortKey, TableFilter, TablePageRequest,
+        ConnectionState, ConstraintKind, DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef,
+        ObjectScope, PendingChange, RowIdentity, RowKey, SortDirection, SortKey, TableFilter,
+        TablePageRequest,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -1317,6 +1349,23 @@ mod contract_tests {
             .expect("description should succeed");
         assert_eq!(description.columns[0].name, "id");
         assert_eq!(description.primary_key_columns, ["id"]);
+
+        let indexes = description
+            .indexes
+            .expect("the fake adapter must report inspected index metadata");
+        assert!(indexes
+            .iter()
+            .any(|index| index.name == "users_pkey" && index.primary));
+        assert!(indexes
+            .iter()
+            .any(|index| index.name == "users_name_idx"));
+
+        let constraints = description
+            .constraints
+            .expect("the fake adapter must report inspected constraint metadata");
+        assert!(constraints
+            .iter()
+            .any(|constraint| constraint.kind == ConstraintKind::PrimaryKey));
     }
 
     #[test]

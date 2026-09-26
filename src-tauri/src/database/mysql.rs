@@ -44,8 +44,9 @@ use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::database::{
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, DatabaseAdapter, ObjectKind, ObjectRef, ObjectScope,
-    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
+    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, IndexInfo,
+    ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage,
+    TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -372,6 +373,21 @@ fn column_is_binary(column: &Column) -> bool {
 fn column_type_name(column_type: ColumnType) -> String {
     let raw = format!("{column_type:?}");
     raw.strip_prefix("MYSQL_TYPE_").unwrap_or(&raw).to_string()
+}
+
+/// Maps a MySQL `table_constraints.constraint_type` value onto a normalized kind.
+fn mysql_constraint_kind(constraint_type: &str) -> Option<ConstraintKind> {
+    if constraint_type.eq_ignore_ascii_case("PRIMARY KEY") {
+        Some(ConstraintKind::PrimaryKey)
+    } else if constraint_type.eq_ignore_ascii_case("FOREIGN KEY") {
+        Some(ConstraintKind::ForeignKey)
+    } else if constraint_type.eq_ignore_ascii_case("UNIQUE") {
+        Some(ConstraintKind::Unique)
+    } else if constraint_type.eq_ignore_ascii_case("CHECK") {
+        Some(ConstraintKind::Check)
+    } else {
+        None
+    }
 }
 
 /// Converts a normalized cell value into a bound MySQL parameter.
@@ -764,11 +780,101 @@ impl DatabaseAdapter for MySqlAdapter {
                         (database.as_str(), object.name.as_str()),
                     )
                     .map_err(map_error)?;
+                let primary_key_columns: Vec<String> =
+                    keys.into_iter().map(|(name,)| name).collect();
 
-                Ok(TableDescription {
-                    columns,
-                    primary_key_columns: keys.into_iter().map(|(name,)| name).collect(),
-                })
+                // Indexes: `statistics` lists one row per index key part, so the
+                // rows are grouped by index name in index-key order. Functional
+                // key parts report a `NULL` column name; `COALESCE` keeps the
+                // slot rather than dropping it from the width.
+                let index_rows: Vec<(String, i64, String)> = handle
+                    .exec(
+                        "SELECT INDEX_NAME, NON_UNIQUE, COALESCE(COLUMN_NAME, '<expression>') \
+                         FROM information_schema.statistics \
+                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                        (database.as_str(), object.name.as_str()),
+                    )
+                    .map_err(map_error)?;
+                let mut indexes: Vec<IndexInfo> = Vec::new();
+                for (name, non_unique, column) in index_rows {
+                    if let Some(last) = indexes.last_mut() {
+                        if last.name == name {
+                            last.columns.push(column);
+                            continue;
+                        }
+                    }
+                    let primary = name == "PRIMARY";
+                    indexes.push(IndexInfo::new(name, vec![column], non_unique == 0, primary));
+                }
+
+                // Constraints: `table_constraints` joined to `key_column_usage`
+                // supplies the constrained columns and, for foreign keys, the
+                // referenced target. CHECK constraints contribute no key columns.
+                let constraint_rows: Vec<(
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )> = handle
+                    .exec(
+                        "SELECT tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, kcu.COLUMN_NAME, \
+                                kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, \
+                                kcu.REFERENCED_COLUMN_NAME \
+                         FROM information_schema.table_constraints tc \
+                         LEFT JOIN information_schema.key_column_usage kcu \
+                           ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+                          AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+                          AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA \
+                          AND kcu.TABLE_NAME = tc.TABLE_NAME \
+                         WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? \
+                         ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+                        (database.as_str(), object.name.as_str()),
+                    )
+                    .map_err(map_error)?;
+
+                let mut constraints: Vec<ConstraintInfo> = Vec::new();
+                for (name, constraint_type, column, ref_schema, ref_table, ref_column) in
+                    constraint_rows
+                {
+                    let Some(kind) = mysql_constraint_kind(&constraint_type) else {
+                        continue;
+                    };
+                    if let Some(last) = constraints.last_mut() {
+                        if last.name == name {
+                            if let Some(column) = column {
+                                last.columns.push(column);
+                            }
+                            if let Some(ref_column) = ref_column {
+                                last.referenced_columns.push(ref_column);
+                            }
+                            continue;
+                        }
+                    }
+                    let mut constraint = match kind {
+                        ConstraintKind::ForeignKey => ConstraintInfo::foreign_key(
+                            name.clone(),
+                            Vec::new(),
+                            ref_schema.clone(),
+                            ref_table.clone().unwrap_or_default(),
+                            Vec::new(),
+                        ),
+                        other => ConstraintInfo::of_kind(name.clone(), other, Vec::new()),
+                    };
+                    if let Some(column) = column {
+                        constraint.columns.push(column);
+                    }
+                    if let Some(ref_column) = ref_column {
+                        constraint.referenced_columns.push(ref_column);
+                    }
+                    constraints.push(constraint);
+                }
+
+                Ok(TableDescription::new(columns, primary_key_columns)
+                    .with_indexes(indexes)
+                    .with_constraints(constraints))
             })
         })
     }

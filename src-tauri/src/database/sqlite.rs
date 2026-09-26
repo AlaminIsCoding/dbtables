@@ -43,8 +43,9 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::database::{
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, DatabaseAdapter, ObjectKind, ObjectRef, ObjectScope,
-    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
+    ConnectionState, ConnectionTest, ConstraintInfo, DatabaseAdapter, IndexInfo, ObjectKind,
+    ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage, TablePageRequest,
+    TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -279,6 +280,147 @@ fn cell_from_value_ref(value: ValueRef<'_>) -> CellValue {
 fn elapsed_millis(started: Instant) -> u64 {
     let millis = started.elapsed().as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+/// Index metadata plus the declaration that produced it.
+struct SqliteIndex {
+    info: IndexInfo,
+    /// `pragma_index_list.origin`: `c` (CREATE INDEX), `u` (UNIQUE constraint),
+    /// or `pk` (PRIMARY KEY).
+    origin: String,
+}
+
+/// Column names for a SQLite index, in `pragma_index_info` order.
+///
+/// `pragma_index_info` reports `NULL` for an expression key part; the adapter
+/// keeps the slot with a documented placeholder so index width is preserved.
+fn sqlite_index_columns(handle: &Connection, index: &str) -> Result<Vec<String>, QueryError> {
+    let mut statement = handle
+        .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+        .map_err(map_error)?;
+    let rows = statement
+        .query_map([index], |row| row.get::<_, Option<String>>(0))
+        .map_err(map_error)?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        let name = row.map_err(map_error)?;
+        columns.push(name.unwrap_or_else(|| "<expression>".to_string()));
+    }
+    Ok(columns)
+}
+
+/// SQLite indexes for a table, including unique-constraint and primary-key
+/// backing indexes. `pragma_index_list` accepts its table argument as a bound
+/// value, so the object name is never interpolated into SQL.
+fn sqlite_indexes(handle: &Connection, table: &str) -> Result<Vec<SqliteIndex>, QueryError> {
+    let definitions: Vec<(String, i64, String)> = {
+        let mut statement = handle
+            .prepare("SELECT name, \"unique\", origin FROM pragma_index_list(?1) ORDER BY seq")
+            .map_err(map_error)?;
+        let rows = statement
+            .query_map([table], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(map_error)?;
+        let mut definitions = Vec::new();
+        for row in rows {
+            definitions.push(row.map_err(map_error)?);
+        }
+        definitions
+    };
+
+    let mut indexes = Vec::with_capacity(definitions.len());
+    for (name, unique, origin) in definitions {
+        let columns = sqlite_index_columns(handle, &name)?;
+        indexes.push(SqliteIndex {
+            info: IndexInfo::new(name, columns, unique != 0, origin == "pk"),
+            origin,
+        });
+    }
+    Ok(indexes)
+}
+
+/// SQLite foreign-key constraints, grouped from `pragma_foreign_key_list`.
+///
+/// SQLite does not name foreign keys and has no separate schema namespace, so
+/// the adapter generates a deterministic label and reports no referenced
+/// schema. `to` is `NULL` when the key targets the parent's implicit primary
+/// key; that slot is preserved as an empty string rather than guessed.
+fn sqlite_foreign_keys(
+    handle: &Connection,
+    table: &str,
+) -> Result<Vec<ConstraintInfo>, QueryError> {
+    let rows: Vec<(i64, String, String, Option<String>)> = {
+        let mut statement = handle
+            .prepare(
+                "SELECT id, \"table\", \"from\", \"to\" \
+                 FROM pragma_foreign_key_list(?1) ORDER BY id, seq",
+            )
+            .map_err(map_error)?;
+        let mapped = statement
+            .query_map([table], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(map_error)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(map_error)?);
+        }
+        rows
+    };
+
+    let mut constraints = Vec::new();
+    let mut current: Option<(i64, String, Vec<String>, Vec<String>)> = None;
+    for (id, referenced_table, from, to) in rows {
+        let referenced_column = to.unwrap_or_default();
+        match &mut current {
+            Some((current_id, _, columns, referenced_columns)) if *current_id == id => {
+                columns.push(from);
+                referenced_columns.push(referenced_column);
+            }
+            _ => {
+                if let Some((_, table_name, columns, referenced_columns)) = current.take() {
+                    constraints.push(build_sqlite_foreign_key(
+                        table,
+                        table_name,
+                        columns,
+                        referenced_columns,
+                    ));
+                }
+                current = Some((id, referenced_table, vec![from], vec![referenced_column]));
+            }
+        }
+    }
+    if let Some((_, table_name, columns, referenced_columns)) = current {
+        constraints.push(build_sqlite_foreign_key(
+            table,
+            table_name,
+            columns,
+            referenced_columns,
+        ));
+    }
+    Ok(constraints)
+}
+
+/// Builds a foreign-key constraint with SQLite's synthetic, deterministic name.
+fn build_sqlite_foreign_key(
+    table: &str,
+    referenced_table: String,
+    columns: Vec<String>,
+    referenced_columns: Vec<String>,
+) -> ConstraintInfo {
+    let name = format!("{}_{}_fkey", table, columns.join("_"));
+    ConstraintInfo::foreign_key(name, columns, None, referenced_table, referenced_columns)
 }
 
 /// Executes one statement on an open handle and normalizes the outcome.
@@ -560,11 +702,40 @@ impl DatabaseAdapter for SqliteAdapter {
                     }
                 }
                 primary_key.sort_by_key(|(position, _)| *position);
+                let primary_key_columns: Vec<String> =
+                    primary_key.into_iter().map(|(_, name)| name).collect();
 
-                Ok(TableDescription {
-                    columns,
-                    primary_key_columns: primary_key.into_iter().map(|(_, name)| name).collect(),
-                })
+                // Indexes and constraints are reported as inspected lists, never
+                // as an empty success: SQLite always exposes `pragma_index_list`
+                // and `pragma_foreign_key_list`, even when the object has none.
+                let discovered = sqlite_indexes(handle, &object.name)?;
+                let indexes: Vec<IndexInfo> =
+                    discovered.iter().map(|index| index.info.clone()).collect();
+
+                let mut constraints = sqlite_foreign_keys(handle, &object.name)?;
+                if !primary_key_columns.is_empty() {
+                    // SQLite only lists a backing index when the primary key is
+                    // not the rowid alias; otherwise synthesize a stable label.
+                    let name = discovered
+                        .iter()
+                        .find(|index| index.origin == "pk")
+                        .map(|index| index.info.name.clone())
+                        .unwrap_or_else(|| format!("{}_pkey", object.name));
+                    constraints.push(ConstraintInfo::primary_key(
+                        name,
+                        primary_key_columns.clone(),
+                    ));
+                }
+                for index in discovered.iter().filter(|index| index.origin == "u") {
+                    constraints.push(ConstraintInfo::unique(
+                        index.info.name.clone(),
+                        index.info.columns.clone(),
+                    ));
+                }
+
+                Ok(TableDescription::new(columns, primary_key_columns)
+                    .with_indexes(indexes)
+                    .with_constraints(constraints))
             })
         })
     }
@@ -673,8 +844,8 @@ mod fixture_tests {
 
     use super::SqliteAdapter;
     use crate::database::{
-        ChangeRequest, ConnectionId, ConnectionState, DatabaseAdapter, ObjectKind, ObjectRef,
-        ObjectScope, PendingChange, RowKey, TablePageRequest, TransactionId,
+        ChangeRequest, ConnectionId, ConnectionState, ConstraintKind, DatabaseAdapter, ObjectKind,
+        ObjectRef, ObjectScope, PendingChange, RowKey, TablePageRequest, TransactionId,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -703,22 +874,28 @@ mod fixture_tests {
     /// `audit_log` uses `AUTOINCREMENT` so SQLite creates its internal
     /// `sqlite_sequence` table, which object listing must hide.
     const FIXTURE_SCHEMA: &str = "
+        CREATE TABLE teams (
+            id INTEGER PRIMARY KEY NOT NULL
+        );
         CREATE TABLE users (
             id INTEGER PRIMARY KEY NOT NULL,
             name TEXT NOT NULL,
-            email TEXT,
-            balance NUMERIC
+            email TEXT UNIQUE,
+            balance NUMERIC,
+            team_id INTEGER REFERENCES teams(id)
         );
+        CREATE INDEX users_name_idx ON users(name);
         CREATE TABLE audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message TEXT NOT NULL
         );
         CREATE VIEW active_users AS
             SELECT id, name FROM users WHERE name IS NOT NULL;
-        INSERT INTO users (id, name, email, balance) VALUES
-            (1, 'alice', 'alice@example.com', 10.50),
-            (2, 'bob', NULL, 20.00),
-            (3, 'carol', 'carol@example.com', NULL);
+        INSERT INTO teams (id) VALUES (1);
+        INSERT INTO users (id, name, email, balance, team_id) VALUES
+            (1, 'alice', 'alice@example.com', 10.50, 1),
+            (2, 'bob', NULL, 20.00, NULL),
+            (3, 'carol', 'carol@example.com', NULL, NULL);
     ";
 
     /// A freshly created SQLite file removed when the test ends.
@@ -826,7 +1003,7 @@ mod fixture_tests {
             .expect("listing should succeed");
 
         let names: Vec<&str> = objects.iter().map(|object| object.name.as_str()).collect();
-        assert_eq!(names, ["active_users", "audit_log", "users"]);
+        assert_eq!(names, ["active_users", "audit_log", "teams", "users"]);
 
         let users = objects
             .iter()
@@ -864,13 +1041,67 @@ mod fixture_tests {
             .iter()
             .map(|column| column.name.as_str())
             .collect();
-        assert_eq!(names, ["id", "name", "email", "balance"]);
+        assert_eq!(names, ["id", "name", "email", "balance", "team_id"]);
 
         assert_eq!(description.columns[0].type_name.as_deref(), Some("INTEGER"));
         assert_eq!(description.columns[0].nullable, Some(false));
         assert_eq!(description.columns[1].nullable, Some(false));
         assert_eq!(description.columns[2].nullable, Some(true));
         assert_eq!(description.primary_key_columns, ["id"]);
+    }
+
+    #[test]
+    fn describe_table_reports_indexes_and_constraints() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let description = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+
+        let indexes = description
+            .indexes
+            .expect("SQLite must report index metadata for a table");
+        let name_index = indexes
+            .iter()
+            .find(|index| index.name == "users_name_idx")
+            .expect("the named index should be listed");
+        assert_eq!(name_index.columns, ["name"]);
+        assert!(!name_index.unique);
+        assert!(!name_index.primary);
+
+        let unique_index = indexes
+            .iter()
+            .find(|index| index.unique && !index.primary)
+            .expect("the UNIQUE column should have a backing index");
+        assert_eq!(unique_index.columns, ["email"]);
+
+        let constraints = description
+            .constraints
+            .expect("SQLite must report constraint metadata for a table");
+        let primary = constraints
+            .iter()
+            .find(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
+            .expect("the primary key should be reported as a constraint");
+        assert_eq!(primary.columns, ["id"]);
+
+        let unique = constraints
+            .iter()
+            .find(|constraint| constraint.kind == ConstraintKind::Unique)
+            .expect("the UNIQUE column should be reported as a constraint");
+        assert_eq!(unique.columns, ["email"]);
+
+        let foreign = constraints
+            .iter()
+            .find(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .expect("the foreign key should be reported as a constraint");
+        assert_eq!(foreign.columns, ["team_id"]);
+        assert_eq!(foreign.referenced_table.as_deref(), Some("teams"));
+        assert_eq!(foreign.referenced_columns, ["id"]);
+        assert!(
+            foreign.name.contains("team_id"),
+            "an unnamed SQLite foreign key still needs a stable label"
+        );
     }
 
     #[test]
@@ -897,6 +1128,16 @@ mod fixture_tests {
         assert!(
             description.primary_key_columns.is_empty(),
             "a view has no stable primary key"
+        );
+        assert_eq!(
+            description.indexes,
+            Some(Vec::new()),
+            "an inspected view reports no indexes rather than unsupported metadata"
+        );
+        assert_eq!(
+            description.constraints,
+            Some(Vec::new()),
+            "an inspected view reports no constraints rather than unsupported metadata"
         );
     }
 

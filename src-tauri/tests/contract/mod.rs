@@ -33,7 +33,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dbtables_lib::database::{ConnectionSecret, ConnectionState, DatabaseAdapter, ObjectScope};
+use dbtables_lib::database::{
+    ConnectionSecret, ConnectionState, ConstraintKind, DatabaseAdapter, ObjectScope,
+};
 use dbtables_lib::database::{MySqlAdapter, PostgresAdapter, SqliteAdapter};
 use dbtables_lib::domain::{
     CellValue, ConnectionDescriptor, EngineId, ErrorCategory, OperationState, QueryRequest,
@@ -140,17 +142,23 @@ impl Drop for TempSqliteDatabase {
 /// `sqlite_sequence` table, which object listing must hide; the expected table
 /// below is what the contract requires to be listed.
 const FIXTURE_SCHEMA: &str = "
+    CREATE TABLE contract_teams (
+        id INTEGER PRIMARY KEY NOT NULL
+    );
     CREATE TABLE contract_users (
         id INTEGER PRIMARY KEY NOT NULL,
-        name TEXT NOT NULL
+        name TEXT NOT NULL,
+        email TEXT UNIQUE,
+        team_id INTEGER REFERENCES contract_teams(id)
     );
+    CREATE INDEX contract_users_name_idx ON contract_users(name);
     CREATE TABLE contract_audit (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message TEXT NOT NULL
     );
     CREATE VIEW contract_active_users AS
         SELECT id, name FROM contract_users WHERE name IS NOT NULL;
-    INSERT INTO contract_users (id, name) VALUES (1, 'alice'), (2, 'bob');
+    INSERT INTO contract_users (id, name, email) VALUES (1, 'alice', 'alice@example.com'), (2, 'bob', NULL);
 ";
 
 /// Builds the always-available SQLite target.
@@ -319,7 +327,9 @@ async fn run_contract_async(target: &EngineTarget) {
         }
     };
 
-    // Metadata: every listed object can be described with at least one column.
+    // Metadata: every listed object can be described with at least one column,
+    // and the detail call reports inspected index/constraint lists (Some) rather
+    // than silently omitting a category the adapter cannot provide.
     let objects = adapter
         .list_objects(&connection, &scope)
         .await
@@ -338,6 +348,53 @@ async fn run_contract_async(target: &EngineTarget) {
         assert!(
             !description.columns.is_empty(),
             "{engine}: a described object must report at least one column",
+        );
+        assert!(
+            description.indexes.is_some(),
+            "{engine}: index metadata must be inspected (Some), not omitted as unsupported",
+        );
+        assert!(
+            description.constraints.is_some(),
+            "{engine}: constraint metadata must be inspected (Some), not omitted as unsupported",
+        );
+        for constraint in description.constraints.as_deref().unwrap_or_default() {
+            if constraint.kind == ConstraintKind::ForeignKey {
+                assert!(
+                    constraint.referenced_table.is_some(),
+                    "{engine}: a reported foreign key must name its referenced table",
+                );
+                assert!(
+                    !constraint.columns.is_empty(),
+                    "{engine}: a reported foreign key must name its constrained columns",
+                );
+            }
+        }
+    }
+
+    // A controlled fixture proves index/constraint discovery has real content,
+    // not just an empty inspected list.
+    if let Some(known) = target.known_table {
+        let known_object = objects
+            .iter()
+            .find(|object| object.name == known)
+            .expect("the controlled table must be listed before describing it");
+        let description = adapter
+            .describe_table(&connection, known_object)
+            .await
+            .expect("describing the controlled table should succeed");
+        assert!(
+            description
+                .indexes
+                .as_deref()
+                .is_some_and(|indexes| !indexes.is_empty()),
+            "{engine}: the controlled table must report at least one index",
+        );
+        assert!(
+            description
+                .constraints
+                .as_deref()
+                .is_some_and(|constraints| !constraints.is_empty()),
+            "{engine}: the controlled table must report at least one constraint",
         );
     }
 

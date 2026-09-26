@@ -68,8 +68,9 @@ use tokio_postgres::{Client, Column, Config, NoTls, Socket};
 
 use crate::database::{
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, DatabaseAdapter, ObjectKind, ObjectRef, ObjectScope,
-    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
+    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, IndexInfo,
+    ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage,
+    TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -496,6 +497,21 @@ fn column_info(column: &Column) -> ColumnInfo {
         name: column.name().to_string(),
         type_name: Some(column.type_().name().to_string()),
         nullable: None,
+    }
+}
+
+/// Maps an `information_schema.table_constraints.constraint_type` onto a kind.
+fn postgres_constraint_kind(constraint_type: &str) -> Option<ConstraintKind> {
+    if constraint_type.eq_ignore_ascii_case("PRIMARY KEY") {
+        Some(ConstraintKind::PrimaryKey)
+    } else if constraint_type.eq_ignore_ascii_case("FOREIGN KEY") {
+        Some(ConstraintKind::ForeignKey)
+    } else if constraint_type.eq_ignore_ascii_case("UNIQUE") {
+        Some(ConstraintKind::Unique)
+    } else if constraint_type.eq_ignore_ascii_case("CHECK") {
+        Some(ConstraintKind::Check)
+    } else {
+        None
     }
 }
 
@@ -1215,10 +1231,117 @@ impl DatabaseAdapter for PostgresAdapter {
                 primary_key_columns.push(name);
             }
 
-            Ok(TableDescription {
-                columns,
-                primary_key_columns,
-            })
+            // Indexes: `pg_index` carries uniqueness/primary flags; iterating the
+            // index's column positions and asking `pg_get_indexdef` for each one
+            // yields the key column (or its expression) without parsing DDL.
+            let index_rows = client
+                .query(
+                    "SELECT idx.relname::text, i.indisunique, i.indisprimary, \
+                            pg_get_indexdef(i.indexrelid, cols.n, true) \
+                     FROM pg_index i \
+                     JOIN pg_class idx ON idx.oid = i.indexrelid \
+                     JOIN pg_class tbl ON tbl.oid = i.indrelid \
+                     JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
+                     CROSS JOIN LATERAL generate_series(1, i.indnatts) AS cols(n) \
+                     WHERE ns.nspname = $1 AND tbl.relname = $2 \
+                     ORDER BY idx.relname, cols.n",
+                    &[&schema, &object.name],
+                )
+                .await
+                .map_err(map_error)?;
+
+            let mut indexes: Vec<IndexInfo> = Vec::new();
+            for row in &index_rows {
+                let name: String = row.try_get(0).map_err(map_error)?;
+                let unique: bool = row.try_get(1).map_err(map_error)?;
+                let primary: bool = row.try_get(2).map_err(map_error)?;
+                let column: String = row.try_get(3).map_err(map_error)?;
+                if let Some(last) = indexes.last_mut() {
+                    if last.name == name {
+                        last.columns.push(column);
+                        continue;
+                    }
+                }
+                indexes.push(IndexInfo::new(name, vec![column], unique, primary));
+            }
+
+            // Constraints: `table_constraints` joined to `key_column_usage`
+            // supplies columns and foreign-key targets; `check_constraints`
+            // supplies the check clause. Each is reported with its normalized
+            // kind rather than flattened into one opaque list.
+            let constraint_rows = client
+                .query(
+                    "SELECT tc.constraint_name::text, tc.constraint_type::text, \
+                            kcu.column_name::text, kcu.referenced_table_schema::text, \
+                            kcu.referenced_table_name::text, kcu.referenced_column_name::text, \
+                            cc.check_clause::text \
+                     FROM information_schema.table_constraints tc \
+                     LEFT JOIN information_schema.key_column_usage kcu \
+                       ON kcu.constraint_schema = tc.constraint_schema \
+                      AND kcu.constraint_name = tc.constraint_name \
+                      AND kcu.table_schema = tc.table_schema \
+                      AND kcu.table_name = tc.table_name \
+                     LEFT JOIN information_schema.check_constraints cc \
+                       ON cc.constraint_schema = tc.constraint_schema \
+                      AND cc.constraint_name = tc.constraint_name \
+                     WHERE tc.table_schema = $1 AND tc.table_name = $2 \
+                     ORDER BY tc.constraint_name, kcu.ordinal_position",
+                    &[&schema, &object.name],
+                )
+                .await
+                .map_err(map_error)?;
+
+            let mut constraints: Vec<ConstraintInfo> = Vec::new();
+            for row in &constraint_rows {
+                let name: String = row.try_get(0).map_err(map_error)?;
+                let constraint_type: String = row.try_get(1).map_err(map_error)?;
+                let Some(kind) = postgres_constraint_kind(&constraint_type) else {
+                    continue;
+                };
+                let column: Option<String> = row.try_get(2).map_err(map_error)?;
+                let referenced_schema: Option<String> = row.try_get(3).map_err(map_error)?;
+                let referenced_table: Option<String> = row.try_get(4).map_err(map_error)?;
+                let referenced_column: Option<String> = row.try_get(5).map_err(map_error)?;
+                let check_clause: Option<String> = row.try_get(6).map_err(map_error)?;
+
+                if let Some(last) = constraints.last_mut() {
+                    if last.name == name {
+                        if let Some(column) = column {
+                            last.columns.push(column);
+                        }
+                        if let Some(referenced_column) = referenced_column {
+                            last.referenced_columns.push(referenced_column);
+                        }
+                        continue;
+                    }
+                }
+
+                let mut constraint = match kind {
+                    ConstraintKind::ForeignKey => ConstraintInfo::foreign_key(
+                        name.clone(),
+                        Vec::new(),
+                        referenced_schema.clone(),
+                        referenced_table.clone().unwrap_or_default(),
+                        Vec::new(),
+                    ),
+                    ConstraintKind::Check => match check_clause.clone() {
+                        Some(clause) => ConstraintInfo::check(name.clone(), clause),
+                        None => ConstraintInfo::of_kind(name.clone(), kind, Vec::new()),
+                    },
+                    other => ConstraintInfo::of_kind(name.clone(), other, Vec::new()),
+                };
+                if let Some(column) = column {
+                    constraint.columns.push(column);
+                }
+                if let Some(referenced_column) = referenced_column {
+                    constraint.referenced_columns.push(referenced_column);
+                }
+                constraints.push(constraint);
+            }
+
+            Ok(TableDescription::new(columns, primary_key_columns)
+                .with_indexes(indexes)
+                .with_constraints(constraints))
         })
     }
 
