@@ -1,4 +1,4 @@
-export { TableDataView, type TableDataViewProps } from "./TableDataView";
+export { TableTabView, type TableTabViewProps } from "./TableTabView";
 export {
   baseValueForColumn,
   cellValueToEditText,
@@ -8,10 +8,10 @@ export {
   type EditParseResult,
 } from "./editorValue";
 export { InsertRowDialog, type InsertRowDialogProps } from "./InsertRowDialog";
-export { ValueEditor, type ValueEditorProps } from "./ValueEditor";
 export {
   cellValuesEqual,
   describeStagedChange,
+  hasPendingData,
   isApplyable,
   isBlocking,
   pendingRequests,
@@ -23,10 +23,13 @@ export {
   stagedChangeToRequest,
   stagedDeletedRows,
   stagedEditedCells,
+  stagedInserts,
   stageCellEdit,
   stageDelete,
+  stageDeleteRows,
   stageInsert,
   summarizeStaged,
+  updateInsertCell,
   type StagedChange,
   type StagedChangeKind,
   type StagedChangeStatus,
@@ -37,10 +40,6 @@ export {
   type StagedChangesController,
   type UseStagedChangesOptions,
 } from "./useStagedChanges";
-export {
-  TableDataProvider,
-  useTableDataSession,
-} from "./context";
 export {
   createTableFilter,
   describeFilter,

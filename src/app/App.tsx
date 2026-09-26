@@ -1,30 +1,41 @@
-import { Sidebar } from "../components/layout/Sidebar";
-import { StatusBar } from "../components/layout/StatusBar";
-import { TopBar } from "../components/layout/TopBar";
-import { Workspace } from "../components/layout/Workspace";
-import { TableDataProvider } from "../features/table-data";
+import { useState } from "react";
+
+import { Sidebar } from "@/components/layout/Sidebar";
+import { TopBar } from "@/components/layout/TopBar";
+import { Workspace } from "@/components/layout/Workspace";
+import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
+
+import { WorkspaceProvider } from "./store";
 import { useTheme } from "./useTheme";
 
-/**
- * Desktop workspace shell.
- *
- * Composes the compact top bar, explorer sidebar, query workspace, and status
- * bar. A table-data session lets the explorer open the read-only browser in the
- * workspace without caching any rows in the shell itself.
- */
-export default function App() {
+function Shell() {
   const { theme, toggleTheme } = useTheme();
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   return (
-    <TableDataProvider>
+    <TooltipProvider delayDuration={400}>
       <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-        <TopBar theme={theme} onToggleTheme={toggleTheme} />
+        <TopBar
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        />
         <div className="flex min-h-0 flex-1">
-          <Sidebar />
+          <Sidebar collapsed={!sidebarOpen} />
           <Workspace />
         </div>
-        <StatusBar />
       </div>
-    </TableDataProvider>
+      <Toaster theme={theme} position="bottom-right" />
+    </TooltipProvider>
+  );
+}
+
+/** Desktop application root: theme, workspace store, and the shell layout. */
+export default function App() {
+  return (
+    <WorkspaceProvider>
+      <Shell />
+    </WorkspaceProvider>
   );
 }

@@ -85,8 +85,8 @@ describe("table data paging", () => {
   });
 
   it("labels the visible range without inventing a total", () => {
-    expect(pageRangeLabel(0, 50, 320)).toBe("Rows 1–50 of 320");
-    expect(pageRangeLabel(50, 25)).toBe("Rows 51–75");
+    expect(pageRangeLabel(0, 50, 320)).toBe("Rows 1-50 of 320");
+    expect(pageRangeLabel(50, 25)).toBe("Rows 51-75");
     expect(pageRangeLabel(0, 0)).toBe("No rows");
     expect(pageRangeLabel(25, 0)).toBe("No rows at offset 25");
   });

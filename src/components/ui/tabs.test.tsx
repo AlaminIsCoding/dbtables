@@ -35,9 +35,13 @@ describe("Tabs", () => {
   it("switches panels when another tab is clicked", () => {
     renderTabs();
 
-    fireEvent.click(screen.getByRole("tab", { name: "Tab B" }));
+    // Radix activates tabs on pointer-down rather than click.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Tab B" }));
 
-    expect(screen.getByText("Panel B")).toBeTruthy();
-    expect(screen.queryByText("Panel A")).toBeNull();
+    expect(
+      screen.getByRole("tab", { name: "Tab B" }).getAttribute("aria-selected"),
+    ).toBe("true");
+    const panel = screen.getByText("Panel B").closest('[role="tabpanel"]');
+    expect(panel?.hasAttribute("hidden")).toBe(false);
   });
 });

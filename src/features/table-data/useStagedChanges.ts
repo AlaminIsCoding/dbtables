@@ -22,8 +22,10 @@ import {
   rowIdentityFor,
   stageCellEdit,
   stageDelete,
+  stageDeleteRows,
   stageInsert,
   summarizeStaged,
+  updateInsertCell,
   type StagedChange,
   type StagedSummary,
 } from "./stagedChanges";
@@ -60,8 +62,12 @@ export interface StagedChangesController {
   stageEdit: (rowIndex: number, columnIndex: number, value: CellValue) => void;
   /** Stages an insert for a new row. */
   insertRow: (values: RowKey[]) => void;
+  /** Sets one cell of a staged insert (inline new-row editing). */
+  updateInsert: (id: string, column: string, value: CellValue) => void;
   /** Stages a delete for a loaded row. */
   deleteRow: (rowIndex: number) => void;
+  /** Stages deletes for every selectable row among the given indexes. */
+  deleteRows: (rowIndexes: readonly number[]) => void;
   /** Removes one staged change. */
   remove: (id: string) => void;
   /** Discards every staged change. */
@@ -176,11 +182,18 @@ export function useStagedChanges(
   );
 
   const insertRow = useCallback((values: RowKey[]) => {
-    if (!canEditRef.current || values.length === 0) {
+    if (!canEditRef.current) {
       return;
     }
     setStaged((current) => stageInsert(current, objectRef.current, values));
   }, []);
+
+  const updateInsert = useCallback(
+    (id: string, column: string, value: CellValue) => {
+      setStaged((current) => updateInsertCell(current, id, column, value));
+    },
+    [],
+  );
 
   const deleteRow = useCallback((rowIndex: number) => {
     if (!canEditRef.current) {
@@ -196,6 +209,20 @@ export function useStagedChanges(
     }
     setStaged((current) =>
       stageDelete(current, objectRef.current, identity, rowIndex),
+    );
+  }, []);
+
+  const deleteRows = useCallback((rowIndexes: readonly number[]) => {
+    if (!canEditRef.current || rowIndexes.length === 0) {
+      return;
+    }
+    setStaged((current) =>
+      stageDeleteRows(current, objectRef.current, {
+        rows: rowsRef.current,
+        columns: columnsRef.current,
+        identityColumns: identityRef.current,
+        rowIndexes,
+      }),
     );
   }, []);
 
@@ -271,7 +298,9 @@ export function useStagedChanges(
     lastGroup,
     stageEdit,
     insertRow,
+    updateInsert,
     deleteRow,
+    deleteRows,
     remove,
     discardAll,
     apply,

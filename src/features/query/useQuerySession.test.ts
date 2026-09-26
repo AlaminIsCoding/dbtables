@@ -483,3 +483,76 @@ describe("useQuerySession", () => {
     expect(result.current.cancellationSupported).toBe(false);
   });
 });
+
+describe("useQuerySession with an external connection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capabilitiesMock.mockResolvedValue(capabilities());
+    listObjectsMock.mockResolvedValue([{ name: "users", kind: "table" }]);
+  });
+
+  it("binds to the supplied connection without opening one of its own", async () => {
+    const { result } = renderHook(() =>
+      useQuerySession({ connectionId: "sqlite-1" }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(result.current.connection).toEqual({
+      status: "connected",
+      connectionId: "sqlite-1",
+      objects: {
+        status: "ready",
+        objects: [{ name: "users", kind: "table" }],
+      },
+    });
+    expect(result.current.canRun).toBe(true);
+    expect(result.current.cancellationSupported).toBe(false);
+  });
+
+  it("reports disconnected when the external connection is null", async () => {
+    const { result } = renderHook(() =>
+      useQuerySession({ connectionId: null }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.connection).toEqual({ status: "disconnected" });
+    expect(result.current.canRun).toBe(false);
+  });
+
+  it("executes against the external connection id", async () => {
+    executeMock.mockResolvedValue(gridResult());
+    const { result } = renderHook(() =>
+      useQuerySession({ connectionId: "sqlite-1" }),
+    );
+
+    await act(async () => {
+      await result.current.runQuery("SELECT id FROM users");
+    });
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    expect(executeMock.mock.calls[0][0]).toBe("sqlite-1");
+    expect(result.current.outcome.kind).toBe("grid");
+  });
+
+  it("does not open or close a connection from its own controls", async () => {
+    const { result } = renderHook(() =>
+      useQuerySession({ connectionId: "sqlite-1" }),
+    );
+
+    await act(async () => {
+      await result.current.openDatabase("C:/data/other.sqlite");
+      await result.current.disconnectDatabase();
+    });
+
+    expect(connectMock).not.toHaveBeenCalled();
+    expect(disconnectMock).not.toHaveBeenCalled();
+    expect(result.current.connection.status).toBe("connected");
+  });
+});

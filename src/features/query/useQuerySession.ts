@@ -41,10 +41,22 @@ export type ConnectionStatus =
   | {
       status: "connected";
       connectionId: string;
-      filePath: string;
+      /** Only present for a session that opened its own SQLite file. */
+      filePath?: string;
       objects: ObjectListState;
     }
   | { status: "error"; error: QueryError };
+
+/**
+ * Binds a query session to a connection owned elsewhere (the app store).
+ *
+ * Supplying this option - even with `connectionId: null` - puts the session in
+ * external mode: it never opens or closes a connection of its own and exposes
+ * no file path. `null` means the workspace currently has no active connection.
+ */
+export interface UseQuerySessionOptions {
+  connectionId: string | null;
+}
 
 const EMPTY_FILE_PATH_ERROR: QueryError = {
   category: "validation",
@@ -55,6 +67,8 @@ const EMPTY_SQL_ERROR: QueryError = {
   category: "validation",
   message: "Enter a SQL statement to run.",
 };
+
+const EMPTY_OBJECTS: ObjectListState = { status: "ready", objects: [] };
 
 export interface QuerySession {
   /** Current connection lifecycle state. */
@@ -82,8 +96,14 @@ export interface QuerySession {
   openDatabase: (filePath: string) => Promise<void>;
   disconnectDatabase: () => Promise<void>;
   refreshObjects: () => Promise<void>;
-  /** Executes the supplied statement and records the outcome. */
-  runQuery: (statement: string) => Promise<void>;
+  /**
+   * Executes the supplied statement and records the outcome.
+   *
+   * Resolves with the terminal outcome that was rendered, or `null` when the
+   * request was ignored (no connection, or a query was already running). The
+   * external-connection host uses this to know whether a run succeeded.
+   */
+  runQuery: (statement: string) => Promise<QueryOutcome | null>;
   /**
    * Re-runs the last successful statement with a larger bounded cap.
    *
@@ -112,16 +132,25 @@ function defaultCapabilities(): EngineCapabilities | null {
  * call so the editor and connection controls stay interactive while the backend
  * works.
  *
+ * Two modes are supported. With no options the hook opens and closes its own
+ * SQLite file (the legacy standalone workspace). With a
+ * {@link UseQuerySessionOptions} argument it binds to the app store's single
+ * active connection instead and never opens or closes a connection itself.
+ *
  * Cancellation is capability-gated: the hook reads the adapter's reported
  * capabilities and only offers Cancel when the driver supports it. A cancel
  * request never invents a final state; the executing call reports the real
  * outcome, and a refused request surfaces a non-fatal notice instead of
  * overwriting the running state.
  */
-export function useQuerySession(): QuerySession {
-  const [connection, setConnection] = useState<ConnectionStatus>({
-    status: "disconnected",
-  });
+export function useQuerySession(options?: UseQuerySessionOptions): QuerySession {
+  const external = options !== undefined;
+  const externalConnectionId = options?.connectionId ?? null;
+
+  const [internalConnection, setInternalConnection] =
+    useState<ConnectionStatus>({ status: "disconnected" });
+  const [externalObjects, setExternalObjects] =
+    useState<ObjectListState>(EMPTY_OBJECTS);
   const [outcome, setOutcome] = useState<QueryOutcome>(idleOutcome);
   const [isRunning, setIsRunning] = useState(false);
   const [isFetchingMore, setIsFetchingMore] = useState(false);
@@ -138,6 +167,7 @@ export function useQuerySession(): QuerySession {
   const lastStatementRef = useRef<string | null>(null);
   const requestedLimitRef = useRef(0);
   const outcomeRef = useRef<QueryOutcome>(outcome);
+  const externalTokenRef = useRef(0);
 
   useEffect(() => {
     outcomeRef.current = outcome;
@@ -146,14 +176,14 @@ export function useQuerySession(): QuerySession {
   const loadObjects = useCallback(async (connectionId: string) => {
     try {
       const objects = await listObjects(connectionId);
-      setConnection((current) =>
+      setInternalConnection((current) =>
         current.status === "connected" &&
         current.connectionId === connectionId
           ? { ...current, objects: { status: "ready", objects } }
           : current,
       );
     } catch (error) {
-      setConnection((current) =>
+      setInternalConnection((current) =>
         current.status === "connected" &&
         current.connectionId === connectionId
           ? {
@@ -175,11 +205,61 @@ export function useQuerySession(): QuerySession {
     }
   }, []);
 
+  // External mode: mirror the store's active connection, reloading the object
+  // list and adapter capabilities whenever it changes. The session never opens
+  // or closes this connection.
+  useEffect(() => {
+    if (!external) {
+      return;
+    }
+
+    lastStatementRef.current = null;
+    requestedLimitRef.current = 0;
+    setOutcome(idleOutcome());
+    setCancelRequested(false);
+    setNotice(null);
+    setIsFetchingMore(false);
+
+    if (externalConnectionId === null) {
+      setExternalObjects(EMPTY_OBJECTS);
+      setCapabilities(null);
+      return;
+    }
+
+    const token = externalTokenRef.current + 1;
+    externalTokenRef.current = token;
+    setExternalObjects({ status: "loading" });
+
+    void (async () => {
+      try {
+        const objects = await listObjects(externalConnectionId);
+        if (externalTokenRef.current === token) {
+          setExternalObjects({ status: "ready", objects });
+        }
+      } catch (error) {
+        if (externalTokenRef.current === token) {
+          setExternalObjects({ status: "error", error: toQueryError(error) });
+        }
+      }
+    })();
+
+    void loadCapabilities();
+  }, [external, externalConnectionId, loadCapabilities]);
+
   const openDatabase = useCallback(
     async (filePath: string) => {
+      if (external) {
+        // The connection belongs to the app store; opening a file here would
+        // create a second connection.
+        return;
+      }
+
       const trimmed = filePath.trim();
       if (trimmed.length === 0) {
-        setConnection({ status: "error", error: EMPTY_FILE_PATH_ERROR });
+        setInternalConnection({
+          status: "error",
+          error: EMPTY_FILE_PATH_ERROR,
+        });
         return;
       }
 
@@ -195,7 +275,7 @@ export function useQuerySession(): QuerySession {
         }
       }
 
-      setConnection({ status: "connecting" });
+      setInternalConnection({ status: "connecting" });
       setOutcome(idleOutcome());
       setCapabilities(null);
       setNotice(null);
@@ -207,7 +287,7 @@ export function useQuerySession(): QuerySession {
       try {
         const connectionId = await connectSqlite(trimmed);
         connectionIdRef.current = connectionId;
-        setConnection({
+        setInternalConnection({
           status: "connected",
           connectionId,
           filePath: trimmed,
@@ -216,16 +296,21 @@ export function useQuerySession(): QuerySession {
         await Promise.all([loadObjects(connectionId), loadCapabilities()]);
       } catch (error) {
         connectionIdRef.current = null;
-        setConnection({ status: "error", error: toQueryError(error) });
+        setInternalConnection({ status: "error", error: toQueryError(error) });
       }
     },
-    [loadCapabilities, loadObjects],
+    [external, loadCapabilities, loadObjects],
   );
 
   const disconnectDatabase = useCallback(async () => {
+    if (external) {
+      // The app store owns the connection's lifecycle.
+      return;
+    }
+
     const connectionId = connectionIdRef.current;
     connectionIdRef.current = null;
-    setConnection({ status: "disconnected" });
+    setInternalConnection({ status: "disconnected" });
     setOutcome(idleOutcome());
     setCapabilities(null);
     setCancelRequested(false);
@@ -241,21 +326,36 @@ export function useQuerySession(): QuerySession {
         // The UI is already disconnected; a failed close does not change that.
       }
     }
-  }, []);
+  }, [external]);
 
   const refreshObjects = useCallback(async () => {
+    if (external) {
+      if (externalConnectionId === null) {
+        return;
+      }
+
+      setExternalObjects({ status: "loading" });
+      try {
+        const objects = await listObjects(externalConnectionId);
+        setExternalObjects({ status: "ready", objects });
+      } catch (error) {
+        setExternalObjects({ status: "error", error: toQueryError(error) });
+      }
+      return;
+    }
+
     const connectionId = connectionIdRef.current;
     if (!connectionId) {
       return;
     }
 
-    setConnection((current) =>
+    setInternalConnection((current) =>
       current.status === "connected" && current.connectionId === connectionId
         ? { ...current, objects: { status: "loading" } }
         : current,
     );
     await loadObjects(connectionId);
-  }, [loadObjects]);
+  }, [external, externalConnectionId, loadObjects]);
 
   const recordHistory = useCallback((entry: QueryHistoryEntry | null) => {
     if (!entry) {
@@ -265,16 +365,19 @@ export function useQuerySession(): QuerySession {
   }, []);
 
   const runQuery = useCallback(
-    async (statement: string) => {
-      const connectionId = connectionIdRef.current;
+    async (statement: string): Promise<QueryOutcome | null> => {
+      const connectionId = external
+        ? externalConnectionId
+        : connectionIdRef.current;
       if (!connectionId || runningRef.current) {
-        return;
+        return null;
       }
 
       const trimmed = statement.trim();
       if (trimmed.length === 0) {
-        setOutcome(commandErrorOutcome(EMPTY_SQL_ERROR));
-        return;
+        const blocked = commandErrorOutcome(EMPTY_SQL_ERROR);
+        setOutcome(blocked);
+        return blocked;
       }
 
       const operationId = createOperationId();
@@ -296,12 +399,16 @@ export function useQuerySession(): QuerySession {
           lastStatementRef.current = trimmed;
           requestedLimitRef.current = result.rows?.length ?? 0;
         }
-        setOutcome(resultOutcome(result));
+        const next = resultOutcome(result);
+        setOutcome(next);
         recordHistory(historyEntryFromResult(operationId, trimmed, result));
+        return next;
       } catch (error) {
         const queryError = toQueryError(error);
-        setOutcome(commandErrorOutcome(queryError));
+        const next = commandErrorOutcome(queryError);
+        setOutcome(next);
         recordHistory(historyEntryFromError(operationId, trimmed, queryError));
+        return next;
       } finally {
         runningRef.current = false;
         activeOperationRef.current = null;
@@ -309,11 +416,13 @@ export function useQuerySession(): QuerySession {
         setIsRunning(false);
       }
     },
-    [recordHistory],
+    [external, externalConnectionId, recordHistory],
   );
 
   const fetchMore = useCallback(async () => {
-    const connectionId = connectionIdRef.current;
+    const connectionId = external
+      ? externalConnectionId
+      : connectionIdRef.current;
     const sql = lastStatementRef.current;
     const current = outcomeRef.current;
     if (!connectionId || !sql || runningRef.current) {
@@ -350,10 +459,12 @@ export function useQuerySession(): QuerySession {
       runningRef.current = false;
       setIsFetchingMore(false);
     }
-  }, []);
+  }, [external, externalConnectionId]);
 
   const cancelRunningQuery = useCallback(async () => {
-    const connectionId = connectionIdRef.current;
+    const connectionId = external
+      ? externalConnectionId
+      : connectionIdRef.current;
     const operationId = activeOperationRef.current;
     if (!connectionId || !operationId || !runningRef.current) {
       return;
@@ -369,11 +480,21 @@ export function useQuerySession(): QuerySession {
       setCancelRequested(false);
       setNotice(toQueryError(error).message);
     }
-  }, []);
+  }, [external, externalConnectionId]);
 
   const clearHistory = useCallback(() => {
     setHistory([]);
   }, []);
+
+  const connection: ConnectionStatus = external
+    ? externalConnectionId === null
+      ? { status: "disconnected" }
+      : {
+          status: "connected",
+          connectionId: externalConnectionId,
+          objects: externalObjects,
+        }
+    : internalConnection;
 
   const cancellationSupported = capabilities?.cancellation === true;
   const canFetchMore =

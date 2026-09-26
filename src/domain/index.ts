@@ -252,6 +252,44 @@ export interface TableDescription {
   constraints?: ConstraintInfo[];
 }
 
+/** A column definition used when creating or altering a table. */
+export interface ColumnDefinition {
+  /** Column identifier. */
+  name: string;
+  /** Engine SQL type text, for example `INTEGER`, `TEXT`, or `NUMERIC`. */
+  typeName: string;
+  /** Whether the column accepts NULL. */
+  nullable: boolean;
+  /** Whether the column is (part of) the primary key. */
+  primaryKey: boolean;
+  /** Optional SQL default expression. */
+  default?: string;
+}
+
+/** A foreign-key definition used when creating a table. */
+export interface ForeignKeyDefinition {
+  /** Local column identifiers that form the key. */
+  columns: string[];
+  /** Referenced table name. */
+  referencedTable: string;
+  /** Referenced column identifiers, in the same order as `columns`. */
+  referencedColumns: string[];
+  /** Referenced schema, when the engine exposes one. */
+  referencedSchema?: string;
+  /** Optional constraint name; the backend generates one when absent. */
+  name?: string;
+}
+
+/** A table definition used to create a table. */
+export interface TableDefinition {
+  /** Object to create; `object.kind` must be `"table"`. */
+  object: ObjectRef;
+  /** Columns in ordinal order. */
+  columns: ColumnDefinition[];
+  /** Foreign keys to declare on the new table. */
+  foreignKeys?: ForeignKeyDefinition[];
+}
+
 /** Normalized category for a database or application error. */
 export type ErrorCategory =
   | "connection"

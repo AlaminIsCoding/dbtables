@@ -58,6 +58,10 @@ export interface TableDataController {
   goNext: () => void;
   /** Requests the previous page. */
   goBack: () => void;
+  /** Requests the first page. */
+  goFirst: () => void;
+  /** Requests the last page, when the total row count is known. */
+  goLast: () => void;
   /** Reloads the current window, discarding any cached page. */
   refresh: () => void;
   /** Active filters. */
@@ -191,6 +195,21 @@ export function useTableDataController(
     setOffset((current) => previousOffset(current, pageSize));
   }, [pageSize]);
 
+  const goFirst = useCallback(() => {
+    setOffset(0);
+  }, []);
+
+  const goLast = useCallback(() => {
+    setOffset((current) => {
+      const total = page?.totalRows;
+      if (total === undefined) {
+        return current;
+      }
+      const pages = Math.max(1, Math.ceil(total / pageSize));
+      return (pages - 1) * pageSize;
+    });
+  }, [page, pageSize]);
+
   const refresh = useCallback(() => {
     setReloadToken((token) => token + 1);
   }, []);
@@ -234,6 +253,8 @@ export function useTableDataController(
     canGoNext: canGoNext(page),
     goNext,
     goBack,
+    goFirst,
+    goLast,
     refresh,
     filters,
     addFilter,

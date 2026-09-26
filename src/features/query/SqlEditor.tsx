@@ -1,8 +1,9 @@
+import { autocompletion } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { sql } from "@codemirror/lang-sql";
 import {
   bracketMatching,
-  defaultHighlightStyle,
+  HighlightStyle,
   indentOnInput,
   syntaxHighlighting,
 } from "@codemirror/language";
@@ -11,12 +12,10 @@ import {
   drawSelection,
   dropCursor,
   EditorView,
-  highlightActiveLine,
-  highlightActiveLineGutter,
   highlightSpecialChars,
   keymap,
-  lineNumbers,
 } from "@codemirror/view";
+import { tags as t } from "@lezer/highlight";
 import { useEffect, useRef } from "react";
 
 import { cn } from "../../components/ui/cn";
@@ -43,6 +42,26 @@ export interface SqlEditorProps {
   className?: string;
 }
 
+/**
+ * SQL syntax highlighting that reads the app's design tokens, so the editor
+ * follows the light/dark theme instead of CodeMirror's built-in palette.
+ */
+const sqlHighlightStyle = HighlightStyle.define([
+  { tag: t.keyword, color: "var(--primary)", fontWeight: "600" },
+  { tag: [t.typeName, t.typeOperator, t.standard(t.name)], color: "oklch(0.72 0.15 210)" },
+  { tag: [t.string, t.special(t.string), t.character], color: "oklch(0.72 0.17 145)" },
+  { tag: [t.number, t.bool, t.null, t.atom], color: "oklch(0.68 0.15 300)" },
+  {
+    tag: [t.lineComment, t.blockComment, t.comment],
+    color: "var(--muted-foreground)",
+    fontStyle: "italic",
+  },
+  { tag: [t.operator, t.punctuation, t.bracket], color: "var(--muted-foreground)" },
+  { tag: [t.function(t.variableName), t.labelName, t.propertyName], color: "var(--foreground)" },
+  { tag: t.variableName, color: "var(--foreground)" },
+  { tag: t.invalid, color: "var(--destructive)" },
+]);
+
 /** Reads the primary selection and cursor head from an editor view. */
 function readSelection(view: EditorView): SqlEditorSelection {
   const range = view.state.selection.main;
@@ -57,8 +76,9 @@ function readSelection(view: EditorView): SqlEditorSelection {
  *
  * The view is created once and kept for the component's lifetime; React only
  * feeds it the controlled `value` and receives edits through `onChange`. The
- * custom keymap binds `Ctrl`/`Cmd` + `Enter` to run without a mouse, and the
- * editor theme reads the app's CSS variables so it follows light/dark tokens.
+ * custom keymap binds `Ctrl`/`Cmd` + `Enter` to run without a mouse, keyword and
+ * schema completion is enabled through `autocompletion`, and the highlighting
+ * plus UI chrome read the app's CSS variables so the editor follows the theme.
  */
 export function SqlEditor({
   value,
@@ -88,8 +108,6 @@ export function SqlEditor({
     const state = EditorState.create({
       doc: value,
       extensions: [
-        lineNumbers(),
-        highlightActiveLineGutter(),
         highlightSpecialChars(),
         history(),
         drawSelection(),
@@ -97,8 +115,8 @@ export function SqlEditor({
         EditorState.allowMultipleSelections.of(true),
         indentOnInput(),
         bracketMatching(),
-        highlightActiveLine(),
-        syntaxHighlighting(defaultHighlightStyle),
+        autocompletion({ activateOnTyping: true }),
+        syntaxHighlighting(sqlHighlightStyle),
         sql(),
         EditorView.lineWrapping,
         keymap.of([...defaultKeymap, ...historyKeymap]),
@@ -132,32 +150,48 @@ export function SqlEditor({
           "&": {
             height: "100%",
             color: "var(--foreground)",
-            backgroundColor: "var(--background)",
-            fontSize: "0.75rem",
+            backgroundColor: "transparent",
+            fontSize: "0.78rem",
           },
           ".cm-scroller": {
-            fontFamily:
-              "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-            lineHeight: "1.5",
+            fontFamily: "var(--font-mono)",
+            lineHeight: "1.65",
+            scrollbarWidth: "thin",
+            scrollbarColor:
+              "color-mix(in oklch, var(--muted-foreground) 35%, transparent) transparent",
           },
-          ".cm-content": { padding: "0.5rem 0" },
+          ".cm-content": { padding: "0.75rem 0.875rem", caretColor: "var(--primary)" },
           ".cm-gutters": {
-            backgroundColor: "var(--muted)",
+            backgroundColor: "transparent",
             color: "var(--muted-foreground)",
             border: "none",
           },
-          ".cm-activeLine": { backgroundColor: "var(--accent)" },
-          ".cm-activeLineGutter": {
+          ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px 0 6px" },
+          "&.cm-focused": { outline: "none" },
+          "&.cm-focused .cm-cursor": { borderLeftColor: "var(--primary)" },
+          "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
+            backgroundColor: "color-mix(in oklch, var(--primary) 22%, transparent)",
+          },
+          ".cm-activeLine": { backgroundColor: "transparent" },
+          ".cm-activeLineGutter": { backgroundColor: "transparent" },
+          ".cm-tooltip": {
+            border: "1px solid var(--border)",
+            backgroundColor: "var(--popover)",
+            color: "var(--popover-foreground)",
+            borderRadius: "calc(var(--radius) - 2px)",
+            boxShadow: "var(--shadow-md)",
+          },
+          ".cm-tooltip-autocomplete ul li": {
+            fontFamily: "var(--font-mono)",
+            fontSize: "12px",
+            padding: "2px 6px",
+          },
+          ".cm-tooltip-autocomplete ul li[aria-selected]": {
             backgroundColor: "var(--accent)",
             color: "var(--accent-foreground)",
           },
-          "&.cm-focused .cm-cursor": {
-            borderLeftColor: "var(--foreground)",
-          },
-          "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-            backgroundColor: "var(--ring)",
-            opacity: "0.35",
-          },
+          ".cm-completionLabel": { color: "inherit" },
+          ".cm-completionDetail": { color: "var(--muted-foreground)", fontStyle: "normal" },
         }),
       ],
     });
@@ -196,10 +230,7 @@ export function SqlEditor({
     <div
       ref={containerRef}
       data-testid="sql-editor"
-      className={cn(
-        "min-h-24 overflow-hidden rounded-md border border-input focus-within:ring-1 focus-within:ring-ring",
-        className,
-      )}
+      className={cn("min-h-0 overflow-hidden", className)}
     />
   );
 }

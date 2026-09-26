@@ -1,4 +1,4 @@
-export { QueryWorkspace, type QueryWorkspaceProps } from "./QueryWorkspace";
+export { QueryTabView, type QueryTabViewProps } from "./QueryTabView";
 export {
   describeQueryStatus,
   formatQueryStatus,

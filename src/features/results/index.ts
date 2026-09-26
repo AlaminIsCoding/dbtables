@@ -1,4 +1,3 @@
-export { ResultGrid, type ResultGridProps } from "./ResultGrid";
 export { ResultsPanel, summarizeOutcome, type ResultsPanelProps } from "./ResultsPanel";
 export { copyTextToClipboard } from "./clipboard";
 export {

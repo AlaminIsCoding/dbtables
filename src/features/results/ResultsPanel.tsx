@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import type { GridSelection, Item } from "@glideapps/glide-data-grid";
 
+import { DataTable, type DataTableColumn } from "../../components/data-table";
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
 import type {
@@ -14,10 +14,19 @@ import { toQueryError } from "../../services/errors";
 import { exportQueryCsv } from "../../services/export";
 import { copyTextToClipboard } from "./clipboard";
 import { cellCopyText, resultCopyText, rowCopyText } from "./copy";
-import { ResultGrid } from "./ResultGrid";
-import { queryResultToResultSet } from "./resultSet";
+import { queryResultToResultSet, type ResultSet } from "./resultSet";
 import type { QueryOutcome } from "./queryOutcome";
 import { ValueViewer } from "./ValueViewer";
+
+/** A cell location: `[columnIndex, rowIndex]`. */
+type Item = [number, number];
+
+function resultColumnsToDataTableColumns(result: ResultSet): DataTableColumn[] {
+  return result.columns.map((column) => ({
+    name: column.name,
+    typeName: column.typeName,
+  }));
+}
 
 export interface ResultsPanelProps {
   /** Current query outcome, including idle/running/error states. */
@@ -242,11 +251,36 @@ function PartialBanner({
 }
 
 interface BodyHandlers {
-  onSelectionChange: (selection: GridSelection) => void;
-  onCellActivated: (location: Item) => void;
+  onCellClick: (col: number, row: number) => void;
+  onCellActivated: (col: number, row: number) => void;
+  activeCell: Item | null;
   canFetchMore: boolean;
   fetchingMore: boolean;
   onFetchMore?: () => void;
+}
+
+function ResultGrid({
+  result,
+  handlers,
+}: {
+  result: QueryResult;
+  handlers: BodyHandlers;
+}) {
+  const set = queryResultToResultSet(result);
+  return (
+    <DataTable
+      ariaLabel={`Query results: ${set.rows.length} rows, ${set.columns.length} columns`}
+      columns={resultColumnsToDataTableColumns(set)}
+      rows={set.rows}
+      activeCell={
+        handlers.activeCell
+          ? { col: handlers.activeCell[0], row: handlers.activeCell[1] }
+          : null
+      }
+      onCellClick={handlers.onCellClick}
+      onCellActivated={handlers.onCellActivated}
+    />
+  );
 }
 
 function renderBody(outcome: QueryOutcome, handlers: BodyHandlers) {
@@ -256,13 +290,7 @@ function renderBody(outcome: QueryOutcome, handlers: BodyHandlers) {
     case "running":
       return <LoadingState />;
     case "grid":
-      return (
-        <ResultGrid
-          result={queryResultToResultSet(outcome.result)}
-          onSelectionChange={handlers.onSelectionChange}
-          onCellActivated={handlers.onCellActivated}
-        />
-      );
+      return <ResultGrid result={outcome.result} handlers={handlers} />;
     case "partial":
       return (
         <div className="flex h-full min-h-0 flex-col">
@@ -272,12 +300,8 @@ function renderBody(outcome: QueryOutcome, handlers: BodyHandlers) {
             fetchingMore={handlers.fetchingMore}
             onFetchMore={handlers.onFetchMore}
           />
-          <div className="min-h-0 flex-1">
-            <ResultGrid
-              result={queryResultToResultSet(outcome.result)}
-              onSelectionChange={handlers.onSelectionChange}
-              onCellActivated={handlers.onCellActivated}
-            />
+          <div className="flex min-h-0 flex-1 flex-col">
+            <ResultGrid result={outcome.result} handlers={handlers} />
           </div>
         </div>
       );
@@ -326,12 +350,12 @@ export function ResultsPanel({
     null,
   );
 
-  const handleSelectionChange = useCallback((selection: GridSelection) => {
-    setSelectedCell(selection.current?.cell ?? null);
+  const handleCellClick = useCallback((col: number, row: number) => {
+    setSelectedCell([col, row]);
   }, []);
 
-  const openViewer = useCallback((location: Item) => {
-    setViewerCell(location);
+  const openViewer = useCallback((col: number, row: number) => {
+    setViewerCell([col, row]);
   }, []);
 
   // The viewer needs a cell-bearing grid; export also applies to a column-only
@@ -444,7 +468,7 @@ export function ResultsPanel({
             size="sm"
             variant="ghost"
             className="h-5 shrink-0 px-1.5 text-[10px]"
-            onClick={() => openViewer(selectedCell)}
+            onClick={() => openViewer(selectedCell[0], selectedCell[1])}
           >
             View value
           </Button>
@@ -545,8 +569,9 @@ export function ResultsPanel({
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {renderBody(outcome, {
-          onSelectionChange: handleSelectionChange,
+          onCellClick: handleCellClick,
           onCellActivated: openViewer,
+          activeCell: selectedCell,
           canFetchMore,
           fetchingMore,
           onFetchMore,

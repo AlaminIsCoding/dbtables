@@ -5,6 +5,7 @@ import type { ChangeGroupResult, RowIdentity } from "../../services/tableData";
 import {
   cellValuesEqual,
   describeStagedChange,
+  hasPendingData,
   isApplyable,
   isBlocking,
   pendingRequests,
@@ -19,6 +20,7 @@ import {
   stagedDeletedRows,
   stagedEditedCells,
   summarizeStaged,
+  updateInsertCell,
   type StagedChange,
 } from "./stagedChanges";
 
@@ -136,7 +138,7 @@ describe("stageCellEdit", () => {
 });
 
 describe("stageInsert and stageDelete", () => {
-  it("stages an insert and ignores an empty one", () => {
+  it("stages an insert and keeps an empty one as a draft", () => {
     const staged = stageInsert([], object, [{ column: "name", value: text("dana") }], "new-1");
     expect(staged).toHaveLength(1);
     expect(staged[0].change).toEqual({
@@ -144,7 +146,19 @@ describe("stageInsert and stageDelete", () => {
       values: [{ column: "name", value: { type: "text", value: "dana" } }],
     });
     expect(staged[0].rowKey).toBe("new-1");
-    expect(stageInsert([], object, [])).toHaveLength(0);
+
+    // An empty insert is a draft row: kept, but with no applyable data yet.
+    const draft = stageInsert([], object, [], "new-2");
+    expect(draft).toHaveLength(1);
+    expect(hasPendingData(draft[0])).toBe(false);
+    expect(pendingRequests(draft)).toHaveLength(0);
+
+    const filled = updateInsertCell(draft, "new-2", "name", text("erin"));
+    expect(hasPendingData(filled[0])).toBe(true);
+    expect(pendingRequests(filled)).toHaveLength(1);
+
+    const cleared = updateInsertCell(filled, "new-2", "name", { type: "null" });
+    expect(hasPendingData(cleared[0])).toBe(false);
   });
 
   it("replaces a pending update with a delete for the same row", () => {

@@ -106,9 +106,9 @@ export function pageRangeLabel(
   const first = offset + 1;
   const last = offset + rowCount;
   if (totalRows !== undefined) {
-    return `Rows ${first}–${last} of ${totalRows}`;
+    return `Rows ${first}-${last} of ${totalRows}`;
   }
-  return `Rows ${first}–${last}`;
+  return `Rows ${first}-${last}`;
 }
 
 /** Whether the page reports a primary key or other safe row identity. */

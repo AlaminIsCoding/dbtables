@@ -54,7 +54,7 @@ function ColumnRow({
         {column.name}
       </span>
       <span className="shrink-0 text-[10px] text-muted-foreground">
-        {column.typeName ?? "—"}
+        {column.typeName ?? "-"}
       </span>
       {isPrimaryKey ? (
         <span className="shrink-0 rounded-sm bg-accent px-1 text-[9px] font-semibold uppercase">

@@ -239,10 +239,6 @@ export function stageInsert(
   values: readonly RowKey[],
   id: string = createOperationId(),
 ): StagedChange[] {
-  if (values.length === 0) {
-    return [...staged];
-  }
-
   return [
     ...staged,
     {
@@ -256,6 +252,47 @@ export function stageInsert(
       conflictedColumns: [],
     },
   ];
+}
+
+/**
+ * Whether a staged change carries enough data to be sent to the backend.
+ *
+ * A freshly staged insert starts empty (the user fills it in inline), so an
+ * insert with no values is a draft rather than an applyable change.
+ */
+export function hasPendingData(change: StagedChange): boolean {
+  return change.change.kind !== "insert" || change.change.values.length > 0;
+}
+
+/**
+ * Sets one cell of a staged insert, merging it into the insert's values.
+ *
+ * Editing the cell to `NULL` removes the column from the insert, so untouched
+ * or cleared columns are not sent as explicit nulls.
+ */
+export function updateInsertCell(
+  staged: readonly StagedChange[],
+  id: string,
+  column: string,
+  value: CellValue,
+): StagedChange[] {
+  return staged.map((change) => {
+    if (change.id !== id || change.change.kind !== "insert") {
+      return change;
+    }
+    const values = change.change.values.filter((entry) => entry.column !== column);
+    if (value.type !== "null") {
+      values.push({ column, value });
+    }
+    return {
+      ...change,
+      change: { kind: "insert", values },
+      columns: values.map((entry) => entry.column),
+      status: "pending",
+      conflictedColumns: [],
+      error: undefined,
+    };
+  });
 }
 
 /**
@@ -292,6 +329,42 @@ export function stageDelete(
   ];
 }
 
+/**
+ * Stages deletes for every selected page row that can be safely identified.
+ *
+ * Rows missing from the loaded page, or without a backend-confirmed identity,
+ * are skipped so a multi-row delete never targets a row the engine cannot
+ * address. Existing updates for a deleted row are replaced by its delete.
+ */
+export function stageDeleteRows(
+  staged: readonly StagedChange[],
+  object: ObjectRef,
+  params: {
+    /** Loaded page rows, indexed by their grid row. */
+    rows: readonly Row[];
+    /** Columns for the loaded page. */
+    columns: ColumnInfo[];
+    /** Backend-reported identity columns. */
+    identityColumns: string[];
+    /** Page row indexes selected in the grid. */
+    rowIndexes: readonly number[];
+  },
+): StagedChange[] {
+  let next: StagedChange[] = [...staged];
+  for (const rowIndex of params.rowIndexes) {
+    const row = params.rows[rowIndex];
+    if (!row) {
+      continue;
+    }
+    const identity = rowIdentityFor(row, params.columns, params.identityColumns);
+    if (identity === null) {
+      continue;
+    }
+    next = stageDelete(next, object, identity, rowIndex);
+  }
+  return next;
+}
+
 /** Removes one staged change by id. */
 export function removeStagedChange(
   staged: readonly StagedChange[],
@@ -316,7 +389,16 @@ export function stagedChangeToRequest(change: StagedChange): ChangeRequest {
 
 /** Requests for every change that may be applied right now, in staged order. */
 export function pendingRequests(staged: readonly StagedChange[]): ChangeRequest[] {
-  return staged.filter(isApplyable).map(stagedChangeToRequest);
+  return staged
+    .filter((change) => isApplyable(change) && hasPendingData(change))
+    .map(stagedChangeToRequest);
+}
+
+/** Insert changes that are still queued (new rows being filled in inline). */
+export function stagedInserts(staged: readonly StagedChange[]): StagedChange[] {
+  return staged.filter(
+    (change) => change.change.kind === "insert" && change.status !== "applied",
+  );
 }
 
 /** Counts and flags for the staged list. */
@@ -336,11 +418,15 @@ export function summarizeStaged(staged: readonly StagedChange[]): StagedSummary 
     switch (change.status) {
       case "pending":
         pending += 1;
-        applyable += 1;
+        if (hasPendingData(change)) {
+          applyable += 1;
+        }
         break;
       case "failed":
         failed += 1;
-        applyable += 1;
+        if (hasPendingData(change)) {
+          applyable += 1;
+        }
         break;
       case "conflict":
         conflict += 1;
@@ -462,7 +548,7 @@ export function describeStagedChange(change: StagedChange): string {
       : change.rowIndex !== null
         ? `row ${change.rowIndex + 1}`
         : "row";
-  const columns = change.columns.length > 0 ? change.columns.join(", ") : "—";
+  const columns = change.columns.length > 0 ? change.columns.join(", ") : "-";
   switch (change.change.kind) {
     case "insert":
       return `Insert ${columns}`;

@@ -1,5 +1,4 @@
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -19,37 +18,8 @@ vi.mock("./clipboard", () => ({
 
 const copyMock = vi.mocked(copyTextToClipboard);
 
-const glide = vi.hoisted(() => ({
-  props: undefined as
-    | {
-        rows: number;
-        columns: { title: string }[];
-        onCellEdited?: unknown;
-        onCellsEdited?: unknown;
-        onGridSelectionChange?: (selection: {
-          current?: { cell: readonly [number, number] };
-        }) => void;
-        onCellActivated?: (cell: readonly [number, number]) => void;
-      }
-    | undefined,
-}));
-
-vi.mock("@glideapps/glide-data-grid", () => ({
-  GridCellKind: {
-    Text: "text",
-    Number: "number",
-    Boolean: "boolean",
-  },
-  getDefaultTheme: () => ({}),
-  DataEditor: (props: unknown) => {
-    glide.props = props as typeof glide.props;
-    return null;
-  },
-}));
-
 afterEach(() => {
   cleanup();
-  glide.props = undefined;
   copyMock.mockClear();
 });
 
@@ -85,7 +55,7 @@ describe("ResultsPanel", () => {
     );
   });
 
-  it("renders a grid success with a read-only Glide instance", () => {
+  it("renders a grid success as a read-only data table", () => {
     renderOutcome({
       kind: "grid",
       result: resultWith({
@@ -104,14 +74,13 @@ describe("ResultsPanel", () => {
       }),
     });
 
-    expect(glide.props?.rows).toBe(2);
-    expect(glide.props?.onCellEdited).toBeUndefined();
-    expect(glide.props?.onCellsEdited).toBeUndefined();
     expect(
       screen.getByRole("region", {
-        name: /Query results grid: 2 rows, 2 columns/,
+        name: /Query results: 2 rows, 2 columns/,
       }),
     ).toBeTruthy();
+    expect(screen.getByText("alice")).toBeTruthy();
+    expect(screen.getByText("bob")).toBeTruthy();
     expect(screen.getByTestId("results-summary").textContent).toBe(
       "2 rows · 2 columns · 5 ms",
     );
@@ -177,9 +146,7 @@ describe("ResultsPanel", () => {
       }),
     });
 
-    act(() => {
-      glide.props?.onGridSelectionChange?.({ current: { cell: [0, 0] } });
-    });
+    fireEvent.click(screen.getByText("a long value"));
 
     fireEvent.click(screen.getByRole("button", { name: "View value" }));
 
@@ -203,9 +170,7 @@ describe("ResultsPanel", () => {
       }),
     });
 
-    act(() => {
-      glide.props?.onCellActivated?.([0, 0]);
-    });
+    fireEvent.doubleClick(screen.getByText('{"a":1}'));
 
     expect(screen.getByTestId("value-viewer-text").textContent).toContain(
       '"a": 1',
@@ -302,9 +267,7 @@ describe("ResultsPanel", () => {
     expect(copyCell.disabled).toBe(true);
     expect(copyRow.disabled).toBe(true);
 
-    act(() => {
-      glide.props?.onGridSelectionChange?.({ current: { cell: [1, 0] } });
-    });
+    fireEvent.click(screen.getByText("alice"));
 
     fireEvent.click(screen.getByRole("button", { name: "Copy cell" }));
     await waitFor(() => expect(copyMock).toHaveBeenCalledWith("alice"));
@@ -329,9 +292,7 @@ describe("ResultsPanel", () => {
       }),
     });
 
-    act(() => {
-      glide.props?.onGridSelectionChange?.({ current: { cell: [0, 0] } });
-    });
+    fireEvent.click(screen.getAllByRole("cell")[1]);
     fireEvent.click(screen.getByRole("button", { name: "Copy cell" }));
 
     expect(
