@@ -8,8 +8,8 @@ import { toQueryError } from "@/services/errors";
 import { listProfileDatabases } from "@/services/connections";
 import { pickExistingSqliteFile, pickNewSqliteFile } from "@/services/dialogs";
 
+import { ConnectionGrid } from "./ConnectionGrid";
 import { ProfileForm } from "./ProfileForm";
-import { ProfileList } from "./ProfileList";
 import {
   draftFromProfile,
   emptyDraft,
@@ -24,16 +24,14 @@ export interface ConnectionsPageProps {
 }
 
 /**
- * Full-screen connection manager.
+ * Full-screen connections page.
  *
- * Owns the connection controller and shows the saved-connection list beside a
- * create/edit form. It is the landing view while disconnected and can be opened
- * from the top bar while connected. Server databases can be discovered for the
- * draft; SQLite paths are chosen with a native file dialog.
+ * Shows the saved connections (engine brand mark plus connection name); choosing
+ * one connects and the shared database picker opens. "New connection" reveals the
+ * create/edit form. The same controller is shared with the top bar, so connecting
+ * here updates the app's single active connection.
  */
 export function ConnectionsPage({ onClose }: ConnectionsPageProps) {
-  // Uses the workspace store's shared controller so connecting here updates the
-  // app's single active connection (and therefore the sidebar/workspace).
   const { connections: controller } = useWorkspace();
   const [editing, setEditing] = useState<ProfileDraft | null>(null);
   const [formError, setFormError] = useState<QueryError | null>(null);
@@ -156,12 +154,15 @@ export function ConnectionsPage({ onClose }: ConnectionsPageProps) {
     }
   }
 
-  function testProfile(profile: ConnectionProfile) {
-    controller.clearMutation();
-    void controller.testConnection(
-      { id: profile.id, name: profile.name, descriptor: profile.descriptor },
-      profile.id,
-    );
+  async function removeEditing() {
+    if (!editing?.id) {
+      return;
+    }
+    const removed = await controller.remove(editing.id);
+    if (removed) {
+      setEditing(null);
+      resetDatabaseState();
+    }
   }
 
   return (
@@ -188,36 +189,61 @@ export function ConnectionsPage({ onClose }: ConnectionsPageProps) {
         </Button>
       </header>
 
-      <div className="flex min-h-0 flex-1">
-        <div className="app-scroll flex w-80 min-h-0 shrink-0 flex-col overflow-auto border-r border-border p-2">
-          {controller.profiles.status === "loading" ? (
-            <p role="status" className="px-2 py-3 text-xs text-muted-foreground">
-              Loading connections…
+      <div className="app-scroll min-h-0 flex-1 overflow-auto">
+        {editing ? (
+          <ProfileForm
+            className="mx-auto w-full max-w-2xl p-6"
+            draft={editing}
+            onChange={updateEditing}
+            onSubmit={() => void submitDraft()}
+            onTest={() => void testDraft()}
+            onCancel={cancelEdit}
+            onRemove={() => void removeEditing()}
+            removing={controller.mutation.status === "removing"}
+            saving={controller.mutation.status === "saving"}
+            testing={
+              controller.test.status === "testing" &&
+              controller.test.targetId === null
+            }
+            test={controller.test}
+            error={formError ?? mutationError}
+            databases={databases}
+            loadingDatabases={loadingDatabases}
+            databasesError={databasesError}
+            onLoadDatabases={() => void loadDatabases()}
+            onBrowseFile={() => void browseFile()}
+            onNewDatabaseFile={() => void newDatabaseFile()}
+          />
+        ) : controller.profiles.status === "loading" ? (
+          <p role="status" className="px-6 py-6 text-xs text-muted-foreground">
+            Loading connections…
+          </p>
+        ) : controller.profiles.status === "error" ? (
+          <div className="flex flex-col gap-2 px-6 py-6">
+            <p role="alert" className="text-xs text-destructive">
+              {controller.profiles.error.message}
             </p>
-          ) : controller.profiles.status === "error" ? (
-            <div className="flex flex-col gap-1 px-2 py-3">
-              <p role="alert" className="text-xs text-destructive">
-                {controller.profiles.error.message}
-              </p>
-              <Button
-                variant="outline"
-                size="sm"
-                className="self-start"
-                onClick={() => void controller.reload()}
-              >
-                Retry
-              </Button>
-            </div>
-          ) : profiles.length === 0 ? (
-            <p className="px-2 py-3 text-xs text-muted-foreground">
-              No saved connections yet. Create one to get started.
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={() => void controller.reload()}
+            >
+              Retry
+            </Button>
+          </div>
+        ) : profiles.length === 0 ? (
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <p className="text-sm font-medium">No saved connections yet</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Create a connection for SQLite, MySQL, or PostgreSQL to get started.
             </p>
-          ) : (
-            <ProfileList
+          </div>
+        ) : (
+          <div className="mx-auto max-w-5xl p-4">
+            <ConnectionGrid
               profiles={profiles}
               active={controller.active}
-              test={controller.test}
-              mutation={controller.mutation}
               onConnect={(profileId) => {
                 controller.clearMutation();
                 void controller.connect(profileId);
@@ -225,54 +251,15 @@ export function ConnectionsPage({ onClose }: ConnectionsPageProps) {
               onDisconnect={() => {
                 void controller.disconnect();
               }}
-              onEdit={startEdit}
-              onRemove={(profileId) => {
-                void controller.remove(profileId);
-              }}
-              onTest={testProfile}
+              onMore={startEdit}
             />
-          )}
-
-          {mutationError ? (
-            <p role="alert" className="px-2 pt-2 text-[11px] text-destructive">
-              {mutationError.message}
-            </p>
-          ) : null}
-        </div>
-
-        <div className="app-scroll min-h-0 flex-1 overflow-auto">
-          {editing ? (
-            <ProfileForm
-              className="max-w-2xl p-4"
-              draft={editing}
-              onChange={updateEditing}
-              onSubmit={() => void submitDraft()}
-              onTest={() => void testDraft()}
-              onCancel={cancelEdit}
-              saving={controller.mutation.status === "saving"}
-              testing={
-                controller.test.status === "testing" &&
-                controller.test.targetId === null
-              }
-              test={controller.test}
-              error={formError ?? mutationError}
-              databases={databases}
-              loadingDatabases={loadingDatabases}
-              databasesError={databasesError}
-              onLoadDatabases={() => void loadDatabases()}
-              onBrowseFile={() => void browseFile()}
-              onNewDatabaseFile={() => void newDatabaseFile()}
-            />
-          ) : (
-            <div className="flex h-full flex-col items-center justify-center gap-1 p-6 text-center">
-              <p className="text-sm font-medium">Manage your connections</p>
-              <p className="max-w-sm text-xs text-muted-foreground">
-                Select a saved connection to connect, edit, test, or remove it, or
-                create a new one.
+            {mutationError ? (
+              <p role="alert" className="px-2 pt-2 text-[11px] text-destructive">
+                {mutationError.message}
               </p>
-            </div>
-          )}
-        </div>
+            ) : null}
+          </div>
+        )}
       </div>
     </section>
   );

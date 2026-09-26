@@ -15,20 +15,13 @@ import type {
   QueryError,
   TlsMode,
 } from "../../domain";
+import { ENGINE_IDS, ENGINE_LABELS } from "../../lib/engines";
 import type { ConnectionProfileInput } from "../../services/connections";
+
+export { ENGINE_IDS, ENGINE_LABELS };
 
 /** Maximum profile display-name length, matching the backend limit. */
 export const MAX_PROFILE_NAME_LENGTH = 120;
-
-/** Supported engines, in menu order. */
-export const ENGINE_IDS: readonly EngineId[] = ["sqlite", "mysql", "postgres"];
-
-/** Human-readable engine names. */
-export const ENGINE_LABELS: Record<EngineId, string> = {
-  sqlite: "SQLite",
-  mysql: "MySQL",
-  postgres: "PostgreSQL",
-};
 
 /** Default server port per engine. SQLite has no network port. */
 export const DEFAULT_PORTS: Record<EngineId, number> = {

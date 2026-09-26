@@ -1,5 +1,10 @@
+export { ConnectionGrid, type ConnectionGridProps } from "./ConnectionGrid";
 export { ConnectionManager, type ConnectionManagerProps } from "./ConnectionManager";
 export { ConnectionsPage, type ConnectionsPageProps } from "./ConnectionsPage";
+export {
+  DatabasePickerDialog,
+  type DatabasePickerDialogProps,
+} from "./DatabasePickerDialog";
 export { ProfileForm, type ProfileFormProps } from "./ProfileForm";
 export { ProfileList, type ProfileListProps } from "./ProfileList";
 export {

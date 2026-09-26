@@ -1,11 +1,12 @@
 import {
+  CheckIcon,
   ChevronDownIcon,
   DatabaseIcon,
   MessageSquareIcon,
   MoonIcon,
   PanelLeftIcon,
-  PlugZapIcon,
   PowerIcon,
+  SettingsIcon,
   SquarePenIcon,
   SunIcon,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import type { Theme } from "@/app/theme";
 import { useWorkspace } from "@/app/store";
 import logoDark from "@/assets/logo-dark.png";
 import logoLight from "@/assets/logo-light.png";
+import { EngineLogo } from "@/components/engine-logo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -25,6 +27,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import type { EngineId } from "@/domain";
 
 export interface TopBarProps {
   theme: Theme;
@@ -32,26 +35,32 @@ export interface TopBarProps {
   onToggleSidebar: () => void;
   /** Opens the full-screen connections page. */
   onOpenConnections: () => void;
-  /** Whether the connections page is currently shown (for button emphasis). */
-  connectionsOpen?: boolean;
+  /** Opens the database picker for the active connection. */
+  onOpenDatabase: () => void;
   className?: string;
 }
 
 /**
- * Application top bar: sidebar toggle, brand, connection switcher, connections,
- * new query, messages, and theme toggle.
+ * Application top bar: sidebar toggle, brand, connection picker, open-database
+ * button, connections, new query, messages, and theme toggle.
+ *
+ * The connection picker lists saved connections (engine brand mark plus
+ * connection name). Once a connection is open, "Open database" launches the
+ * database picker for that connection.
  */
 export function TopBar({
   theme,
   onToggleTheme,
   onToggleSidebar,
   onOpenConnections,
-  connectionsOpen = false,
+  onOpenDatabase,
   className,
 }: TopBarProps) {
   const {
     connections,
     connectionId,
+    scopes,
+    scope,
     openQuery,
     unread,
     messagesOpen,
@@ -60,6 +69,25 @@ export function TopBar({
 
   const profiles =
     connections.profiles.status === "ready" ? connections.profiles.profiles : [];
+
+  const activeProfileId =
+    connections.active.status === "connected" ||
+    connections.active.status === "connecting"
+      ? connections.active.profileId
+      : null;
+  const activeProfile = profiles.find(
+    (profile) => profile.id === activeProfileId,
+  );
+  const activeEngine: EngineId | undefined = activeProfile?.descriptor.engine;
+  const connecting = connections.active.status === "connecting";
+
+  const databases = scopes?.databases ?? [];
+  const profileDatabase =
+    activeProfile && activeProfile.descriptor.engine !== "sqlite"
+      ? activeProfile.descriptor.database
+      : undefined;
+  const currentDatabase = scope.database ?? profileDatabase;
+  const databaseLabel = currentDatabase ?? activeProfile?.name ?? "Open database";
 
   return (
     <header
@@ -93,15 +121,27 @@ export function TopBar({
 
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm">
-            <DatabaseIcon />
-            Open database
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label={`Connection: ${activeProfile?.name ?? "none"}`}
+          >
+            {activeEngine ? (
+              <EngineLogo engine={activeEngine} className="size-4" />
+            ) : (
+              <DatabaseIcon />
+            )}
+            <span className="max-w-40 truncate">
+              {activeProfile?.name ?? "Select connection"}
+            </span>
             <ChevronDownIcon className="opacity-60" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-64">
-          <DropdownMenuLabel>Saved connections</DropdownMenuLabel>
-          {profiles.length === 0 ? (
+          <DropdownMenuLabel>Connections</DropdownMenuLabel>
+          {connecting ? (
+            <DropdownMenuItem disabled>Connecting…</DropdownMenuItem>
+          ) : profiles.length === 0 ? (
             <DropdownMenuItem disabled>No saved connections</DropdownMenuItem>
           ) : (
             profiles.map((profile) => (
@@ -109,16 +149,17 @@ export function TopBar({
                 key={profile.id}
                 onSelect={() => void connections.connect(profile.id)}
               >
-                <DatabaseIcon />
+                <EngineLogo engine={profile.descriptor.engine} className="size-4" />
                 <span className="flex-1 truncate">{profile.name}</span>
-                <span className="text-[10px] uppercase text-muted-foreground">
-                  {profile.descriptor.engine}
-                </span>
+                {activeProfileId === profile.id ? (
+                  <CheckIcon className="size-3.5" />
+                ) : null}
               </DropdownMenuItem>
             ))
           )}
           <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => onOpenConnections()}>
+            <SettingsIcon />
             Manage connections…
           </DropdownMenuItem>
           {connectionId ? (
@@ -133,17 +174,18 @@ export function TopBar({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <div className="flex-1" />
-
       <Button
-        variant={connectionsOpen ? "secondary" : "outline"}
+        variant="outline"
         size="sm"
-        onClick={onOpenConnections}
-        aria-label="Connections"
+        onClick={onOpenDatabase}
+        disabled={connectionId === null || databases.length === 0}
+        aria-label={`Open database: ${databaseLabel}`}
       >
-        <PlugZapIcon />
-        Connections
+        <DatabaseIcon />
+        <span className="max-w-40 truncate">{databaseLabel}</span>
       </Button>
+
+      <div className="flex-1" />
 
       <Button
         variant="outline"

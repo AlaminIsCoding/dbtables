@@ -185,48 +185,26 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
         </CreateMenu>
       </div>
 
-      {scopes && (scopes.databases?.length || scopes.schemas?.length) ? (
+      {scopes && scopes.schemas && scopes.schemas.length > 0 ? (
         <div className="flex shrink-0 flex-col gap-1 px-2 pb-1">
-          {scopes.databases && scopes.databases.length > 0 ? (
-            <label className="flex items-center gap-1.5 text-[10px] tracking-wide text-muted-foreground uppercase">
-              <span className="w-14 shrink-0">Database</span>
-              <select
-                aria-label="Database"
-                value={scope.database ?? ""}
-                onChange={(event) =>
-                  setScope({ ...scope, database: event.target.value || undefined })
-                }
-                className="h-6 min-w-0 flex-1 rounded-sm border border-input bg-background px-1 font-mono text-[11px] normal-case"
-              >
-                <option value="">(default)</option>
-                {scopes.databases.map((database) => (
-                  <option key={database} value={database}>
-                    {database}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-          {scopes.schemas && scopes.schemas.length > 0 ? (
-            <label className="flex items-center gap-1.5 text-[10px] tracking-wide text-muted-foreground uppercase">
-              <span className="w-14 shrink-0">Schema</span>
-              <select
-                aria-label="Schema"
-                value={scope.schema ?? ""}
-                onChange={(event) =>
-                  setScope({ ...scope, schema: event.target.value || undefined })
-                }
-                className="h-6 min-w-0 flex-1 rounded-sm border border-input bg-background px-1 font-mono text-[11px] normal-case"
-              >
-                <option value="">(default)</option>
-                {scopes.schemas.map((schemaName) => (
-                  <option key={schemaName} value={schemaName}>
-                    {schemaName}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
+          <label className="flex items-center gap-1.5 text-[10px] tracking-wide text-muted-foreground uppercase">
+            <span className="w-14 shrink-0">Schema</span>
+            <select
+              aria-label="Schema"
+              value={scope.schema ?? ""}
+              onChange={(event) =>
+                setScope({ ...scope, schema: event.target.value || undefined })
+              }
+              className="h-6 min-w-0 flex-1 rounded-sm border border-input bg-background px-1 font-mono text-[11px] normal-case"
+            >
+              <option value="">(default)</option>
+              {scopes.schemas.map((schemaName) => (
+                <option key={schemaName} value={schemaName}>
+                  {schemaName}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
       ) : null}
 

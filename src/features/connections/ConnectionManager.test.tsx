@@ -85,9 +85,7 @@ describe("ConnectionManager", () => {
     expect(screen.getByLabelText("Database file")).toBeTruthy();
     expect(screen.queryByLabelText("Host")).toBeNull();
 
-    fireEvent.change(screen.getByLabelText("Engine"), {
-      target: { value: "mysql" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "MySQL" }));
 
     expect(screen.queryByLabelText("Database file")).toBeNull();
     expect(screen.getByLabelText("Host")).toBeTruthy();
@@ -185,9 +183,7 @@ describe("ConnectionManager", () => {
     fireEvent.change(screen.getByLabelText("Name"), {
       target: { value: "Reporting" },
     });
-    fireEvent.change(screen.getByLabelText("Engine"), {
-      target: { value: "postgres" },
-    });
+    fireEvent.click(screen.getByRole("radio", { name: "PostgreSQL" }));
     fireEvent.change(screen.getByLabelText("Username"), {
       target: { value: "app_user" },
     });

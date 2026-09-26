@@ -2,10 +2,9 @@ import { useId } from "react";
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
-import { EngineLogo } from "../../components/engine-logo";
-import type { EngineId, QueryError, TlsMode } from "../../domain";
+import { EnginePicker } from "../../components/engine-picker";
+import type { QueryError, TlsMode } from "../../domain";
 import {
-  ENGINE_IDS,
   ENGINE_LABELS,
   TLS_MODES,
   TLS_MODE_LABELS,
@@ -25,6 +24,10 @@ export interface ProfileFormProps {
   onTest: () => void;
   /** Discards the draft. */
   onCancel: () => void;
+  /** Removes the saved profile; only shown while editing. */
+  onRemove?: () => void;
+  /** Whether a removal is in progress. */
+  removing?: boolean;
   /** Whether a save is in progress. */
   saving: boolean;
   /** Whether a test of this draft is in progress. */
@@ -95,6 +98,8 @@ export function ProfileForm({
   onSubmit,
   onTest,
   onCancel,
+  onRemove,
+  removing = false,
   saving,
   testing,
   test,
@@ -109,7 +114,6 @@ export function ProfileForm({
 }: ProfileFormProps) {
   const baseId = useId();
   const nameId = `${baseId}-name`;
-  const engineId = `${baseId}-engine`;
   const filePathId = `${baseId}-file-path`;
   const hostId = `${baseId}-host`;
   const portId = `${baseId}-port`;
@@ -146,26 +150,12 @@ export function ProfileForm({
       </div>
 
       <div className="flex flex-col gap-1">
-        <label htmlFor={engineId} className={labelClass}>
-          Engine
-        </label>
-        <div className="flex items-center gap-2">
-          <EngineLogo engine={draft.engine} className="size-5" />
-          <select
-            id={engineId}
-            value={draft.engine}
-            onChange={(event) =>
-              onChange(withEngine(draft, event.target.value as EngineId))
-            }
-            className={inputClass}
-          >
-            {ENGINE_IDS.map((engine) => (
-              <option key={engine} value={engine}>
-                {ENGINE_LABELS[engine]}
-              </option>
-            ))}
-          </select>
-        </div>
+        <span className={labelClass}>Engine</span>
+        <EnginePicker
+          value={draft.engine}
+          onSelect={(engine) => onChange(withEngine(draft, engine))}
+          showLabels
+        />
       </div>
 
       {draft.engine === "sqlite" ? (
@@ -358,6 +348,17 @@ export function ProfileForm({
         <Button type="button" variant="ghost" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
+        {draft.id && onRemove ? (
+          <Button
+            type="button"
+            variant="ghost"
+            className="ml-auto text-destructive hover:text-destructive"
+            onClick={onRemove}
+            disabled={saving || testing || removing}
+          >
+            {removing ? "Removing…" : "Delete connection"}
+          </Button>
+        ) : null}
       </div>
     </form>
   );

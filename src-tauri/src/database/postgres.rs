@@ -1845,10 +1845,15 @@ impl DatabaseAdapter for PostgresAdapter {
             let client = connected_client(&guard, connection)?;
 
             // PostgreSQL exposes schemas, not alternate databases, on one
-            // connection; the database field stays empty.
+            // connection; the database field stays empty. System catalogs
+            // (`pg_catalog`, `pg_toast`, `pg_temp_*`) and `information_schema`
+            // are filtered out so a picker lists only user schemas.
             let rows = client
                 .query(
-                    "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
+                    "SELECT schema_name FROM information_schema.schemata \
+                     WHERE schema_name <> 'information_schema' \
+                     AND schema_name NOT LIKE 'pg_%' \
+                     ORDER BY schema_name",
                     &[],
                 )
                 .await
