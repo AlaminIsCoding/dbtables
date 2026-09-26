@@ -8,6 +8,19 @@ vi.mock("../services/appStatus", () => ({
   getAppStatus: vi.fn(),
 }));
 
+// The sidebar mounts the connection manager, which lists saved profiles on
+// mount. Keep the shell test independent of Tauri and of a real settings file.
+vi.mock("../services/connections", () => ({
+  connectSqlite: vi.fn(),
+  disconnectConnection: vi.fn(),
+  getConnectionState: vi.fn(),
+  listConnectionProfiles: vi.fn().mockResolvedValue([]),
+  saveConnectionProfile: vi.fn(),
+  deleteConnectionProfile: vi.fn(),
+  testConnectionProfile: vi.fn(),
+  connectProfile: vi.fn(),
+}));
+
 // The shell renders the Glide prototype in the results pane. jsdom has no
 // canvas support, so the grid is stubbed to keep the shell test focused.
 vi.mock("@glideapps/glide-data-grid", () => ({
@@ -49,14 +62,14 @@ describe("App workspace shell", () => {
     getAppStatusMock.mockReset();
   });
 
-  it("renders the sidebar, query tabs, split panes, and status bar", () => {
+  it("renders the sidebar, query tabs, split panes, and status bar", async () => {
     render(<App />);
 
     expect(screen.getByRole("heading", { name: "dbtables" })).toBeTruthy();
     expect(
       screen.getByRole("complementary", { name: "Workspace navigation" }),
     ).toBeTruthy();
-    expect(screen.getByText("No connections yet.")).toBeTruthy();
+    expect(await screen.findByText("No connections yet.")).toBeTruthy();
     expect(
       screen.getByRole("tab", { name: "Query 1" }).getAttribute("aria-selected"),
     ).toBe("true");

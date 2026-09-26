@@ -1,10 +1,11 @@
+import { ConnectionManager } from "../../features/connections";
 import { cn } from "../ui/cn";
 
 export interface SidebarProps {
   className?: string;
 }
 
-/** Explorer/connections sidebar placeholder for the desktop workspace. */
+/** Explorer/connections sidebar for the desktop workspace. */
 export function Sidebar({ className }: SidebarProps) {
   return (
     <aside
@@ -14,15 +15,7 @@ export function Sidebar({ className }: SidebarProps) {
         className,
       )}
     >
-      <h2 className="flex h-8 items-center px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-        Connections
-      </h2>
-      <div className="px-3 pb-3">
-        <p className="text-xs text-muted-foreground">No connections yet.</p>
-        <p className="mt-1 text-[11px] text-muted-foreground">
-          Connection profiles arrive in a later milestone.
-        </p>
-      </div>
+      <ConnectionManager />
 
       <h2 className="flex h-8 items-center border-t border-sidebar-border px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
         Explorer

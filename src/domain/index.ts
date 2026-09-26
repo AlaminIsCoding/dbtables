@@ -66,12 +66,37 @@ export type ConnectionDescriptor =
   | ({ engine: "mysql" } & ServerConnection)
   | ({ engine: "postgres" } & ServerConnection);
 
+/**
+ * Saved, secret-free connection profile mirrored from the Rust
+ * `ConnectionProfile`.
+ *
+ * `id` is an opaque reference used to resolve the password from the backend's
+ * OS-protected credential store. A profile never carries a password, and the
+ * backend never returns a stored password to the frontend after a save.
+ */
+export interface ConnectionProfile {
+  /** Stable identifier, also the protected-storage secret reference. */
+  id: string;
+  /** User-facing display name. */
+  name: string;
+  /** Secret-free routing settings for the target database. */
+  descriptor: ConnectionDescriptor;
+}
+
 /** Reported state of a connection known to the backend adapter. */
 export type ConnectionState =
   | "disconnected"
   | "connecting"
   | "connected"
   | "failed";
+
+/** Normalized, secret-free result of a connection test. */
+export interface ConnectionTest {
+  /** Engine that accepted the connection. */
+  engine: EngineId;
+  /** Server/driver version string when the engine reports one. */
+  serverVersion?: string;
+}
 
 /** Kind of database object exposed by metadata listing. */
 export type ObjectKind = "table" | "view";
