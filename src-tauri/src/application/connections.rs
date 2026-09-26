@@ -26,6 +26,14 @@ pub fn mysql_descriptor(connection: ServerConnection) -> ConnectionDescriptor {
     ConnectionDescriptor::MySql(connection)
 }
 
+/// Builds a PostgreSQL connection descriptor from secret-free server settings.
+///
+/// The password is not part of the descriptor; it is resolved from protected
+/// storage and supplied to [`connect`]/[`test_connection`] separately.
+pub fn postgres_descriptor(connection: ServerConnection) -> ConnectionDescriptor {
+    ConnectionDescriptor::Postgres(connection)
+}
+
 /// Confirms a descriptor targets the engine served by `adapter`.
 fn ensure_engine(
     adapter: &dyn DatabaseAdapter,
@@ -86,7 +94,7 @@ mod tests {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
-    use super::{connect, ensure_engine, mysql_descriptor, sqlite_descriptor};
+    use super::{connect, ensure_engine, mysql_descriptor, postgres_descriptor, sqlite_descriptor};
     use crate::application::queries::execute_query;
     use crate::database::testing::FakeAdapter;
     use crate::database::{ConnectionSecret, SqliteAdapter};
@@ -157,6 +165,22 @@ mod tests {
     }
 
     #[test]
+    fn postgres_descriptor_carries_server_settings_without_secrets() {
+        let descriptor = postgres_descriptor(mysql_server());
+
+        assert_eq!(descriptor.engine(), EngineId::Postgres);
+        let server = descriptor
+            .server()
+            .expect("PostgreSQL descriptor holds server settings");
+        assert_eq!(server.host, "db.example.com");
+        assert_eq!(server.username, "app_user");
+
+        let serialized = serde_json::to_string(&descriptor).expect("descriptor should serialize");
+        assert!(!serialized.to_lowercase().contains("password"));
+        assert!(!serialized.to_lowercase().contains("secret"));
+    }
+
+    #[test]
     fn mysql_connect_and_query_flow_works_through_the_services() {
         let adapter = FakeAdapter::new(EngineId::MySql);
         let descriptor = mysql_descriptor(mysql_server());
@@ -171,6 +195,25 @@ mod tests {
             QueryRequest::new("op", "SELECT id, name FROM users"),
         ))
         .expect("MySQL query should run through the application service");
+        assert_eq!(result.state, OperationState::Succeeded);
+        assert!(!result.rows.is_empty());
+    }
+
+    #[test]
+    fn postgres_connect_and_query_flow_works_through_the_services() {
+        let adapter = FakeAdapter::new(EngineId::Postgres);
+        let descriptor = postgres_descriptor(mysql_server());
+        let secret = ConnectionSecret::new("test-only-value");
+
+        let connection = block_on(connect(&adapter, &descriptor, Some(&secret)))
+            .expect("PostgreSQL connect should succeed through the application service");
+
+        let result = block_on(execute_query(
+            &adapter,
+            &connection,
+            QueryRequest::new("op", "SELECT id, name FROM users"),
+        ))
+        .expect("PostgreSQL query should run through the application service");
         assert_eq!(result.state, OperationState::Succeeded);
         assert!(!result.rows.is_empty());
     }

@@ -23,3 +23,18 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # pure-Rust decompression backend (avoids a system zlib build) and `native-tls`
 # provides TLS through the platform provider (SChannel on Windows).
 mysql = { version = "28", default-features = false, features = ["minimal-rust", "native-tls"] }
+# PostgreSQL driver for server connections. The asynchronous `tokio-postgres`
+# client maps directly onto the adapter's async boundary and is driven by the
+# application's runtime, unlike the synchronous `postgres` crate which embeds a
+# private runtime and cannot be called from an async command context.
+# `native-tls` provides TLS through the platform provider (SChannel on Windows),
+# `postgres-types`/`bytes` support the custom text-format parameter binding, and
+# `futures-util`/`tokio` drive the connection and stream results without loading
+# an entire result set into memory.
+tokio-postgres = "0.7"
+postgres-native-tls = "0.5"
+native-tls = "0.2"
+postgres-types = "0.2"
+bytes = "1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "sync"] }

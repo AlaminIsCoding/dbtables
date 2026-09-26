@@ -39,10 +39,12 @@ use crate::domain::{
 };
 
 pub mod mysql;
+pub mod postgres;
 pub mod sqlite;
 pub mod testing;
 
 pub use mysql::MySqlAdapter;
+pub use postgres::PostgresAdapter;
 pub use sqlite::SqliteAdapter;
 
 /// Future returned by every adapter operation.
