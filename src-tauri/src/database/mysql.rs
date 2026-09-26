@@ -1,7 +1,7 @@
-//! Read-only MySQL adapter backed by the pure-Rust `mysql` crate.
+//! MySQL adapter backed by the pure-Rust `mysql` crate.
 //!
-//! This module implements the metadata and query half of the shared
-//! [`DatabaseAdapter`] contract for MySQL servers:
+//! This module implements the metadata, query, and guarded-write parts of the
+//! shared [`DatabaseAdapter`] contract for MySQL servers:
 //!
 //! - Test a server connection, open one, report state, and disconnect.
 //! - List the databases (schemas) a connection can address.
@@ -11,19 +11,19 @@
 //!   column metadata, rows, affected-row count, duration, and structured errors.
 //! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
 //!   primary key as a safe row identity when the object has one.
-//!
-//! Staged changes arrive in a later task and report
-//! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
-//! [`Self::capabilities`] reports only what the adapter can honor today.
+//! - Apply staged parameterized insert/update/delete changes with primary-key
+//!   identity checks and stale-row conflict detection.
+//! - Begin, commit, and roll back explicit transactions on a connection.
 //!
 //! Design rules:
 //!
-//! - The session is switched to `READ ONLY` after connecting, so a statement
-//!   issued through this connection cannot mutate the database. A rejected write
-//!   fails at the server with a normalized permission error.
-//! - Parameters supplied with a request are bound as parameters; caller text is
-//!   never concatenated into the statement. Object/database names are always
-//!   bound values in `information_schema` predicates, never interpolated.
+//! - Parameters supplied with a request are bound through the binary protocol;
+//!   caller text is never concatenated into the statement. Object/database names
+//!   are always bound values in `information_schema` predicates, never
+//!   interpolated.
+//! - An update or delete requires the row identity to match the table's primary
+//!   key exactly. A statement that affects no row is reported as a conflict
+//!   rather than a zero-row success.
 //! - Driver-native [`mysql::Conn`] handles never leave this module. Callers
 //!   receive opaque, serializable [`ConnectionId`] tokens.
 //! - Credentials enter only through [`ConnectionSecret`] and are placed in the
@@ -35,7 +35,7 @@
 //! async runtime to test — matching the `rusqlite` choice made for SQLite. SQLx
 //! remains a candidate for the PostgreSQL adapter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,11 +45,12 @@ use mysql::prelude::{Protocol, Queryable};
 use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::database::{
-    build_table_page_query, effective_sort_order, effective_table_page_limit,
-    quote_identifier_backtick, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult,
-    ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind,
-    DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription,
-    TablePage, TablePageRequest, TransactionId,
+    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
+    conflict_columns, effective_sort_order, effective_table_page_limit,
+    quote_identifier_backtick, validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest,
+    ChangeResult, ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo,
+    ConstraintKind, DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange,
+    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -75,6 +76,8 @@ struct ConnectionSlot {
     handle: Option<Conn>,
     /// Default database selected by the descriptor, if any.
     default_database: Option<String>,
+    /// Explicit transactions begun on this connection and not yet ended.
+    open_transactions: HashSet<TransactionId>,
 }
 
 /// MySQL adapter implementing the shared database boundary.
@@ -86,6 +89,7 @@ struct ConnectionSlot {
 pub struct MySqlAdapter {
     connections: Mutex<HashMap<ConnectionId, Arc<Mutex<ConnectionSlot>>>>,
     next_connection: AtomicU64,
+    next_transaction: AtomicU64,
 }
 
 impl Default for MySqlAdapter {
@@ -100,6 +104,7 @@ impl MySqlAdapter {
         Self {
             connections: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(0),
+            next_transaction: AtomicU64::new(0),
         }
     }
 
@@ -228,22 +233,17 @@ fn build_opts(
     Ok(Opts::from(builder))
 }
 
-/// Opens a connection and switches the session to read-only.
+/// Opens a writable connection to a MySQL server.
 ///
-/// `SET SESSION TRANSACTION READ ONLY` makes every subsequent transaction
-/// (including autocommit statements) reject writes, so a raw write statement
-/// fails at the server rather than mutating data.
-fn open_read_only(
+/// The previous read-only slice switched the session to `READ ONLY`; that is no
+/// longer done because the guarded-write path is implemented here.
+fn open_writable(
     descriptor: &ConnectionDescriptor,
     secret: Option<&ConnectionSecret>,
 ) -> Result<Conn, QueryError> {
     let server = mysql_server(descriptor)?;
     let opts = build_opts(server, secret)?;
-    let mut handle = Conn::new(opts).map_err(map_error)?;
-    handle
-        .query_drop("SET SESSION TRANSACTION READ ONLY")
-        .map_err(map_error)?;
-    Ok(handle)
+    Conn::new(opts).map_err(map_error)
 }
 
 /// Normalized category for a MySQL server error code/SQLSTATE.
@@ -707,20 +707,110 @@ fn fetch_mysql_page(
     })
 }
 
+/// Executes a generated parameterized DML statement and reports affected rows.
+fn execute_change(handle: &mut Conn, sql: &str, bound: &[CellValue]) -> Result<u64, QueryError> {
+    let parameters: Vec<Value> = bound.iter().map(cell_to_value).collect();
+    let result = handle.exec_iter(sql, parameters).map_err(map_error)?;
+    Ok(result.affected_rows())
+}
+
+/// Applies one staged change to a MySQL base table.
+///
+/// Views are rejected because they have no safe row identity. Updates and
+/// deletes require an identity that matches the primary key exactly; a statement
+/// that affects no row is returned as a conflict, never a zero-row success.
+fn apply_mysql_change(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    request: ChangeRequest,
+) -> Result<ChangeResult, QueryError> {
+    if request.object.kind != ObjectKind::Table {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!(
+                "`{}` is not a base table and cannot be modified",
+                request.object.name
+            ),
+        ));
+    }
+
+    let database = resolve_database(handle, default_database, request.object.database.as_deref())?;
+    let (columns, primary_key) = mysql_table_shape(handle, &database, &request.object.name)?;
+    let from = format!(
+        "{}.{}",
+        quote_identifier_backtick(&database),
+        quote_identifier_backtick(&request.object.name)
+    );
+    let operation_id = request.operation_id.clone();
+
+    let (sql, bound, conflict) = match request.change {
+        PendingChange::Insert { values } => {
+            let (sql, bound) = build_insert_statement(
+                &from,
+                &columns,
+                &values,
+                |_| "?".to_string(),
+                quote_identifier_backtick,
+            )?;
+            (sql, bound, None)
+        }
+        PendingChange::Update { identity, values } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_update_statement(
+                &from,
+                &columns,
+                &identity,
+                &values,
+                |_| "?".to_string(),
+                quote_identifier_backtick,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+        PendingChange::Delete { identity } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_delete_statement(
+                &from,
+                &columns,
+                &identity,
+                |_| "?".to_string(),
+                quote_identifier_backtick,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+    };
+
+    match execute_change(handle, &sql, &bound) {
+        Ok(affected) => {
+            if affected == 0 {
+                if let Some(conflict) = conflict {
+                    return Ok(ChangeResult::conflict(operation_id, conflict));
+                }
+            }
+            Ok(ChangeResult::applied(operation_id, affected))
+        }
+        Err(error) if error.category.may_have_unknown_outcome() => {
+            Ok(ChangeResult::outcome_unknown(operation_id))
+        }
+        Err(error) => Ok(ChangeResult::failed(operation_id, error)),
+    }
+}
+
 impl DatabaseAdapter for MySqlAdapter {
     fn engine(&self) -> EngineId {
         EngineId::MySql
     }
 
     fn capabilities(&self) -> EngineCapabilities {
-        // This slice implements connect/disconnect, metadata inspection, and
-        // read-only SQL execution over TLS-capable connections. Transaction,
-        // cancellation, and staged-change flags stay `false` so the UI never
-        // advertises behavior the adapter cannot honor yet. MySQL treats a
-        // database as its schema, so `schemas` stays `false` while
-        // `multiple_databases` reflects the database picker `list_scopes` feeds.
+        // This adapter implements connect/disconnect, metadata inspection, SQL
+        // execution, guarded staged writes, and explicit transactions over
+        // TLS-capable connections. MySQL treats a database as its schema, so
+        // `schemas` stays `false` while `multiple_databases` reflects the
+        // database picker `list_scopes` feeds. MySQL performs an implicit commit
+        // around DDL, so `ddl_transactions` is `false`.
         EngineCapabilities {
-            transactions: false,
+            transactions: true,
             ddl_transactions: false,
             savepoints: false,
             cancellation: false,
@@ -756,7 +846,7 @@ impl DatabaseAdapter for MySqlAdapter {
     ) -> AdapterFuture<'a, Result<ConnectionId, QueryError>> {
         Box::pin(async move {
             let default_database = mysql_server(descriptor)?.database.clone();
-            let handle = open_read_only(descriptor, secret)?;
+            let handle = open_writable(descriptor, secret)?;
 
             let sequence = self.next_connection.fetch_add(1, Ordering::SeqCst) + 1;
             let connection = ConnectionId::new(format!("mysql-{sequence}"));
@@ -767,6 +857,7 @@ impl DatabaseAdapter for MySqlAdapter {
                     state: ConnectionState::Connected,
                     handle: Some(handle),
                     default_database,
+                    open_transactions: HashSet::new(),
                 })),
             );
 
@@ -785,6 +876,7 @@ impl DatabaseAdapter for MySqlAdapter {
                 .expect("MySQL connection state must not be poisoned");
             slot.state = ConnectionState::Disconnected;
             slot.handle = None;
+            slot.open_transactions.clear();
             Ok(())
         })
     }
@@ -1004,13 +1096,11 @@ impl DatabaseAdapter for MySqlAdapter {
     fn apply_change<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: ChangeRequest,
+        request: ChangeRequest,
     ) -> AdapterFuture<'a, Result<ChangeResult, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |_handle, _database| {
-                Err(unsupported_error(
-                    "this connection is read-only and does not support data changes",
-                ))
+            self.with_connection(connection, |handle, database| {
+                apply_mysql_change(handle, database, request)
             })
         })
     }
@@ -1029,36 +1119,88 @@ impl DatabaseAdapter for MySqlAdapter {
 
     fn begin_transaction<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
+        connection: &'a ConnectionId,
     ) -> AdapterFuture<'a, Result<TransactionId, QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for MySQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut slot = slot
+                .lock()
+                .expect("MySQL connection state must not be poisoned");
+            {
+                if !matches!(slot.state, ConnectionState::Connected) {
+                    return Err(connection_error(connection));
+                }
+                let Some(handle) = slot.handle.as_mut() else {
+                    return Err(connection_error(connection));
+                };
+                handle
+                    .query_drop("START TRANSACTION")
+                    .map_err(map_error)?;
+            }
+            let sequence = self.next_transaction.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = TransactionId::new(format!("mysql-tx-{sequence}"));
+            slot.open_transactions.insert(id.clone());
+            Ok(id)
         })
     }
 
     fn commit<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for MySQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut slot = slot
+                .lock()
+                .expect("MySQL connection state must not be poisoned");
+            if !slot.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                if !matches!(slot.state, ConnectionState::Connected) {
+                    return Err(connection_error(connection));
+                }
+                let Some(handle) = slot.handle.as_mut() else {
+                    return Err(connection_error(connection));
+                };
+                handle.query_drop("COMMIT").map_err(map_error)?;
+            }
+            slot.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 
     fn rollback<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for MySQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut slot = slot
+                .lock()
+                .expect("MySQL connection state must not be poisoned");
+            if !slot.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                if !matches!(slot.state, ConnectionState::Connected) {
+                    return Err(connection_error(connection));
+                }
+                let Some(handle) = slot.handle.as_mut() else {
+                    return Err(connection_error(connection));
+                };
+                handle.query_drop("ROLLBACK").map_err(map_error)?;
+            }
+            slot.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 }
@@ -1110,7 +1252,7 @@ mod tests {
         assert_eq!(
             adapter.capabilities(),
             EngineCapabilities {
-                transactions: false,
+                transactions: true,
                 ddl_transactions: false,
                 savepoints: false,
                 cancellation: false,
@@ -1297,16 +1439,15 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_adapter_is_disconnected_and_unsupported_for_writes() {
+    fn a_fresh_adapter_is_disconnected_and_exposes_guarded_writes() {
         let adapter = MySqlAdapter::new();
         let unknown = ConnectionId::new("missing");
 
-        // Staged changes and paging report Unsupported for a live connection;
-        // with an unknown token the connection error takes precedence.
-        assert_eq!(
+        // Guarded writes and paging are implemented; with an unknown token the
+        // connection error still takes precedence for a live operation.
+        assert!(
             adapter.capabilities().transactions,
-            false,
-            "transactions are not implemented in this slice"
+            "explicit transactions are implemented"
         );
         assert_eq!(
             block_on(adapter.cancel(&unknown, &crate::domain::OperationId::new("op")))

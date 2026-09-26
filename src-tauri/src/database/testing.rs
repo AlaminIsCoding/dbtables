@@ -79,6 +79,9 @@ struct FakeState {
     next_transaction: u64,
     open_transactions: HashSet<TransactionId>,
     execute_calls: usize,
+    begin_transaction_calls: usize,
+    commit_calls: usize,
+    rollback_calls: usize,
     table: FakeTable,
     uncertain_writes: bool,
 }
@@ -363,6 +366,21 @@ impl FakeAdapter {
     /// Number of `execute` calls observed, used to prove no silent retries.
     pub fn execute_call_count(&self) -> usize {
         self.state().execute_calls
+    }
+
+    /// Number of `begin_transaction` calls observed by the fake.
+    pub fn begin_transaction_call_count(&self) -> usize {
+        self.state().begin_transaction_calls
+    }
+
+    /// Number of `commit` calls observed by the fake.
+    pub fn commit_call_count(&self) -> usize {
+        self.state().commit_calls
+    }
+
+    /// Number of `rollback` calls observed by the fake.
+    pub fn rollback_call_count(&self) -> usize {
+        self.state().rollback_calls
     }
 
     fn state(&self) -> MutexGuard<'_, FakeState> {
@@ -914,6 +932,7 @@ impl DatabaseAdapter for FakeAdapter {
                 return Err(Self::unknown_connection(connection));
             }
 
+            state.begin_transaction_calls += 1;
             state.next_transaction += 1;
             let id = TransactionId::new(format!("tx-{}", state.next_transaction));
             state.open_transactions.insert(id.clone());
@@ -944,6 +963,7 @@ impl DatabaseAdapter for FakeAdapter {
                     format!("transaction `{transaction}` is not open"),
                 ));
             }
+            state.commit_calls += 1;
             Ok(())
         })
     }
@@ -971,6 +991,7 @@ impl DatabaseAdapter for FakeAdapter {
                     format!("transaction `{transaction}` is not open"),
                 ));
             }
+            state.rollback_calls += 1;
             Ok(())
         })
     }

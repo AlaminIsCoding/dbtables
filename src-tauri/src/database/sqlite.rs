@@ -1,7 +1,7 @@
-//! Read-only SQLite adapter backed by `rusqlite`.
+//! SQLite adapter backed by `rusqlite`.
 //!
-//! This module implements the metadata and query half of the shared
-//! [`DatabaseAdapter`] contract for local SQLite files:
+//! This module implements the metadata, query, and guarded-write parts of the
+//! shared [`DatabaseAdapter`] contract for local SQLite files:
 //!
 //! - Connect to an existing file, report its state, and disconnect.
 //! - List base tables and views, excluding SQLite's internal `sqlite_*` objects.
@@ -10,16 +10,19 @@
 //!   column metadata, rows, affected-row count, duration, and structured errors.
 //! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
 //!   primary key as a safe row identity when the object has one.
-//!
-//! Staged changes arrive in a later task and report
-//! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
-//! [`Self::capabilities`] reports only what the adapter can honor today.
+//! - Apply staged parameterized insert/update/delete changes with primary-key
+//!   identity checks and stale-row conflict detection.
+//! - Begin, commit, and roll back explicit transactions on a connection.
 //!
 //! Design rules:
 //!
-//! - Connections are opened with `SQLITE_OPEN_READ_ONLY`. The adapter cannot
-//!   create a database file or mutate an existing one, so any write statement a
-//!   caller attempts fails at the driver with a normalized permission error.
+//! - Connections are opened with `SQLITE_OPEN_READ_WRITE` (without `CREATE`), so
+//!   a missing file is still an error and is never created, while an existing
+//!   database can be edited. Every generated write uses bound parameters; the
+//!   adapter never concatenates a caller value into a statement.
+//! - An update or delete requires the row identity to match the table's primary
+//!   key exactly. A statement that affects no row is reported as a
+//!   [`ChangeOutcome::Conflict`] rather than a zero-row success.
 //! - Parameters supplied with a request are bound as parameters; caller text is
 //!   never concatenated into the statement.
 //! - Driver-native [`rusqlite::Connection`] handles never leave this module.
@@ -29,13 +32,13 @@
 //!   avoids identifier-quoting mistakes and injection through object names.
 //!
 //! **Driver decision:** `rusqlite` with the `bundled` feature was chosen for the
-//! initial SQLite slice because it provides a synchronous, connection-oriented
-//! API that maps directly onto the adapter's per-connection model and needs no
-//! async runtime to test. The bundled build makes the adapter independent of a
-//! system SQLite library. Server engines can still evaluate SQLx when their
-//! adapters are added.
+//! SQLite adapter because it provides a synchronous, connection-oriented API
+//! that maps directly onto the adapter's per-connection model and needs no async
+//! runtime to test. The bundled build makes the adapter independent of a system
+//! SQLite library. Server engines can still evaluate SQLx when their adapters
+//! are added.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -44,11 +47,12 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::database::{
-    build_table_page_query, effective_sort_order, effective_table_page_limit, quote_identifier,
-    AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, ConstraintInfo, DatabaseAdapter, IndexInfo, ObjectKind,
-    ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage, TablePageRequest,
-    TransactionId,
+    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
+    conflict_columns, effective_sort_order, effective_table_page_limit, quote_identifier,
+    validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId,
+    ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, DatabaseAdapter, IndexInfo,
+    ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDescription, TablePage,
+    TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -66,6 +70,8 @@ const MAX_RESULT_ROWS: u32 = 10_000;
 struct ConnectionSlot {
     state: ConnectionState,
     handle: Option<Connection>,
+    /// Explicit transactions begun on this connection and not yet ended.
+    open_transactions: HashSet<TransactionId>,
 }
 
 /// SQLite adapter implementing the shared database boundary.
@@ -76,6 +82,7 @@ struct ConnectionSlot {
 pub struct SqliteAdapter {
     connections: Mutex<HashMap<ConnectionId, ConnectionSlot>>,
     next_connection: AtomicU64,
+    next_transaction: AtomicU64,
 }
 
 impl Default for SqliteAdapter {
@@ -90,6 +97,7 @@ impl SqliteAdapter {
         Self {
             connections: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(0),
+            next_transaction: AtomicU64::new(0),
         }
     }
 
@@ -224,11 +232,11 @@ fn sqlite_path(descriptor: &ConnectionDescriptor) -> Result<&str, QueryError> {
     })
 }
 
-/// Opens a local SQLite database file read-only with a bounded busy timeout.
+/// Opens a local SQLite database file read-write with a bounded busy timeout.
 ///
-/// Opening read-only means a missing file is an error instead of being created,
-/// and no statement issued through this connection can mutate the database.
-fn open_read_only(path: &str) -> Result<Connection, QueryError> {
+/// `SQLITE_OPEN_READ_WRITE` without `CREATE` means a missing file is still an
+/// error instead of being created, while an existing database can be edited.
+fn open_read_write(path: &str) -> Result<Connection, QueryError> {
     let path = path.trim();
     if path.is_empty() {
         return Err(configuration_error(
@@ -237,7 +245,7 @@ fn open_read_only(path: &str) -> Result<Connection, QueryError> {
     }
 
     let connection =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_error)?;
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(map_error)?;
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(map_error)?;
@@ -644,17 +652,115 @@ fn fetch_sqlite_page(
     })
 }
 
+/// Executes a generated parameterized DML statement and reports affected rows.
+///
+/// The values are bound through the driver; the statement text contains only
+/// quoted identifiers and placeholders.
+fn execute_change(handle: &Connection, sql: &str, bound: &[CellValue]) -> Result<u64, QueryError> {
+    let parameters = bind_parameters(bound);
+    let mut statement = handle.prepare(sql).map_err(map_error)?;
+    statement
+        .execute(rusqlite::params_from_iter(parameters.iter()))
+        .map(|affected| affected as u64)
+        .map_err(map_error)
+}
+
+/// Applies one staged change to a SQLite base table.
+///
+/// Views are rejected because they have no safe row identity. Updates and
+/// deletes require an identity that matches the primary key exactly; a statement
+/// that affects no row is returned as a conflict, never a zero-row success.
+fn apply_sqlite_change(
+    handle: &Connection,
+    request: ChangeRequest,
+) -> Result<ChangeResult, QueryError> {
+    if request.object.kind != ObjectKind::Table {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!(
+                "`{}` is not a base table and cannot be modified",
+                request.object.name
+            ),
+        ));
+    }
+
+    let (columns, primary_key) = sqlite_table_shape(handle, &request.object)?;
+    let from = quote_identifier(&request.object.name);
+    let operation_id = request.operation_id.clone();
+
+    let (sql, bound, conflict) = match request.change {
+        PendingChange::Insert { values } => {
+            let (sql, bound) = build_insert_statement(
+                &from,
+                &columns,
+                &values,
+                |_| "?".to_string(),
+                quote_identifier,
+            )?;
+            (sql, bound, None)
+        }
+        PendingChange::Update { identity, values } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_update_statement(
+                &from,
+                &columns,
+                &identity,
+                &values,
+                |_| "?".to_string(),
+                quote_identifier,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+        PendingChange::Delete { identity } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_delete_statement(
+                &from,
+                &columns,
+                &identity,
+                |_| "?".to_string(),
+                quote_identifier,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+    };
+
+    match execute_change(handle, &sql, &bound) {
+        Ok(affected) => {
+            if affected == 0 {
+                if let Some(conflict) = conflict {
+                    return Ok(ChangeResult::conflict(operation_id, conflict));
+                }
+            }
+            Ok(ChangeResult::applied(operation_id, affected))
+        }
+        Err(error) if error.category.may_have_unknown_outcome() => {
+            Ok(ChangeResult::outcome_unknown(operation_id))
+        }
+        Err(error) => Ok(ChangeResult::failed(operation_id, error)),
+    }
+}
+
 impl DatabaseAdapter for SqliteAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Sqlite
     }
 
     fn capabilities(&self) -> EngineCapabilities {
-        // This slice implements connect/disconnect, metadata inspection, and
-        // read-only SQL execution. Transaction, cancellation, and multi-scope
-        // flags stay `false` so the UI never advertises behavior the adapter
-        // cannot honor yet.
-        EngineCapabilities::default()
+        // This adapter implements connect/disconnect, metadata inspection, SQL
+        // execution, guarded staged writes, and explicit transactions. Savepoints
+        // are not implemented, so the flag stays `false` rather than advertising a
+        // capability the adapter cannot honor.
+        EngineCapabilities {
+            transactions: true,
+            ddl_transactions: true,
+            savepoints: false,
+            cancellation: false,
+            schemas: false,
+            multiple_databases: false,
+            tls: false,
+        }
     }
 
     fn test_connection<'a>(
@@ -666,7 +772,7 @@ impl DatabaseAdapter for SqliteAdapter {
             let path = sqlite_path(descriptor)?;
             // Open and immediately release the handle; `test_connection` must
             // not retain a connection.
-            drop(open_read_only(path)?);
+            drop(open_read_write(path)?);
 
             Ok(ConnectionTest {
                 engine: EngineId::Sqlite,
@@ -682,7 +788,7 @@ impl DatabaseAdapter for SqliteAdapter {
     ) -> AdapterFuture<'a, Result<ConnectionId, QueryError>> {
         Box::pin(async move {
             let path = sqlite_path(descriptor)?;
-            let handle = open_read_only(path)?;
+            let handle = open_read_write(path)?;
 
             let sequence = self.next_connection.fetch_add(1, Ordering::SeqCst) + 1;
             let connection = ConnectionId::new(format!("sqlite-{sequence}"));
@@ -692,6 +798,7 @@ impl DatabaseAdapter for SqliteAdapter {
                 ConnectionSlot {
                     state: ConnectionState::Connected,
                     handle: Some(handle),
+                    open_transactions: HashSet::new(),
                 },
             );
 
@@ -710,6 +817,7 @@ impl DatabaseAdapter for SqliteAdapter {
                 .ok_or_else(|| connection_error(connection))?;
             slot.state = ConnectionState::Disconnected;
             slot.handle = None;
+            slot.open_transactions.clear();
             Ok(())
         })
     }
@@ -856,14 +964,10 @@ impl DatabaseAdapter for SqliteAdapter {
     fn apply_change<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: ChangeRequest,
+        request: ChangeRequest,
     ) -> AdapterFuture<'a, Result<ChangeResult, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |_| {
-                Err(unsupported_error(
-                    "this connection is read-only and does not support data changes",
-                ))
-            })
+            self.with_connection(connection, |handle| apply_sqlite_change(handle, request))
         })
     }
 
@@ -881,36 +985,81 @@ impl DatabaseAdapter for SqliteAdapter {
 
     fn begin_transaction<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
+        connection: &'a ConnectionId,
     ) -> AdapterFuture<'a, Result<TransactionId, QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for SQLite in this slice",
-            ))
+            let sequence = self.next_transaction.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = TransactionId::new(format!("sqlite-tx-{sequence}"));
+
+            let mut slots = self.connection_slots();
+            let slot = slots
+                .get_mut(connection)
+                .ok_or_else(|| connection_error(connection))?;
+            {
+                let handle = match (&slot.state, slot.handle.as_ref()) {
+                    (ConnectionState::Connected, Some(handle)) => handle,
+                    _ => return Err(connection_error(connection)),
+                };
+                handle.execute_batch("BEGIN").map_err(map_error)?;
+            }
+            slot.open_transactions.insert(id.clone());
+            Ok(id)
         })
     }
 
     fn commit<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for SQLite in this slice",
-            ))
+            let mut slots = self.connection_slots();
+            let slot = slots
+                .get_mut(connection)
+                .ok_or_else(|| connection_error(connection))?;
+            if !slot.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                let handle = match (&slot.state, slot.handle.as_ref()) {
+                    (ConnectionState::Connected, Some(handle)) => handle,
+                    _ => return Err(connection_error(connection)),
+                };
+                handle.execute_batch("COMMIT").map_err(map_error)?;
+            }
+            slot.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 
     fn rollback<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for SQLite in this slice",
-            ))
+            let mut slots = self.connection_slots();
+            let slot = slots
+                .get_mut(connection)
+                .ok_or_else(|| connection_error(connection))?;
+            if !slot.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                let handle = match (&slot.state, slot.handle.as_ref()) {
+                    (ConnectionState::Connected, Some(handle)) => handle,
+                    _ => return Err(connection_error(connection)),
+                };
+                handle.execute_batch("ROLLBACK").map_err(map_error)?;
+            }
+            slot.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 }
@@ -926,9 +1075,10 @@ mod fixture_tests {
 
     use super::SqliteAdapter;
     use crate::database::{
-        ChangeRequest, ConnectionId, ConnectionState, ConstraintKind, DatabaseAdapter,
-        FilterOperator, ObjectKind, ObjectRef, ObjectScope, PendingChange, RowKey, SortDirection,
-        SortKey, TableFilter, TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
+        ChangeOutcome, ChangeRequest, ConnectionId, ConnectionState, ConstraintKind,
+        DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef, ObjectScope, PendingChange,
+        RowIdentity, RowKey, SortDirection, SortKey, TableFilter, TablePageRequest,
+        MAX_TABLE_PAGE_ROWS,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -1313,13 +1463,24 @@ mod fixture_tests {
     }
 
     #[test]
-    fn capabilities_expose_only_the_implemented_slice() {
+    fn capabilities_report_the_implemented_writable_slice() {
         let adapter = SqliteAdapter::new();
-        assert_eq!(adapter.capabilities(), EngineCapabilities::default());
+        assert_eq!(
+            adapter.capabilities(),
+            EngineCapabilities {
+                transactions: true,
+                ddl_transactions: true,
+                savepoints: false,
+                cancellation: false,
+                schemas: false,
+                multiple_databases: false,
+                tls: false,
+            }
+        );
     }
 
     #[test]
-    fn read_only_slice_exposes_reads_but_not_writes() {
+    fn editing_slice_exposes_reads_and_guarded_writes() {
         let fixture = TempDatabase::new();
         let adapter = SqliteAdapter::new();
         let connection = connected(&adapter, &fixture);
@@ -1328,24 +1489,28 @@ mod fixture_tests {
             &connection,
             QueryRequest::new("op-select", "SELECT * FROM users"),
         ))
-        .expect("SQL execution is implemented for the read-only slice");
+        .expect("SQL execution is implemented");
         assert_eq!(select.state, crate::domain::OperationState::Succeeded);
 
-        let change = PendingChange::insert(vec![RowKey::new("id", CellValue::Integer(99))]);
-        let apply = block_on(adapter.apply_change(
+        let change = PendingChange::insert(vec![
+            RowKey::new("id", CellValue::Integer(99)),
+            RowKey::new("name", CellValue::Text("mallory".to_string())),
+        ]);
+        let applied = block_on(adapter.apply_change(
             &connection,
             ChangeRequest::new("chg-1", users_object(), change),
         ))
-        .expect_err("a read-only connection must not apply changes");
-        assert_eq!(apply.category, ErrorCategory::Unsupported);
+        .expect("a writable connection applies a staged change");
+        assert_eq!(applied.outcome, crate::database::ChangeOutcome::Applied);
+        assert_eq!(applied.affected_rows, Some(1));
 
         let page = block_on(adapter.fetch_table_page(
             &connection,
             TablePageRequest::new("page-1", users_object(), 10),
         ))
-        .expect("table browsing is implemented for the read-only slice");
+        .expect("table browsing is implemented");
         assert_eq!(page.row_identity, ["id"]);
-        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.rows.len(), 4);
 
         let cancelled = block_on(adapter.cancel(&connection, &OperationId::new("op-select")))
             .expect_err("SQLite cancellation is unsupported");
@@ -1651,7 +1816,7 @@ mod fixture_tests {
     }
 
     #[test]
-    fn execute_blocks_writes_on_a_read_only_connection() {
+    fn execute_permits_writes_on_a_writable_connection() {
         let fixture = TempDatabase::new();
         let adapter = SqliteAdapter::new();
         let connection = connected(&adapter, &fixture);
@@ -1663,12 +1828,11 @@ mod fixture_tests {
                 "INSERT INTO users (id, name) VALUES (100, 'mallory')",
             ),
         ))
-        .expect("a rejected write still produces a result");
+        .expect("a write still produces a normalized result");
 
-        assert_eq!(result.state, OperationState::Failed);
-        assert!(!result.state.is_success());
-        let error = result.error.expect("failed result should carry an error");
-        assert_eq!(error.category, ErrorCategory::Permission);
+        assert_eq!(result.state, OperationState::Succeeded);
+        assert_eq!(result.affected_rows, Some(1));
+        assert!(result.error.is_none());
     }
 
     #[test]
@@ -1682,27 +1846,190 @@ mod fixture_tests {
     }
 
     #[test]
-    fn explicit_transactions_are_reported_unsupported() {
+    fn explicit_transactions_begin_commit_and_rollback() {
         let fixture = TempDatabase::new();
         let adapter = SqliteAdapter::new();
         let connection = connected(&adapter, &fixture);
 
-        let begin = block_on(adapter.begin_transaction(&connection))
-            .expect_err("transactions are not implemented in this slice");
-        assert_eq!(begin.category, ErrorCategory::Unsupported);
+        let transaction =
+            block_on(adapter.begin_transaction(&connection)).expect("begin should succeed");
+        block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "tx-insert",
+                users_object(),
+                PendingChange::insert(vec![
+                    RowKey::new("id", CellValue::Integer(50)),
+                    RowKey::new("name", CellValue::Text("in-tx".to_string())),
+                ]),
+            ),
+        ))
+        .expect("a change inside a transaction should apply");
+        block_on(adapter.commit(&connection, &transaction)).expect("commit should succeed");
 
-        let transaction = TransactionId::new("tx-1");
+        let stale = block_on(adapter.rollback(&connection, &transaction))
+            .expect_err("a committed transaction cannot roll back");
+        assert_eq!(stale.category, ErrorCategory::Validation);
+
+        let rollback_tx =
+            block_on(adapter.begin_transaction(&connection)).expect("begin should succeed");
+        block_on(adapter.rollback(&connection, &rollback_tx)).expect("rollback should succeed");
+    }
+
+    #[test]
+    fn apply_change_inserts_updates_and_deletes_with_bound_values() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let insert = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "ins",
+                users_object(),
+                PendingChange::insert(vec![
+                    RowKey::new("id", CellValue::Integer(10)),
+                    RowKey::new("name", CellValue::Text("dana".to_string())),
+                    RowKey::new("email", CellValue::Text("dana@example.com".to_string())),
+                ]),
+            ),
+        ))
+        .expect("insert should return a result");
+        assert_eq!(insert.outcome, ChangeOutcome::Applied);
+        assert_eq!(insert.affected_rows, Some(1));
+
+        let update = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "upd",
+                users_object(),
+                PendingChange::update(
+                    RowIdentity::new(
+                        vec![RowKey::new("id", CellValue::Integer(10))],
+                        vec![RowKey::new("name", CellValue::Text("dana".to_string()))],
+                    ),
+                    vec![RowKey::new("name", CellValue::Text("dana-updated".to_string()))],
+                ),
+            ),
+        ))
+        .expect("update should return a result");
+        assert_eq!(update.outcome, ChangeOutcome::Applied);
+
+        let delete = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "del",
+                users_object(),
+                PendingChange::delete(RowIdentity::key("id", CellValue::Integer(10))),
+            ),
+        ))
+        .expect("delete should return a result");
+        assert_eq!(delete.outcome, ChangeOutcome::Applied);
+    }
+
+    #[test]
+    fn apply_change_reports_a_stale_row_as_a_conflict_not_a_success() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let stale = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "stale",
+                users_object(),
+                PendingChange::update(
+                    RowIdentity::new(
+                        vec![RowKey::new("id", CellValue::Integer(1))],
+                        vec![RowKey::new("name", CellValue::Text("not-alice".to_string()))],
+                    ),
+                    vec![RowKey::new("name", CellValue::Text("changed".to_string()))],
+                ),
+            ),
+        ))
+        .expect("an executed change returns a result");
+        assert_eq!(stale.outcome, ChangeOutcome::Conflict);
+        assert_eq!(stale.conflicted_columns, ["name"]);
+        assert!(!stale.outcome.is_applied());
+    }
+
+    #[test]
+    fn apply_change_rejects_an_unsafe_identity_and_maps_constraints_to_failures() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        // A view has no primary key and cannot be targeted.
+        let view = ObjectRef {
+            database: None,
+            schema: None,
+            name: "active_users".to_string(),
+            kind: ObjectKind::View,
+        };
+        let view_error = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "view",
+                view,
+                PendingChange::delete(RowIdentity::key("id", CellValue::Integer(1))),
+            ),
+        ))
+        .expect_err("a view must not be modified");
+        assert_eq!(view_error.category, ErrorCategory::Validation);
+
+        // A duplicate primary key is a constraint failure, not a success.
+        let duplicate = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "dup",
+                users_object(),
+                PendingChange::insert(vec![
+                    RowKey::new("id", CellValue::Integer(1)),
+                    RowKey::new("name", CellValue::Text("duplicate".to_string())),
+                ]),
+            ),
+        ))
+        .expect("a constraint failure still returns a result");
+        assert_eq!(duplicate.outcome, ChangeOutcome::Failed);
         assert_eq!(
-            block_on(adapter.commit(&connection, &transaction))
-                .expect_err("commit is not implemented in this slice")
-                .category,
-            ErrorCategory::Unsupported
+            duplicate.error.expect("failure should carry an error").category,
+            ErrorCategory::Constraint
         );
-        assert_eq!(
-            block_on(adapter.rollback(&connection, &transaction))
-                .expect_err("rollback is not implemented in this slice")
-                .category,
-            ErrorCategory::Unsupported
-        );
+
+        // An unknown column is rejected before the statement runs.
+        let unknown = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "inject",
+                users_object(),
+                PendingChange::insert(vec![RowKey::new(
+                    "id) VALUES (1); DROP TABLE users; --",
+                    CellValue::Integer(1),
+                )]),
+            ),
+        ))
+        .expect_err("an unknown column must be rejected");
+        assert_eq!(unknown.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn update_identity_must_match_the_primary_key() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let partial = block_on(adapter.apply_change(
+            &connection,
+            ChangeRequest::new(
+                "partial",
+                users_object(),
+                PendingChange::update(
+                    RowIdentity::key("name", CellValue::Text("alice".to_string())),
+                    vec![RowKey::new("name", CellValue::Text("changed".to_string()))],
+                ),
+            ),
+        ))
+        .expect_err("a non-primary-key identity must be rejected");
+        assert_eq!(partial.category, ErrorCategory::Validation);
     }
 }

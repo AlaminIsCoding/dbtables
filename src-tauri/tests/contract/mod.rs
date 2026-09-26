@@ -13,17 +13,19 @@
 //!   `Unsupported` error for engines that do not.
 //! - `list_objects` / `describe_table` metadata with at least one column.
 //! - `execute` on a `SELECT`, returning normalized columns, rows, and duration.
-//! - `execute` on a DML statement, confirming the normalized result metadata and
-//!   that a read-only adapter never reports the write as success or fabricates
-//!   an affected-row count.
+//! - `execute` on a DML statement, confirming the normalized result metadata:
+//!   either a confirmed write that reports its affected-row count, or a
+//!   categorized terminal failure. Never a success without affected rows and
+//!   never a fabricated count.
 //! - `execute` on invalid SQL, returning a structured `Syntax` failure.
 //! - `disconnect`, with the connection reporting `Disconnected`.
 //!
 //! **Capability differences are documented, not hidden.** SQLite exposes no
 //! scopes and returns `Unsupported`; MySQL exposes databases/catalogs; PostgreSQL
-//! exposes schemas and binds a connection to one database. These adapters are
-//! read-only, so a DML statement is surfaced as a categorized failure rather than
-//! a success; the write workflow belongs to a later task.
+//! exposes schemas and binds a connection to one database. The shipped adapters
+//! implement guarded staged writes, so a DML statement may confirm a write with
+//! an affected-row count on a controlled table; the structured-result contract
+//! still holds either way.
 //!
 //! **Secrets stay out of test output.** Passwords are read only from environment
 //! variables and are never printed, asserted on, or written to a fixture. When a
@@ -444,9 +446,9 @@ async fn run_contract_async(target: &EngineTarget) {
         "{engine}: a single-row SELECT must not be reported as truncated",
     );
 
-    // DML-result metadata: these adapters are read-only, so a write must come
-    // back as a normalized, terminal failure — never a success, never a
-    // transport-level `Err`, and never with a fabricated affected-row count.
+    // DML-result metadata: a write either succeeds with a confirmed affected-row
+    // count or comes back as a categorized terminal failure — never a success
+    // without affected rows and never a fabricated count.
     let dml = adapter
         .execute(
             &connection,
@@ -459,28 +461,39 @@ async fn run_contract_async(target: &EngineTarget) {
         "{engine}: a DML result must be terminal",
     );
     assert!(
-        !dml.state.is_success(),
-        "{engine}: a read-only adapter must not confirm a write as success",
-    );
-    assert!(
-        dml.affected_rows.is_none(),
-        "{engine}: a rejected write must not fabricate affected rows",
-    );
-    assert!(
         dml.duration_ms.is_some(),
         "{engine}: a completed DML result must report a duration",
     );
-    let dml_error = dml
-        .error
-        .expect("a rejected write must carry a normalized error");
-    assert!(
-        matches!(
+    if dml.state.is_success() {
+        assert!(
+            dml.affected_rows.is_some(),
+            "{engine}: a confirmed write must report its affected-row count",
+        );
+        assert!(
+            dml.error.is_none(),
+            "{engine}: a confirmed write must not carry an error",
+        );
+    } else {
+        assert!(
+            dml.affected_rows.is_none(),
+            "{engine}: a rejected write must not fabricate affected rows",
+        );
+        let dml_error = dml
+            .error
+            .expect("a rejected write must carry a normalized error");
+        assert!(
+            matches!(
+                dml_error.category,
+                ErrorCategory::Permission
+                    | ErrorCategory::Validation
+                    | ErrorCategory::Unsupported
+                    | ErrorCategory::Constraint
+                    | ErrorCategory::Locking
+            ),
+            "{engine}: a rejected write must be categorized, not hidden (got {})",
             dml_error.category,
-            ErrorCategory::Permission | ErrorCategory::Validation | ErrorCategory::Unsupported
-        ),
-        "{engine}: a rejected write must be categorized, not hidden (got {})",
-        dml_error.category,
-    );
+        );
+    }
 
     // Invalid query: a structured syntax failure, not a panic or a silent success.
     let invalid = adapter

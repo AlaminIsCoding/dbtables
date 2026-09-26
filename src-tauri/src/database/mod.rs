@@ -27,6 +27,7 @@
 //! successful update. The capability flags on [`EngineCapabilities`] state
 //! whether an engine supports transactions, savepoints, and cancellation.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -1104,6 +1105,259 @@ impl ChangeRequest {
     }
 }
 
+/// Validates the structural shape of a staged change before any engine call.
+///
+/// This checks only what is knowable without table metadata: a change carries at
+/// least one bound value (insert/update), an update/delete names at least one
+/// identity key, and no column is named twice. Whether a row can be targeted
+/// safely is a separate check the adapter performs against the table's primary
+/// key. Callers use this to reject an obviously malformed change before opening
+/// a transaction or touching the engine.
+pub fn validate_pending_change(change: &PendingChange) -> Result<(), QueryError> {
+    match change {
+        PendingChange::Insert { values } => validate_change_values(values),
+        PendingChange::Update { identity, values } => {
+            validate_change_values(values)?;
+            validate_identity_shape(identity)
+        }
+        PendingChange::Delete { identity } => validate_identity_shape(identity),
+    }
+}
+
+/// Rejects an empty or duplicate-bearing value list.
+fn validate_change_values(values: &[RowKey]) -> Result<(), QueryError> {
+    if values.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a staged change requires at least one column value",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for key in values {
+        if key.column.trim().is_empty() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                "a staged change column name must not be empty",
+            ));
+        }
+        if !seen.insert(key.column.as_str()) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("staged change names column `{}` more than once", key.column),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects an identity with no keys or a duplicated key column.
+fn validate_identity_shape(identity: &RowIdentity) -> Result<(), QueryError> {
+    if identity.keys.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a row-targeted change requires at least one identity key",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for key in &identity.keys {
+        if key.column.trim().is_empty() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                "a row identity column name must not be empty",
+            ));
+        }
+        if !seen.insert(key.column.as_str()) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("row identity lists column `{}` more than once", key.column),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Confirms a row identity matches the table's primary key exactly.
+///
+/// An update or delete may not target a row without a primary key, so an empty
+/// `primary_key` is [`ErrorCategory::Unsupported`]. The identity must name every
+/// primary-key column and no other column, so a partial, reordered, or
+/// substituted identity is rejected as [`ErrorCategory::Validation`] instead of
+/// matching unintended rows.
+pub fn validate_row_identity(
+    primary_key: &[String],
+    identity: &RowIdentity,
+) -> Result<(), QueryError> {
+    if primary_key.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Unsupported,
+            "the table has no safe row identity for this change",
+        ));
+    }
+    validate_identity_shape(identity)?;
+
+    for key in &identity.keys {
+        if !primary_key.iter().any(|primary| primary == &key.column) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!(
+                    "row identity column `{}` is not part of the table's primary key",
+                    key.column
+                ),
+            ));
+        }
+    }
+    for primary in primary_key {
+        if !identity.keys.iter().any(|key| &key.column == primary) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("row identity is missing primary-key column `{primary}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Columns named by a conflict result for an update/delete predicate.
+///
+/// The adapter cannot always tell which predicate column changed, so it reports
+/// the stale-check original values when present, otherwise the identity keys. An
+/// empty identity yields an empty list; callers should not build one.
+pub fn conflict_columns(identity: &RowIdentity) -> Vec<String> {
+    if identity.original_values.is_empty() {
+        identity.keys.iter().map(|key| key.column.clone()).collect()
+    } else {
+        identity
+            .original_values
+            .iter()
+            .map(|key| key.column.clone())
+            .collect()
+    }
+}
+
+/// Builds a parameterized `INSERT` from validated column/value pairs.
+///
+/// Every value column is checked against `columns` and quoted with `quote`; the
+/// values are returned for binding in placeholder order and are never written
+/// into the statement text.
+pub fn build_insert_statement(
+    from: &str,
+    columns: &[ColumnInfo],
+    values: &[RowKey],
+    mut placeholder: impl FnMut(usize) -> String,
+    quote: impl Fn(&str) -> String,
+) -> Result<(String, Vec<CellValue>), QueryError> {
+    validate_change_values(values)?;
+    let mut names = Vec::with_capacity(values.len());
+    let mut tokens = Vec::with_capacity(values.len());
+    let mut bound = Vec::with_capacity(values.len());
+
+    for key in values {
+        if column_position(columns, &key.column).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("unknown insert column `{}`", key.column),
+            ));
+        }
+        names.push(quote(&key.column));
+        bound.push(key.value.clone());
+        tokens.push(placeholder(bound.len()));
+    }
+
+    let sql = format!(
+        "INSERT INTO {from} ({}) VALUES ({})",
+        names.join(", "),
+        tokens.join(", ")
+    );
+    Ok((sql, bound))
+}
+
+/// Builds a parameterized `UPDATE` with a stale-checking identity predicate.
+///
+/// The `SET` assignments come first in the statement, then the `WHERE`
+/// predicate built from the identity keys and original values, so the returned
+/// values are in placeholder order. The predicate is always present because an
+/// update without a stable identity is rejected before this point.
+pub fn build_update_statement(
+    from: &str,
+    columns: &[ColumnInfo],
+    identity: &RowIdentity,
+    values: &[RowKey],
+    mut placeholder: impl FnMut(usize) -> String,
+    quote: impl Fn(&str) -> String,
+) -> Result<(String, Vec<CellValue>), QueryError> {
+    validate_change_values(values)?;
+
+    let mut bound = Vec::new();
+    let mut assignments = Vec::with_capacity(values.len());
+    for key in values {
+        if column_position(columns, &key.column).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("unknown update column `{}`", key.column),
+            ));
+        }
+        bound.push(key.value.clone());
+        assignments.push(format!("{} = {}", quote(&key.column), placeholder(bound.len())));
+    }
+
+    let predicate = build_identity_predicate(columns, identity, &mut bound, &mut placeholder, &quote)?;
+    let sql = format!(
+        "UPDATE {from} SET {} WHERE {predicate}",
+        assignments.join(", ")
+    );
+    Ok((sql, bound))
+}
+
+/// Builds a parameterized `DELETE` with a stale-checking identity predicate.
+pub fn build_delete_statement(
+    from: &str,
+    columns: &[ColumnInfo],
+    identity: &RowIdentity,
+    mut placeholder: impl FnMut(usize) -> String,
+    quote: impl Fn(&str) -> String,
+) -> Result<(String, Vec<CellValue>), QueryError> {
+    let mut bound = Vec::new();
+    let predicate = build_identity_predicate(columns, identity, &mut bound, &mut placeholder, &quote)?;
+    let sql = format!("DELETE FROM {from} WHERE {predicate}");
+    Ok((sql, bound))
+}
+
+/// Builds the `key = ? AND original = ?` predicate for a row-targeted change.
+///
+/// Identity keys are validated against the table's columns and appended to
+/// `bound` first, followed by the original-value stale checks. Every column is
+/// quoted with `quote`; values are only ever collected for binding.
+fn build_identity_predicate(
+    columns: &[ColumnInfo],
+    identity: &RowIdentity,
+    bound: &mut Vec<CellValue>,
+    placeholder: &mut impl FnMut(usize) -> String,
+    quote: &impl Fn(&str) -> String,
+) -> Result<String, QueryError> {
+    validate_identity_shape(identity)?;
+
+    let mut clauses = Vec::with_capacity(identity.keys.len() + identity.original_values.len());
+    for key in identity
+        .keys
+        .iter()
+        .chain(identity.original_values.iter())
+    {
+        if column_position(columns, &key.column).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("unknown row identity column `{}`", key.column),
+            ));
+        }
+        bound.push(key.value.clone());
+        clauses.push(format!(
+            "{} = {}",
+            quote(&key.column),
+            placeholder(bound.len())
+        ));
+    }
+    Ok(clauses.join(" AND "))
+}
+
 /// Normalized result of a connection test.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1268,13 +1522,15 @@ pub trait DatabaseAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_filter_clause, build_order_clause, build_table_page_query, column_position,
+        build_delete_statement, build_filter_clause, build_insert_statement, build_order_clause,
+        build_table_page_query, build_update_statement, column_position, conflict_columns,
         effective_sort_order, effective_table_page_limit, quote_identifier,
-        quote_identifier_backtick, sort_direction_sql, validate_filter_values, CancelOutcome,
-        ChangeOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-        ConnectionState, ConstraintInfo, FilterOperator, IndexInfo, ObjectKind, ObjectRef,
-        PendingChange, RowIdentity, RowKey, ScopeListing, SortDirection, SortKey, TableDescription,
-        TableFilter, TablePage, TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
+        quote_identifier_backtick, sort_direction_sql, validate_filter_values,
+        validate_pending_change, validate_row_identity, CancelOutcome, ChangeOutcome, ChangeRequest,
+        ChangeResult, ConnectionId, ConnectionSecret, ConnectionState, ConstraintInfo,
+        FilterOperator, IndexInfo, ObjectKind, ObjectRef, PendingChange, RowIdentity, RowKey,
+        ScopeListing, SortDirection, SortKey, TableDescription, TableFilter, TablePage,
+        TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
     };
     use crate::domain::{CellValue, ColumnInfo, ErrorCategory, OperationId};
 
@@ -1825,5 +2081,176 @@ mod tests {
         )
         .expect_err("an unknown sort column must be rejected before quoting");
         assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn pending_change_validation_rejects_malformed_shapes() {
+        let empty_insert = PendingChange::insert(Vec::new());
+        assert_eq!(
+            validate_pending_change(&empty_insert)
+                .expect_err("an empty insert must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let duplicate = PendingChange::insert(vec![
+            RowKey::new("id", CellValue::Integer(1)),
+            RowKey::new("id", CellValue::Integer(2)),
+        ]);
+        assert_eq!(
+            validate_pending_change(&duplicate)
+                .expect_err("a duplicated column must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let no_identity = PendingChange::delete(RowIdentity::new(Vec::new(), Vec::new()));
+        assert_eq!(
+            validate_pending_change(&no_identity)
+                .expect_err("a delete without a key must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let valid = PendingChange::update(
+            RowIdentity::key("id", CellValue::Integer(1)),
+            vec![RowKey::new("name", CellValue::Text("bob".to_string()))],
+        );
+        assert!(validate_pending_change(&valid).is_ok());
+    }
+
+    #[test]
+    fn row_identity_must_match_the_primary_key_exactly() {
+        let primary_key = vec!["tenant".to_string(), "id".to_string()];
+
+        let complete = RowIdentity::new(
+            vec![
+                RowKey::new("id", CellValue::Integer(1)),
+                RowKey::new("tenant", CellValue::Text("acme".to_string())),
+            ],
+            Vec::new(),
+        );
+        assert!(validate_row_identity(&primary_key, &complete).is_ok());
+
+        let partial = RowIdentity::key("id", CellValue::Integer(1));
+        assert_eq!(
+            validate_row_identity(&primary_key, &partial)
+                .expect_err("a partial identity must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let wrong = RowIdentity::new(
+            vec![
+                RowKey::new("id", CellValue::Integer(1)),
+                RowKey::new("tenant", CellValue::Text("acme".to_string())),
+                RowKey::new("name", CellValue::Text("alice".to_string())),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            validate_row_identity(&primary_key, &wrong)
+                .expect_err("a substituted identity must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        assert_eq!(
+            validate_row_identity(&[], &complete)
+                .expect_err("a table without a primary key cannot be targeted")
+                .category,
+            ErrorCategory::Unsupported
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_statements_bind_values_after_quoted_identifiers() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("name")];
+
+        let (insert, values) = build_insert_statement(
+            "\"users\"",
+            &columns,
+            &[
+                RowKey::new("id", CellValue::Integer(1)),
+                RowKey::new("name", CellValue::Text("bob".to_string())),
+            ],
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect("a valid insert should build");
+        assert_eq!(insert, "INSERT INTO \"users\" (\"id\", \"name\") VALUES (?, ?)");
+        assert_eq!(
+            values,
+            vec![
+                CellValue::Integer(1),
+                CellValue::Text("bob".to_string()),
+            ]
+        );
+
+        let (delete, delete_values) = build_delete_statement(
+            "\"users\"",
+            &columns,
+            &RowIdentity::key("id", CellValue::Integer(1)),
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect("a valid delete should build");
+        assert_eq!(delete, "DELETE FROM \"users\" WHERE \"id\" = ?");
+        assert_eq!(delete_values, vec![CellValue::Integer(1)]);
+    }
+
+    #[test]
+    fn update_statement_orders_set_placeholders_before_the_where_predicate() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("name")];
+        let identity = RowIdentity::new(
+            vec![RowKey::new("id", CellValue::Integer(7))],
+            vec![RowKey::new("name", CellValue::Text("alice".to_string()))],
+        );
+
+        let (sql, values) = build_update_statement(
+            "\"users\"",
+            &columns,
+            &identity,
+            &[RowKey::new("name", CellValue::Text("bob".to_string()))],
+            |position| format!("${position}"),
+            quote_identifier,
+        )
+        .expect("a valid update should build");
+
+        assert_eq!(
+            sql,
+            "UPDATE \"users\" SET \"name\" = $1 WHERE \"id\" = $2 AND \"name\" = $3"
+        );
+        assert_eq!(
+            values,
+            vec![
+                CellValue::Text("bob".to_string()),
+                CellValue::Integer(7),
+                CellValue::Text("alice".to_string()),
+            ]
+        );
+
+        let unknown = RowIdentity::key("name = 'x'", CellValue::Text("alice".to_string()));
+        let error = build_delete_statement(
+            "\"users\"",
+            &columns,
+            &unknown,
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect_err("an identity outside table metadata must be rejected");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn conflict_columns_prefer_original_values_over_keys() {
+        let with_originals = RowIdentity::new(
+            vec![RowKey::new("id", CellValue::Integer(1))],
+            vec![RowKey::new("name", CellValue::Text("alice".to_string()))],
+        );
+        assert_eq!(conflict_columns(&with_originals), ["name"]);
+
+        let keys_only = RowIdentity::key("id", CellValue::Integer(1));
+        assert_eq!(conflict_columns(&keys_only), ["id"]);
     }
 }

@@ -1,7 +1,7 @@
-//! Read-only PostgreSQL adapter backed by `tokio-postgres`.
+//! PostgreSQL adapter backed by `tokio-postgres`.
 //!
-//! This module implements the metadata and query half of the shared
-//! [`DatabaseAdapter`] contract for PostgreSQL servers:
+//! This module implements the metadata, query, and guarded-write parts of the
+//! shared [`DatabaseAdapter`] contract for PostgreSQL servers:
 //!
 //! - Test a server connection, open one, report state, and disconnect.
 //! - List the schemas a connection exposes (PostgreSQL's scope model) and the
@@ -11,10 +11,9 @@
 //!   column metadata, rows, affected-row count, duration, and structured errors.
 //! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
 //!   primary key as a safe row identity when the object has one.
-//!
-//! Table paging is implemented; staged changes arrive in a later task and report
-//! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
-//! [`Self::capabilities`] reports only what the adapter can honor today.
+//! - Apply staged parameterized insert/update/delete changes with primary-key
+//!   identity checks and stale-row conflict detection.
+//! - Begin, commit, and roll back explicit transactions on a connection.
 //!
 //! PostgreSQL semantics differ from MySQL in ways this adapter represents
 //! rather than hides:
@@ -30,10 +29,9 @@
 //!
 //! Design rules:
 //!
-//! - The session is switched to read-only after connecting with
-//!   `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`, so a statement
-//!   issued through this connection cannot mutate the database. A rejected write
-//!   fails at the server with a normalized permission error.
+//! - An update or delete requires the row identity to match the table's primary
+//!   key exactly. A statement that affects no row is reported as a conflict
+//!   rather than a zero-row success.
 //! - Parameters supplied with a request are bound as parameters; caller text is
 //!   never concatenated into the statement. Object/schema names are always bound
 //!   values in `information_schema` predicates, never interpolated.
@@ -51,7 +49,7 @@
 //! results so the row cap bounds memory, and takes TLS through `native-tls`
 //! (SChannel on Windows), matching the MySQL adapter's provider.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fmt::Write as _;
@@ -69,11 +67,12 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{Client, Column, Config, NoTls, Socket};
 
 use crate::database::{
-    build_table_page_query, effective_sort_order, effective_table_page_limit, quote_identifier,
-    AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, IndexInfo,
-    ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage,
-    TablePageRequest, TransactionId,
+    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
+    conflict_columns, effective_sort_order, effective_table_page_limit, quote_identifier,
+    validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId,
+    ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind,
+    DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing,
+    TableDescription, TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -104,6 +103,8 @@ struct ConnectionSlot {
     database: String,
     /// Default schema for the session's `search_path`, when one resolves.
     default_schema: Option<String>,
+    /// Explicit transactions begun on this connection and not yet ended.
+    open_transactions: HashSet<TransactionId>,
 }
 
 /// PostgreSQL adapter implementing the shared database boundary.
@@ -115,6 +116,7 @@ struct ConnectionSlot {
 pub struct PostgresAdapter {
     connections: Mutex<HashMap<ConnectionId, Arc<AsyncMutex<ConnectionSlot>>>>,
     next_connection: AtomicU64,
+    next_transaction: AtomicU64,
 }
 
 impl Default for PostgresAdapter {
@@ -129,6 +131,7 @@ impl PostgresAdapter {
         Self {
             connections: Mutex::new(HashMap::new()),
             next_connection: AtomicU64::new(0),
+            next_transaction: AtomicU64::new(0),
         }
     }
 
@@ -293,12 +296,12 @@ where
     Ok(client)
 }
 
-/// Opens a read-only connection and captures its default scope.
+/// Opens a writable connection and captures its default scope.
 ///
-/// `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` makes every
-/// subsequent transaction (including autocommit statements) reject writes, so a
-/// raw write statement fails at the server rather than mutating data.
-async fn open_read_only(
+/// The earlier read-only slice set `SESSION CHARACTERISTICS AS TRANSACTION READ
+/// ONLY`; that is no longer done because the guarded-write path is implemented
+/// here.
+async fn open_writable(
     server: &ServerConnection,
     secret: Option<&ConnectionSecret>,
 ) -> Result<(Client, String, Option<String>), QueryError> {
@@ -311,11 +314,6 @@ async fn open_read_only(
         TlsMode::VerifyCa => connect_with_tls(&config, tls_connector(true, false)?).await?,
         TlsMode::VerifyFull => connect_with_tls(&config, tls_connector(true, true)?).await?,
     };
-
-    client
-        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        .await
-        .map_err(map_error)?;
 
     let row = client
         .query_one("SELECT current_database(), current_schema()", &[])
@@ -1142,20 +1140,110 @@ async fn fetch_postgres_page(
     })
 }
 
+/// Applies one staged change to a PostgreSQL base table.
+///
+/// Views are rejected because they have no safe row identity. Updates and
+/// deletes require an identity that matches the primary key exactly; a statement
+/// that affects no row is returned as a conflict, never a zero-row success.
+async fn apply_postgres_change(
+    client: &Client,
+    default_schema: Option<&str>,
+    request: ChangeRequest,
+) -> Result<ChangeResult, QueryError> {
+    if request.object.kind != ObjectKind::Table {
+        return Err(validation_error(format!(
+            "`{}` is not a base table and cannot be modified",
+            request.object.name
+        )));
+    }
+
+    let schema = resolve_schema(default_schema, request.object.schema.as_deref())?;
+    let (columns, primary_key) =
+        postgres_table_shape(client, &schema, &request.object.name).await?;
+    let from = format!(
+        "{}.{}",
+        quote_identifier(&schema),
+        quote_identifier(&request.object.name)
+    );
+    let operation_id = request.operation_id.clone();
+
+    let (sql, bound, conflict) = match request.change {
+        PendingChange::Insert { values } => {
+            let (sql, bound) = build_insert_statement(
+                &from,
+                &columns,
+                &values,
+                |position| format!("${position}"),
+                quote_identifier,
+            )?;
+            (sql, bound, None)
+        }
+        PendingChange::Update { identity, values } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_update_statement(
+                &from,
+                &columns,
+                &identity,
+                &values,
+                |position| format!("${position}"),
+                quote_identifier,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+        PendingChange::Delete { identity } => {
+            validate_row_identity(&primary_key, &identity)?;
+            let conflict = conflict_columns(&identity);
+            let (sql, bound) = build_delete_statement(
+                &from,
+                &columns,
+                &identity,
+                |position| format!("${position}"),
+                quote_identifier,
+            )?;
+            (sql, bound, Some(conflict))
+        }
+    };
+
+    let parameters: Vec<PgParameter> = bound.into_iter().map(PgParameter).collect();
+    let parameter_refs: Vec<&(dyn ToSql + Sync)> = parameters
+        .iter()
+        .map(|parameter| parameter as &(dyn ToSql + Sync))
+        .collect();
+
+    match client.execute(&sql, &parameter_refs).await {
+        Ok(affected) => {
+            if affected == 0 {
+                if let Some(conflict) = conflict {
+                    return Ok(ChangeResult::conflict(operation_id, conflict));
+                }
+            }
+            Ok(ChangeResult::applied(operation_id, affected))
+        }
+        Err(error) => {
+            let mapped = map_error(error);
+            if mapped.category.may_have_unknown_outcome() {
+                Ok(ChangeResult::outcome_unknown(operation_id))
+            } else {
+                Ok(ChangeResult::failed(operation_id, mapped))
+            }
+        }
+    }
+}
+
 impl DatabaseAdapter for PostgresAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Postgres
     }
 
     fn capabilities(&self) -> EngineCapabilities {
-        // This slice implements connect/disconnect, metadata inspection, and
-        // read-only SQL execution over TLS-capable connections. Transaction,
-        // cancellation, and staged-change flags stay `false` so the UI never
-        // advertises behavior the adapter cannot honor yet. PostgreSQL exposes
-        // named schemas but binds a connection to one database.
+        // This adapter implements connect/disconnect, metadata inspection, SQL
+        // execution, guarded staged writes, and explicit transactions over
+        // TLS-capable connections. PostgreSQL exposes named schemas but binds a
+        // connection to one database. Savepoints are not implemented.
         EngineCapabilities {
-            transactions: false,
-            ddl_transactions: false,
+            transactions: true,
+            ddl_transactions: true,
             savepoints: false,
             cancellation: false,
             schemas: true,
@@ -1171,7 +1259,7 @@ impl DatabaseAdapter for PostgresAdapter {
     ) -> AdapterFuture<'a, Result<ConnectionTest, QueryError>> {
         Box::pin(async move {
             let server = postgres_server(descriptor)?;
-            let (client, _database, _schema) = open_read_only(server, secret).await?;
+            let (client, _database, _schema) = open_writable(server, secret).await?;
             let row = client
                 .query_one("SHOW server_version", &[])
                 .await
@@ -1193,7 +1281,7 @@ impl DatabaseAdapter for PostgresAdapter {
     ) -> AdapterFuture<'a, Result<ConnectionId, QueryError>> {
         Box::pin(async move {
             let server = postgres_server(descriptor)?;
-            let (client, database, default_schema) = open_read_only(server, secret).await?;
+            let (client, database, default_schema) = open_writable(server, secret).await?;
 
             let sequence = self.next_connection.fetch_add(1, Ordering::SeqCst) + 1;
             let connection = ConnectionId::new(format!("postgres-{sequence}"));
@@ -1205,6 +1293,7 @@ impl DatabaseAdapter for PostgresAdapter {
                     client: Some(client),
                     database,
                     default_schema,
+                    open_transactions: HashSet::new(),
                 })),
             );
 
@@ -1221,6 +1310,7 @@ impl DatabaseAdapter for PostgresAdapter {
             let mut slot = slot.lock().await;
             slot.state = ConnectionState::Disconnected;
             slot.client = None;
+            slot.open_transactions.clear();
             Ok(())
         })
     }
@@ -1476,13 +1566,14 @@ impl DatabaseAdapter for PostgresAdapter {
     fn apply_change<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: ChangeRequest,
+        request: ChangeRequest,
     ) -> AdapterFuture<'a, Result<ChangeResult, QueryError>> {
         Box::pin(async move {
-            let _ = self.connection_slot(connection)?;
-            Err(unsupported_error(
-                "this connection is read-only and does not support data changes",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            ensure_scope_database(&guard.database, request.object.database.as_deref())?;
+            apply_postgres_change(client, guard.default_schema.as_deref(), request).await
         })
     }
 
@@ -1500,36 +1591,65 @@ impl DatabaseAdapter for PostgresAdapter {
 
     fn begin_transaction<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
+        connection: &'a ConnectionId,
     ) -> AdapterFuture<'a, Result<TransactionId, QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for PostgreSQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut guard = slot.lock().await;
+            {
+                let client = connected_client(&guard, connection)?;
+                client.batch_execute("BEGIN").await.map_err(map_error)?;
+            }
+            let sequence = self.next_transaction.fetch_add(1, Ordering::SeqCst) + 1;
+            let id = TransactionId::new(format!("postgres-tx-{sequence}"));
+            guard.open_transactions.insert(id.clone());
+            Ok(id)
         })
     }
 
     fn commit<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for PostgreSQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut guard = slot.lock().await;
+            if !guard.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                let client = connected_client(&guard, connection)?;
+                client.batch_execute("COMMIT").await.map_err(map_error)?;
+            }
+            guard.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 
     fn rollback<'a>(
         &'a self,
-        _connection: &'a ConnectionId,
-        _transaction: &'a TransactionId,
+        connection: &'a ConnectionId,
+        transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>> {
         Box::pin(async move {
-            Err(unsupported_error(
-                "explicit transactions are not implemented for PostgreSQL in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let mut guard = slot.lock().await;
+            if !guard.open_transactions.contains(transaction) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("transaction `{transaction}` is not open"),
+                ));
+            }
+            {
+                let client = connected_client(&guard, connection)?;
+                client.batch_execute("ROLLBACK").await.map_err(map_error)?;
+            }
+            guard.open_transactions.remove(transaction);
+            Ok(())
         })
     }
 }
@@ -1599,8 +1719,8 @@ mod tests {
         assert_eq!(
             adapter.capabilities(),
             EngineCapabilities {
-                transactions: false,
-                ddl_transactions: false,
+                transactions: true,
+                ddl_transactions: true,
                 savepoints: false,
                 cancellation: false,
                 schemas: true,
@@ -1861,11 +1981,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_adapter_is_disconnected_and_unsupported_for_writes() {
+    fn a_fresh_adapter_is_disconnected_and_exposes_guarded_writes() {
         let adapter = PostgresAdapter::new();
         let unknown = ConnectionId::new("missing");
 
-        assert!(!adapter.capabilities().transactions);
+        assert!(adapter.capabilities().transactions);
         assert_eq!(
             block_on(adapter.cancel(&unknown, &crate::domain::OperationId::new("op")))
                 .expect_err("cancellation is unsupported")

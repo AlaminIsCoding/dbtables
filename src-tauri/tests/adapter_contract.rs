@@ -48,23 +48,31 @@ fn postgres_satisfies_the_shared_adapter_contract_when_configured() {
     contract::run_contract(&target);
 }
 
-/// The read-only slice's capability differences are explicit, not silent.
+/// The writable slice's capability differences are explicit, not silent.
 ///
 /// `EngineId::capabilities()` records the long-term intent; these are the
-/// capabilities the shipped read-only adapters actually honor today. Any change
-/// here is a deliberate contract change, so the test pins the exact sets.
+/// capabilities the shipped adapters actually honor today. Any change here is a
+/// deliberate contract change, so the test pins the exact sets.
 #[test]
-fn read_only_slice_capabilities_are_explicit() {
+fn writable_slice_capabilities_are_explicit() {
     assert_eq!(
         SqliteAdapter::new().capabilities(),
-        EngineCapabilities::default(),
-        "SQLite exposes only the implemented read-only slice",
+        EngineCapabilities {
+            transactions: true,
+            ddl_transactions: true,
+            savepoints: false,
+            cancellation: false,
+            schemas: false,
+            multiple_databases: false,
+            tls: false,
+        },
+        "SQLite exposes guarded writes and transactions",
     );
 
     assert_eq!(
         MySqlAdapter::new().capabilities(),
         EngineCapabilities {
-            transactions: false,
+            transactions: true,
             ddl_transactions: false,
             savepoints: false,
             cancellation: false,
@@ -78,8 +86,8 @@ fn read_only_slice_capabilities_are_explicit() {
     assert_eq!(
         PostgresAdapter::new().capabilities(),
         EngineCapabilities {
-            transactions: false,
-            ddl_transactions: false,
+            transactions: true,
+            ddl_transactions: true,
             savepoints: false,
             cancellation: false,
             schemas: true,
@@ -92,10 +100,10 @@ fn read_only_slice_capabilities_are_explicit() {
 
 /// A successful DML result carries affected-row and duration metadata.
 ///
-/// The shipped adapters are read-only, so this pins the positive result *shape*
-/// through the deterministic fake, which models a writable engine. The real
-/// adapters are covered by the shared contract, where the same statement must be
-/// surfaced as a categorized failure instead.
+/// The deterministic fake models a writable engine, so this pins the positive
+/// result *shape*. The real adapters are covered by the shared contract, where a
+/// confirmed write must also report affected rows and a rejected write must be a
+/// categorized terminal failure.
 #[test]
 fn successful_dml_result_reports_affected_rows_and_duration() {
     let runtime = tokio::runtime::Builder::new_current_thread()
