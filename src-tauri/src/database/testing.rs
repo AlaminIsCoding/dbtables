@@ -1005,10 +1005,10 @@ mod contract_tests {
 
     use super::FakeAdapter;
     use crate::database::{
-        CancelOutcome, ChangeOutcome, ChangeRequest, ConnectionId, ConnectionSecret,
-        ConnectionState, ConstraintKind, DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef,
-        ObjectScope, PendingChange, RowIdentity, RowKey, SortDirection, SortKey, TableFilter,
-        TablePageRequest,
+        CancelOutcome, ChangeOutcome, ChangeRequest, ColumnDefinition, ConnectionId,
+        ConnectionSecret, ConnectionState, ConstraintKind, DatabaseAdapter, FilterOperator,
+        ForeignKeyDefinition, ObjectKind, ObjectRef, ObjectScope, PendingChange, RowIdentity, RowKey,
+        SortDirection, SortKey, TableDefinition, TableFilter, TablePageRequest,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -1867,5 +1867,92 @@ mod contract_tests {
             .rows
             .iter()
             .all(|row| row[1] != CellValue::Text("impostor".to_string())));
+    }
+
+    #[test]
+    fn ddl_defaults_report_unsupported_on_the_fake_adapter() {
+        let descriptor = sqlite_descriptor();
+        let (adapter, connection) = connected(EngineId::Sqlite, &descriptor);
+        let object = users_object();
+        let definition = TableDefinition::new(
+            object.clone(),
+            vec![ColumnDefinition::new("id", "INTEGER")],
+        );
+        let foreign_key = ForeignKeyDefinition::new(
+            vec!["id".to_string()],
+            "users",
+            vec!["id".to_string()],
+        );
+
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &definition))
+                .expect_err("the default create_table must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.drop_table(&connection, &object, false))
+                .expect_err("the default drop_table must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.add_column(
+                &connection,
+                &object,
+                &ColumnDefinition::new("extra", "TEXT"),
+            ))
+            .expect_err("the default add_column must be unsupported")
+            .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.rename_column(&connection, &object, "id", "ident"))
+                .expect_err("the default rename_column must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.drop_column(&connection, &object, "id"))
+                .expect_err("the default drop_column must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.add_foreign_key(&connection, &object, &foreign_key))
+                .expect_err("the default add_foreign_key must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.drop_foreign_key(&connection, &object, "users_fkey"))
+                .expect_err("the default drop_foreign_key must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.create_index(
+                &connection,
+                &object,
+                "users_idx",
+                &["id".to_string()],
+                false,
+            ))
+            .expect_err("the default create_index must be unsupported")
+            .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.drop_index(&connection, &object, "users_idx"))
+                .expect_err("the default drop_index must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
+        assert_eq!(
+            block_on(adapter.count_table_rows(&connection, &object, &[]))
+                .expect_err("the default count_table_rows must be unsupported")
+                .category,
+            ErrorCategory::Unsupported
+        );
     }
 }

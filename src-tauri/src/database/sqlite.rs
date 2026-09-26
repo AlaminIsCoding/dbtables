@@ -47,12 +47,13 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::database::{
-    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
-    conflict_columns, effective_sort_order, effective_table_page_limit, quote_identifier,
-    validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId,
-    ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, DatabaseAdapter, IndexInfo,
-    ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDescription, TablePage,
-    TablePageRequest, TransactionId,
+    build_delete_statement, build_filter_clause, build_insert_statement, build_table_page_query,
+    build_update_statement, column_position, conflict_columns, effective_sort_order,
+    effective_table_page_limit, quote_identifier, validate_row_identity, AdapterFuture, CancelOutcome,
+    ChangeRequest, ChangeResult, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
+    ConnectionTest, ConstraintInfo, DatabaseAdapter, ForeignKeyDefinition, IndexInfo, ObjectKind,
+    ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDefinition, TableDescription,
+    TablePage, TablePageRequest, TableFilter, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -742,6 +743,502 @@ fn apply_sqlite_change(
     }
 }
 
+/// Reads a SQLite object's shape plus its inspected indexes and constraints.
+///
+/// Shared by `describe_table` and `create_table` so a newly created table is
+/// reported exactly the way a later description would report it.
+fn describe_sqlite_table(
+    handle: &Connection,
+    object: &ObjectRef,
+) -> Result<TableDescription, QueryError> {
+    let (columns, primary_key_columns) = sqlite_table_shape(handle, object)?;
+
+    // Indexes and constraints are reported as inspected lists, never as an
+    // empty success: SQLite always exposes `pragma_index_list` and
+    // `pragma_foreign_key_list`, even when the object has none.
+    let discovered = sqlite_indexes(handle, &object.name)?;
+    let indexes: Vec<IndexInfo> = discovered.iter().map(|index| index.info.clone()).collect();
+
+    let mut constraints = sqlite_foreign_keys(handle, &object.name)?;
+    if !primary_key_columns.is_empty() {
+        // SQLite only lists a backing index when the primary key is not the
+        // rowid alias; otherwise synthesize a stable label.
+        let name = discovered
+            .iter()
+            .find(|index| index.origin == "pk")
+            .map(|index| index.info.name.clone())
+            .unwrap_or_else(|| format!("{}_pkey", object.name));
+        constraints.push(ConstraintInfo::primary_key(
+            name,
+            primary_key_columns.clone(),
+        ));
+    }
+    for index in discovered.iter().filter(|index| index.origin == "u") {
+        constraints.push(ConstraintInfo::unique(
+            index.info.name.clone(),
+            index.info.columns.clone(),
+        ));
+    }
+
+    Ok(TableDescription::new(columns, primary_key_columns)
+        .with_indexes(indexes)
+        .with_constraints(constraints))
+}
+
+/// Rejects an object reference that is not a base table.
+fn require_base_table(object: &ObjectRef) -> Result<(), QueryError> {
+    if object.kind != ObjectKind::Table {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("`{}` is not a base table", object.name),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a blank identifier with a validation error.
+fn require_identifier(value: &str, what: &str) -> Result<(), QueryError> {
+    if value.trim().is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("a {what} name must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+/// Confirms a SQL type text is a simple, safe type declaration.
+///
+/// Only letters, digits, whitespace, underscores, parentheses, and commas are
+/// allowed, which covers engine type text such as `VARCHAR(255)` or
+/// `DOUBLE PRECISION` while rejecting statement punctuation.
+fn validate_type_name(type_name: &str) -> Result<(), QueryError> {
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || !type_name.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '_'
+                || character.is_ascii_whitespace()
+                || character == '('
+                || character == ')'
+                || character == ','
+        })
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("`{type_name}` is not a valid SQL type name"),
+        ));
+    }
+    Ok(())
+}
+
+/// Renders a validated column definition for a `CREATE`/`ADD COLUMN` clause.
+///
+/// The name is quoted with [`quote_identifier`]. The type text is restricted to
+/// a safe character set and the default expression is rejected if it carries a
+/// statement terminator or comment marker, so no caller text can escape the
+/// column clause.
+fn render_column_definition(column: &ColumnDefinition) -> Result<String, QueryError> {
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    validate_type_name(&column.type_name)?;
+
+    let mut sql = format!("{} {}", quote_identifier(name), column.type_name.trim());
+    if !column.nullable {
+        sql.push_str(" NOT NULL");
+    }
+    if let Some(default) = &column.default {
+        let default = default.trim();
+        if default.is_empty() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("column `{name}` has an empty default expression"),
+            ));
+        }
+        if default.contains(';') || default.contains("--") || default.contains("/*") {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("column `{name}` has an unsafe default expression"),
+            ));
+        }
+        sql.push_str(" DEFAULT ");
+        sql.push_str(default);
+    }
+    Ok(sql)
+}
+
+/// Renders a named `FOREIGN KEY` table constraint.
+///
+/// SQLite has no schema namespace, so a non-empty `referenced_schema` is
+/// rejected rather than silently dropped.
+fn render_foreign_key(
+    table: &str,
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<String, QueryError> {
+    if foreign_key
+        .referenced_schema
+        .as_deref()
+        .is_some_and(|schema| !schema.trim().is_empty())
+    {
+        return Err(unsupported_error(
+            "SQLite does not support schema-qualified foreign keys",
+        ));
+    }
+    if foreign_key.columns.is_empty()
+        || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a foreign key must pair one local column with one referenced column",
+        ));
+    }
+    if foreign_key.referenced_table.trim().is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a foreign key must name a referenced table",
+        ));
+    }
+
+    let name = match &foreign_key.name {
+        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => format!("{}_{}_fkey", table, foreign_key.columns.join("_")),
+    };
+    let columns = foreign_key
+        .columns
+        .iter()
+        .map(|column| quote_identifier(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let referenced_columns = foreign_key
+        .referenced_columns
+        .iter()
+        .map(|column| quote_identifier(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(format!(
+        "CONSTRAINT {} FOREIGN KEY ({columns}) REFERENCES {} ({referenced_columns})",
+        quote_identifier(&name),
+        quote_identifier(foreign_key.referenced_table.trim())
+    ))
+}
+
+/// Column names of a SQLite table, in declaration order.
+///
+/// Used to validate referenced columns before a `CREATE TABLE`; an unknown
+/// table yields an empty list and the caller reports a validation error.
+fn sqlite_column_names(handle: &Connection, table: &str) -> Result<Vec<String>, QueryError> {
+    let mut statement = handle
+        .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+        .map_err(map_error)?;
+    let rows = statement
+        .query_map([table], |row| row.get::<_, String>(0))
+        .map_err(map_error)?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row.map_err(map_error)?);
+    }
+    Ok(names)
+}
+
+/// Executes a single generated DDL statement.
+///
+/// `rusqlite::Connection::execute` refuses a statement that returns rows and
+/// rejects trailing SQL, so a generated statement cannot smuggle a second
+/// command through.
+fn execute_ddl(handle: &Connection, sql: &str) -> Result<(), QueryError> {
+    handle
+        .execute(sql, rusqlite::params![])
+        .map(|_| ())
+        .map_err(map_error)
+}
+
+/// Creates a table from a validated definition and returns its description.
+fn create_sqlite_table(
+    handle: &Connection,
+    definition: &TableDefinition,
+) -> Result<TableDescription, QueryError> {
+    require_base_table(&definition.object)?;
+    let table = definition.object.name.trim();
+    require_identifier(table, "table")?;
+    if definition.columns.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a table definition requires at least one column",
+        ));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut primary_key: Option<String> = None;
+    for column in &definition.columns {
+        let name = column.name.trim();
+        require_identifier(name, "column")?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("table `{table}` defines column `{name}` more than once"),
+            ));
+        }
+        if column.primary_key {
+            if primary_key.is_some() {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    "a table may have at most one primary-key column in this slice",
+                ));
+            }
+            primary_key = Some(name.to_string());
+        }
+    }
+
+    let mut pieces: Vec<String> = Vec::with_capacity(definition.columns.len() + 1);
+    for column in &definition.columns {
+        pieces.push(render_column_definition(column)?);
+    }
+
+    let mut foreign_keys = Vec::with_capacity(definition.foreign_keys.len());
+    for foreign_key in &definition.foreign_keys {
+        for column in &foreign_key.columns {
+            if !seen.contains(&column.trim().to_ascii_lowercase()) {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!("foreign key names unknown column `{column}`"),
+                ));
+            }
+        }
+        let referenced = sqlite_column_names(handle, foreign_key.referenced_table.trim())?;
+        if referenced.is_empty() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!(
+                    "foreign key references unknown table `{}`",
+                    foreign_key.referenced_table
+                ),
+            ));
+        }
+        for column in &foreign_key.referenced_columns {
+            if !referenced
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column.trim()))
+            {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!(
+                        "foreign key references unknown column `{column}` on `{}`",
+                        foreign_key.referenced_table
+                    ),
+                ));
+            }
+        }
+        foreign_keys.push(render_foreign_key(table, foreign_key)?);
+    }
+
+    if let Some(primary_key) = primary_key {
+        pieces.push(format!("PRIMARY KEY ({})", quote_identifier(&primary_key)));
+    }
+    pieces.extend(foreign_keys);
+
+    let sql = format!(
+        "CREATE TABLE {} ({})",
+        quote_identifier(table),
+        pieces.join(", ")
+    );
+    execute_ddl(handle, &sql)?;
+
+    let object = ObjectRef {
+        database: None,
+        schema: None,
+        name: table.to_string(),
+        kind: ObjectKind::Table,
+    };
+    describe_sqlite_table(handle, &object)
+}
+
+/// Drops a base table.
+///
+/// SQLite has no `DROP TABLE ... CASCADE`, so the `cascade` argument is
+/// intentionally ignored: dependent foreign keys are never removed
+/// automatically by this adapter.
+fn drop_sqlite_table(handle: &Connection, object: &ObjectRef) -> Result<(), QueryError> {
+    require_identifier(&object.name, "table")?;
+    let sql = format!("DROP TABLE {}", quote_identifier(object.name.trim()));
+    execute_ddl(handle, &sql)
+}
+
+/// Adds a column to an existing table.
+///
+/// SQLite cannot add a `PRIMARY KEY` column with `ALTER TABLE`, so that request
+/// is reported as [`ErrorCategory::Unsupported`] instead of being emitted.
+fn add_sqlite_column(
+    handle: &Connection,
+    object: &ObjectRef,
+    column: &ColumnDefinition,
+) -> Result<(), QueryError> {
+    require_base_table(object)?;
+    let (columns, _) = sqlite_table_shape(handle, object)?;
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    if columns
+        .iter()
+        .any(|existing| existing.name.eq_ignore_ascii_case(name))
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` already has a column `{name}`", object.name),
+        ));
+    }
+    if column.primary_key {
+        return Err(unsupported_error(
+            "SQLite cannot add a PRIMARY KEY column to an existing table",
+        ));
+    }
+
+    let definition = render_column_definition(column)?;
+    let sql = format!(
+        "ALTER TABLE {} ADD COLUMN {definition}",
+        quote_identifier(object.name.trim())
+    );
+    execute_ddl(handle, &sql)
+}
+
+/// Renames a column on an existing table.
+fn rename_sqlite_column(
+    handle: &Connection,
+    object: &ObjectRef,
+    from: &str,
+    to: &str,
+) -> Result<(), QueryError> {
+    require_base_table(object)?;
+    let (columns, _) = sqlite_table_shape(handle, object)?;
+    let from = from.trim();
+    let to = to.trim();
+    require_identifier(from, "column")?;
+    require_identifier(to, "column")?;
+    let from_index = column_position(&columns, from).ok_or_else(|| {
+        QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` has no column `{from}`", object.name),
+        )
+    })?;
+    if columns
+        .iter()
+        .enumerate()
+        .any(|(index, column)| index != from_index && column.name.eq_ignore_ascii_case(to))
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` already has a column `{to}`", object.name),
+        ));
+    }
+
+    let sql = format!(
+        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+        quote_identifier(object.name.trim()),
+        quote_identifier(from),
+        quote_identifier(to)
+    );
+    execute_ddl(handle, &sql)
+}
+
+/// Drops a column from an existing table.
+fn drop_sqlite_column(
+    handle: &Connection,
+    object: &ObjectRef,
+    column: &str,
+) -> Result<(), QueryError> {
+    require_base_table(object)?;
+    let (columns, _) = sqlite_table_shape(handle, object)?;
+    let column = column.trim();
+    require_identifier(column, "column")?;
+    if column_position(&columns, column).is_none() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` has no column `{column}`", object.name),
+        ));
+    }
+
+    let sql = format!(
+        "ALTER TABLE {} DROP COLUMN {}",
+        quote_identifier(object.name.trim()),
+        quote_identifier(column)
+    );
+    execute_ddl(handle, &sql)
+}
+
+/// Creates an index on an existing table's validated columns.
+fn create_sqlite_index(
+    handle: &Connection,
+    object: &ObjectRef,
+    name: &str,
+    columns: &[String],
+    unique: bool,
+) -> Result<(), QueryError> {
+    require_base_table(object)?;
+    let (table_columns, _) = sqlite_table_shape(handle, object)?;
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    if columns.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "an index requires at least one column",
+        ));
+    }
+    for column in columns {
+        if column_position(&table_columns, column.trim()).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("index names unknown column `{column}`"),
+            ));
+        }
+    }
+
+    let columns = columns
+        .iter()
+        .map(|column| quote_identifier(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unique = if unique { "UNIQUE " } else { "" };
+    let sql = format!(
+        "CREATE {unique}INDEX {} ON {} ({columns})",
+        quote_identifier(name),
+        quote_identifier(object.name.trim())
+    );
+    execute_ddl(handle, &sql)
+}
+
+/// Drops an index by name. SQLite index names are global to the database.
+fn drop_sqlite_index(handle: &Connection, name: &str) -> Result<(), QueryError> {
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    let sql = format!("DROP INDEX {}", quote_identifier(name));
+    execute_ddl(handle, &sql)
+}
+
+/// Counts a table's rows with the same validated filter clause as paging.
+fn count_sqlite_rows(
+    handle: &Connection,
+    object: &ObjectRef,
+    filters: &[TableFilter],
+) -> Result<u64, QueryError> {
+    let (columns, _) = sqlite_table_shape(handle, object)?;
+    let from = quote_identifier(&object.name);
+    let (where_clause, values) =
+        build_filter_clause(filters, &columns, |_| "?".to_string(), quote_identifier)?;
+
+    let mut sql = format!("SELECT COUNT(*) FROM {from}");
+    if !where_clause.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+
+    let parameters = bind_parameters(&values);
+    let count: i64 = handle
+        .query_row(&sql, rusqlite::params_from_iter(parameters.iter()), |row| {
+            row.get(0)
+        })
+        .map_err(map_error)?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 impl DatabaseAdapter for SqliteAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Sqlite
@@ -896,41 +1393,7 @@ impl DatabaseAdapter for SqliteAdapter {
         object: &'a ObjectRef,
     ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |handle| {
-                let (columns, primary_key_columns) = sqlite_table_shape(handle, object)?;
-
-                // Indexes and constraints are reported as inspected lists, never
-                // as an empty success: SQLite always exposes `pragma_index_list`
-                // and `pragma_foreign_key_list`, even when the object has none.
-                let discovered = sqlite_indexes(handle, &object.name)?;
-                let indexes: Vec<IndexInfo> =
-                    discovered.iter().map(|index| index.info.clone()).collect();
-
-                let mut constraints = sqlite_foreign_keys(handle, &object.name)?;
-                if !primary_key_columns.is_empty() {
-                    // SQLite only lists a backing index when the primary key is
-                    // not the rowid alias; otherwise synthesize a stable label.
-                    let name = discovered
-                        .iter()
-                        .find(|index| index.origin == "pk")
-                        .map(|index| index.info.name.clone())
-                        .unwrap_or_else(|| format!("{}_pkey", object.name));
-                    constraints.push(ConstraintInfo::primary_key(
-                        name,
-                        primary_key_columns.clone(),
-                    ));
-                }
-                for index in discovered.iter().filter(|index| index.origin == "u") {
-                    constraints.push(ConstraintInfo::unique(
-                        index.info.name.clone(),
-                        index.info.columns.clone(),
-                    ));
-                }
-
-                Ok(TableDescription::new(columns, primary_key_columns)
-                    .with_indexes(indexes)
-                    .with_constraints(constraints))
-            })
+            self.with_connection(connection, |handle| describe_sqlite_table(handle, object))
         })
     }
 
@@ -968,6 +1431,130 @@ impl DatabaseAdapter for SqliteAdapter {
     ) -> AdapterFuture<'a, Result<ChangeResult, QueryError>> {
         Box::pin(async move {
             self.with_connection(connection, |handle| apply_sqlite_change(handle, request))
+        })
+    }
+
+    fn create_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        definition: &'a TableDefinition,
+    ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| create_sqlite_table(handle, definition))
+        })
+    }
+
+    fn drop_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        _cascade: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| drop_sqlite_table(handle, object))
+        })
+    }
+
+    fn add_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a ColumnDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| add_sqlite_column(handle, object, column))
+        })
+    }
+
+    fn rename_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        from: &'a str,
+        to: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| {
+                rename_sqlite_column(handle, object, from, to)
+            })
+        })
+    }
+
+    fn drop_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| drop_sqlite_column(handle, object, column))
+        })
+    }
+
+    fn add_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _foreign_key: &'a ForeignKeyDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |_| {
+                Err(unsupported_error(
+                    "SQLite cannot add a foreign key to an existing table without rebuilding it",
+                ))
+            })
+        })
+    }
+
+    fn drop_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |_| {
+                Err(unsupported_error(
+                    "SQLite cannot drop a foreign key from an existing table without rebuilding it",
+                ))
+            })
+        })
+    }
+
+    fn create_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+        columns: &'a [String],
+        unique: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| {
+                create_sqlite_index(handle, object, name, columns, unique)
+            })
+        })
+    }
+
+    fn drop_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| drop_sqlite_index(handle, name))
+        })
+    }
+
+    fn count_table_rows<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        filters: &'a [TableFilter],
+    ) -> AdapterFuture<'a, Result<u64, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle| count_sqlite_rows(handle, object, filters))
         })
     }
 
@@ -1075,10 +1662,10 @@ mod fixture_tests {
 
     use super::{categorize, SqliteAdapter};
     use crate::database::{
-        ChangeOutcome, ChangeRequest, ConnectionId, ConnectionState, ConstraintKind,
-        DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef, ObjectScope, PendingChange,
-        RowIdentity, RowKey, SortDirection, SortKey, TableFilter, TablePageRequest,
-        MAX_TABLE_PAGE_ROWS,
+        ChangeOutcome, ChangeRequest, ColumnDefinition, ConnectionId, ConnectionState,
+        ConstraintKind, DatabaseAdapter, FilterOperator, ForeignKeyDefinition, ObjectKind, ObjectRef,
+        ObjectScope, PendingChange, RowIdentity, RowKey, SortDirection, SortKey, TableDefinition,
+        TableFilter, TablePageRequest, MAX_TABLE_PAGE_ROWS,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -2052,5 +2639,383 @@ mod fixture_tests {
         ))
         .expect_err("a non-primary-key identity must be rejected");
         assert_eq!(partial.category, ErrorCategory::Validation);
+    }
+
+    fn schema_table_object(name: &str) -> ObjectRef {
+        ObjectRef {
+            database: None,
+            schema: None,
+            name: name.to_string(),
+            kind: ObjectKind::Table,
+        }
+    }
+
+    #[test]
+    fn create_table_then_describe_reports_columns_and_primary_key() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let definition = TableDefinition::new(
+            schema_table_object("widgets"),
+            vec![
+                ColumnDefinition::new("id", "INTEGER")
+                    .with_nullable(false)
+                    .with_primary_key(),
+                ColumnDefinition::new("label", "TEXT")
+                    .with_nullable(false)
+                    .with_default("'none'"),
+                ColumnDefinition::new("qty", "INTEGER"),
+                ColumnDefinition::new("team_id", "INTEGER"),
+            ],
+        )
+        .with_foreign_keys(vec![ForeignKeyDefinition::new(
+            vec!["team_id".to_string()],
+            "teams",
+            vec!["id".to_string()],
+        )]);
+
+        let description = block_on(adapter.create_table(&connection, &definition))
+            .expect("creating a table should succeed");
+
+        let names: Vec<&str> = description
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names, ["id", "label", "qty", "team_id"]);
+        assert_eq!(description.primary_key_columns, ["id"]);
+        assert_eq!(description.columns[0].nullable, Some(false));
+        assert_eq!(description.columns[2].nullable, Some(true));
+
+        // A later description agrees with the create result.
+        let described =
+            block_on(adapter.describe_table(&connection, &schema_table_object("widgets")))
+                .expect("the new table should describe");
+        assert_eq!(described.columns, description.columns);
+        let foreign = described
+            .constraints
+            .expect("SQLite reports constraints")
+            .into_iter()
+            .find(|constraint| constraint.kind == ConstraintKind::ForeignKey)
+            .expect("the foreign key should be reported");
+        assert_eq!(foreign.referenced_table.as_deref(), Some("teams"));
+        assert_eq!(foreign.referenced_columns, ["id"]);
+    }
+
+    #[test]
+    fn add_rename_and_drop_column_round_trip() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        block_on(adapter.add_column(
+            &connection,
+            &users_object(),
+            &ColumnDefinition::new("nickname", "TEXT"),
+        ))
+        .expect("adding a column should succeed");
+
+        let described = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+        assert!(
+            described.columns.iter().any(|column| column.name == "nickname"),
+            "the added column should be present"
+        );
+
+        block_on(adapter.rename_column(&connection, &users_object(), "nickname", "alias"))
+            .expect("renaming a column should succeed");
+        let described = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+        assert!(described.columns.iter().any(|column| column.name == "alias"));
+        assert!(!described.columns.iter().any(|column| column.name == "nickname"));
+
+        block_on(adapter.drop_column(&connection, &users_object(), "alias"))
+            .expect("dropping a column should succeed");
+        let described = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+        assert!(!described.columns.iter().any(|column| column.name == "alias"));
+    }
+
+    #[test]
+    fn create_and_drop_index_are_reflected_in_description() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        block_on(adapter.create_index(
+            &connection,
+            &users_object(),
+            "users_balance_idx",
+            &["balance".to_string()],
+            false,
+        ))
+        .expect("creating an index should succeed");
+        block_on(adapter.create_index(
+            &connection,
+            &users_object(),
+            "users_name_unique",
+            &["name".to_string()],
+            true,
+        ))
+        .expect("creating a unique index should succeed");
+
+        let described = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+        let indexes = described.indexes.expect("indexes are inspected");
+
+        let balance = indexes
+            .iter()
+            .find(|index| index.name == "users_balance_idx")
+            .expect("the new index should be listed");
+        assert_eq!(balance.columns, ["balance"]);
+        assert!(!balance.unique);
+
+        let unique = indexes
+            .iter()
+            .find(|index| index.name == "users_name_unique")
+            .expect("the unique index should be listed");
+        assert!(unique.unique);
+        assert_eq!(unique.columns, ["name"]);
+
+        block_on(adapter.drop_index(&connection, &users_object(), "users_balance_idx"))
+            .expect("dropping an index should succeed");
+        let described = block_on(adapter.describe_table(&connection, &users_object()))
+            .expect("description should succeed");
+        assert!(!described
+            .indexes
+            .expect("indexes are inspected")
+            .iter()
+            .any(|index| index.name == "users_balance_idx"));
+    }
+
+    #[test]
+    fn count_table_rows_returns_totals_with_and_without_filters() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let total = block_on(adapter.count_table_rows(&connection, &users_object(), &[]))
+            .expect("an unfiltered count should succeed");
+        assert_eq!(total, 3);
+
+        let filtered = block_on(adapter.count_table_rows(
+            &connection,
+            &users_object(),
+            &[TableFilter {
+                column: "name".to_string(),
+                operator: FilterOperator::Like,
+                values: vec![CellValue::Text("a%".to_string())],
+            }],
+        ))
+        .expect("a filtered count should succeed");
+        assert_eq!(filtered, 1);
+
+        let injection = block_on(adapter.count_table_rows(
+            &connection,
+            &users_object(),
+            &[TableFilter {
+                column: "name = 'alice'".to_string(),
+                operator: FilterOperator::Equal,
+                values: vec![CellValue::Text("alice".to_string())],
+            }],
+        ))
+        .expect_err("an unknown filter column must be rejected");
+        assert_eq!(injection.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn create_table_rejects_invalid_definitions() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let empty = TableDefinition::new(schema_table_object("bad"), Vec::new());
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &empty))
+                .expect_err("an empty column list must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let duplicate = TableDefinition::new(
+            schema_table_object("bad"),
+            vec![
+                ColumnDefinition::new("id", "INTEGER"),
+                ColumnDefinition::new("ID", "TEXT"),
+            ],
+        );
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &duplicate))
+                .expect_err("duplicate column names must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let two_keys = TableDefinition::new(
+            schema_table_object("bad"),
+            vec![
+                ColumnDefinition::new("id", "INTEGER").with_primary_key(),
+                ColumnDefinition::new("tenant", "INTEGER").with_primary_key(),
+            ],
+        );
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &two_keys))
+                .expect_err("multiple primary keys must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let unknown_table = TableDefinition::new(
+            schema_table_object("bad"),
+            vec![ColumnDefinition::new("team_id", "INTEGER")],
+        )
+        .with_foreign_keys(vec![ForeignKeyDefinition::new(
+            vec!["team_id".to_string()],
+            "does_not_exist",
+            vec!["id".to_string()],
+        )]);
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &unknown_table))
+                .expect_err("an unknown referenced table must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let unknown_column = TableDefinition::new(
+            schema_table_object("bad"),
+            vec![ColumnDefinition::new("team_id", "INTEGER")],
+        )
+        .with_foreign_keys(vec![ForeignKeyDefinition::new(
+            vec!["team_id".to_string()],
+            "teams",
+            vec!["nope".to_string()],
+        )]);
+        assert_eq!(
+            block_on(adapter.create_table(&connection, &unknown_column))
+                .expect_err("an unknown referenced column must be rejected")
+                .category,
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn schema_mutations_reject_injection_attempts_and_quote_safely() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let drop = block_on(adapter.drop_column(
+            &connection,
+            &users_object(),
+            "name\" OR \"1\"=\"1",
+        ))
+        .expect_err("an injected column name must be rejected");
+        assert_eq!(drop.category, ErrorCategory::Validation);
+
+        let rename = block_on(adapter.rename_column(
+            &connection,
+            &users_object(),
+            "name\"",
+            "alias",
+        ))
+        .expect_err("an injected source column must be rejected");
+        assert_eq!(rename.category, ErrorCategory::Validation);
+
+        // A quote-bearing column name is quoted safely rather than escaped into
+        // the statement.
+        let definition = TableDefinition::new(
+            schema_table_object("quoted"),
+            vec![
+                ColumnDefinition::new("id", "INTEGER").with_primary_key(),
+                ColumnDefinition::new("we\"ird", "TEXT"),
+            ],
+        );
+        let description = block_on(adapter.create_table(&connection, &definition))
+            .expect("a quote-bearing column name should be quoted safely");
+        let names: Vec<&str> = description
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(names, ["id", "we\"ird"]);
+    }
+
+    #[test]
+    fn altering_foreign_keys_is_unsupported_on_sqlite() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let foreign_key = ForeignKeyDefinition::new(
+            vec!["team_id".to_string()],
+            "teams",
+            vec!["id".to_string()],
+        );
+        let add = block_on(adapter.add_foreign_key(&connection, &users_object(), &foreign_key))
+            .expect_err("SQLite cannot add a foreign key without a rebuild");
+        assert_eq!(add.category, ErrorCategory::Unsupported);
+
+        let drop = block_on(adapter.drop_foreign_key(&connection, &users_object(), "users_fkey"))
+            .expect_err("SQLite cannot drop a foreign key without a rebuild");
+        assert_eq!(drop.category, ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn adding_a_primary_key_column_is_unsupported_on_sqlite() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let error = block_on(adapter.add_column(
+            &connection,
+            &users_object(),
+            &ColumnDefinition::new("code", "INTEGER").with_primary_key(),
+        ))
+        .expect_err("SQLite cannot add a PRIMARY KEY column");
+        assert_eq!(error.category, ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn schema_mutations_on_unknown_connections_are_connection_errors() {
+        let adapter = SqliteAdapter::new();
+        let unknown = ConnectionId::new("does-not-exist");
+        let definition = TableDefinition::new(
+            schema_table_object("widgets"),
+            vec![ColumnDefinition::new("id", "INTEGER")],
+        );
+
+        assert_eq!(
+            block_on(adapter.create_table(&unknown, &definition))
+                .expect_err("unknown connection must not create a table")
+                .category,
+            ErrorCategory::Connection
+        );
+        assert_eq!(
+            block_on(adapter.count_table_rows(&unknown, &users_object(), &[]))
+                .expect_err("unknown connection must not count rows")
+                .category,
+            ErrorCategory::Connection
+        );
+        assert_eq!(
+            block_on(adapter.drop_table(&unknown, &users_object(), false))
+                .expect_err("unknown connection must not drop a table")
+                .category,
+            ErrorCategory::Connection
+        );
+        assert_eq!(
+            block_on(adapter.add_foreign_key(
+                &unknown,
+                &users_object(),
+                &ForeignKeyDefinition::new(
+                    vec!["team_id".to_string()],
+                    "teams",
+                    vec!["id".to_string()],
+                ),
+            ))
+            .expect_err("unknown connection must fail before the capability check")
+            .category,
+            ErrorCategory::Connection
+        );
     }
 }

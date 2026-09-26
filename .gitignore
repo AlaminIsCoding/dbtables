@@ -1,5 +1,6 @@
 # Requested local planning/spec files
 /.ai/
+/.opencode/
 /PRD.md
 /prd.md
 /IMPLEMENTATION_PLAN.md
@@ -15,6 +16,9 @@
 /target/
 /src-tauri/target/
 /src-tauri/gen/schemas/
+
+# Local SQLite test fixture
+/mock-data.sqlite
 
 # Local secrets and environment files
 .env

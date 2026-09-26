@@ -410,6 +410,141 @@ impl TableDescription {
     }
 }
 
+/// A column in a table definition supplied to schema management.
+///
+/// `name` and `type_name` are the only required fields. `nullable` defaults to
+/// `false`, matching the wire default, so an omitted flag means `NOT NULL`.
+/// `default` is engine SQL text (for example `CURRENT_TIMESTAMP` or `0`) and is
+/// the one field that is not an identifier; adapters must validate it before
+/// placing it in a statement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnDefinition {
+    /// Column name.
+    pub name: String,
+    /// SQL type text, for example `INTEGER`, `TEXT`, `REAL`, or `NUMERIC`.
+    pub type_name: String,
+    /// Whether the column accepts nulls.
+    #[serde(default)]
+    pub nullable: bool,
+    /// Whether the column is part of the table's primary key.
+    #[serde(default)]
+    pub primary_key: bool,
+    /// Optional engine default expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+impl ColumnDefinition {
+    /// Creates a nullable, non-key column with no default.
+    pub fn new(name: impl Into<String>, type_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            type_name: type_name.into(),
+            nullable: true,
+            primary_key: false,
+            default: None,
+        }
+    }
+
+    /// Sets whether the column accepts nulls.
+    pub fn with_nullable(mut self, nullable: bool) -> Self {
+        self.nullable = nullable;
+        self
+    }
+
+    /// Marks the column as part of the primary key.
+    pub fn with_primary_key(mut self) -> Self {
+        self.primary_key = true;
+        self
+    }
+
+    /// Sets the column's default expression.
+    pub fn with_default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+}
+
+/// A foreign-key constraint supplied to schema management.
+///
+/// `columns` and `referenced_columns` must be the same length and are paired in
+/// order. `referenced_schema` is present for engines that expose schemas;
+/// SQLite, which has none, rejects a non-empty value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKeyDefinition {
+    /// Constrained local columns, in order.
+    pub columns: Vec<String>,
+    /// Referenced table name.
+    pub referenced_table: String,
+    /// Referenced columns, in the same order as `columns`.
+    pub referenced_columns: Vec<String>,
+    /// Referenced schema, when the engine exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referenced_schema: Option<String>,
+    /// Optional constraint name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ForeignKeyDefinition {
+    /// Creates a foreign key from local columns, a referenced table, and
+    /// referenced columns.
+    pub fn new(
+        columns: Vec<String>,
+        referenced_table: impl Into<String>,
+        referenced_columns: Vec<String>,
+    ) -> Self {
+        Self {
+            columns,
+            referenced_table: referenced_table.into(),
+            referenced_columns,
+            referenced_schema: None,
+            name: None,
+        }
+    }
+
+    /// Sets an explicit constraint name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
+/// A typed definition of a table to create.
+///
+/// `object` must name a [`ObjectKind::Table`]; `columns` must be non-empty with
+/// unique names and at most one primary-key column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableDefinition {
+    /// Object to create. Its `kind` must be [`ObjectKind::Table`].
+    pub object: ObjectRef,
+    /// Columns to create, in ordinal order.
+    pub columns: Vec<ColumnDefinition>,
+    /// Foreign-key constraints to create.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_keys: Vec<ForeignKeyDefinition>,
+}
+
+impl TableDefinition {
+    /// Creates a table definition from an object reference and its columns.
+    pub fn new(object: ObjectRef, columns: Vec<ColumnDefinition>) -> Self {
+        Self {
+            object,
+            columns,
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    /// Sets the foreign-key constraints to create.
+    pub fn with_foreign_keys(mut self, foreign_keys: Vec<ForeignKeyDefinition>) -> Self {
+        self.foreign_keys = foreign_keys;
+        self
+    }
+}
+
 /// Database/catalog and schema names a connection can address.
 ///
 /// Engines differ: SQLite exposes neither, PostgreSQL exposes schemas, and
@@ -1517,6 +1652,165 @@ pub trait DatabaseAdapter: Send + Sync {
         connection: &'a ConnectionId,
         transaction: &'a TransactionId,
     ) -> AdapterFuture<'a, Result<(), QueryError>>;
+
+    /// Creates a table from a typed definition and returns its description.
+    ///
+    /// The default returns [`ErrorCategory::Unsupported`] so an adapter that
+    /// does not implement DDL never silently reports success.
+    fn create_table<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _definition: &'a TableDefinition,
+    ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support creating tables",
+            ))
+        })
+    }
+
+    /// Drops a table.
+    ///
+    /// `cascade` may be ignored by engines (for example SQLite) that have no
+    /// `DROP ... CASCADE`; adapters document that instead of pretending to honor
+    /// it.
+    fn drop_table<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _cascade: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support dropping tables",
+            ))
+        })
+    }
+
+    /// Adds a column to an existing table.
+    fn add_column<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _column: &'a ColumnDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support adding columns",
+            ))
+        })
+    }
+
+    /// Renames a column on an existing table.
+    fn rename_column<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _from: &'a str,
+        _to: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support renaming columns",
+            ))
+        })
+    }
+
+    /// Drops a column from an existing table.
+    fn drop_column<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _column: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support dropping columns",
+            ))
+        })
+    }
+
+    /// Adds a foreign-key constraint to an existing table.
+    fn add_foreign_key<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _foreign_key: &'a ForeignKeyDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support adding foreign keys",
+            ))
+        })
+    }
+
+    /// Drops a named foreign-key constraint from an existing table.
+    fn drop_foreign_key<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support dropping foreign keys",
+            ))
+        })
+    }
+
+    /// Creates an index on one or more columns of a table.
+    fn create_index<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _name: &'a str,
+        _columns: &'a [String],
+        _unique: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support creating indexes",
+            ))
+        })
+    }
+
+    /// Drops an index by name.
+    fn drop_index<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support dropping indexes",
+            ))
+        })
+    }
+
+    /// Counts rows in a table, optionally applying validated filters.
+    fn count_table_rows<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _filters: &'a [TableFilter],
+    ) -> AdapterFuture<'a, Result<u64, QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support counting table rows",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1527,10 +1821,11 @@ mod tests {
         effective_sort_order, effective_table_page_limit, quote_identifier,
         quote_identifier_backtick, sort_direction_sql, validate_filter_values,
         validate_pending_change, validate_row_identity, CancelOutcome, ChangeOutcome, ChangeRequest,
-        ChangeResult, ConnectionId, ConnectionSecret, ConnectionState, ConstraintInfo,
-        FilterOperator, IndexInfo, ObjectKind, ObjectRef, PendingChange, RowIdentity, RowKey,
-        ScopeListing, SortDirection, SortKey, TableDescription, TableFilter, TablePage,
-        TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
+        ChangeResult, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
+        ConstraintInfo, FilterOperator, ForeignKeyDefinition, IndexInfo, ObjectKind, ObjectRef,
+        PendingChange, RowIdentity, RowKey, ScopeListing, SortDirection, SortKey, TableDefinition,
+        TableDescription, TableFilter, TablePage, TablePageRequest, TransactionId,
+        MAX_TABLE_PAGE_ROWS,
     };
     use crate::domain::{CellValue, ColumnInfo, ErrorCategory, OperationId};
 
@@ -1667,6 +1962,44 @@ mod tests {
         assert_eq!(value["constraints"][2]["referencedColumns"][0], "id");
         assert_eq!(value["constraints"][3]["kind"], "check");
         assert_eq!(value["constraints"][3]["definition"], "email <> ''");
+    }
+
+    #[test]
+    fn table_definition_types_serialize_with_camel_case_and_optional_fields() {
+        let definition = TableDefinition::new(
+            ObjectRef {
+                database: None,
+                schema: None,
+                name: "widgets".to_string(),
+                kind: ObjectKind::Table,
+            },
+            vec![
+                ColumnDefinition::new("id", "INTEGER")
+                    .with_nullable(false)
+                    .with_primary_key(),
+                ColumnDefinition::new("label", "TEXT"),
+            ],
+        )
+        .with_foreign_keys(vec![ForeignKeyDefinition::new(
+            vec!["team_id".to_string()],
+            "teams",
+            vec!["id".to_string()],
+        )]);
+
+        let value = serde_json::to_value(&definition).expect("definition should serialize");
+
+        assert_eq!(value["object"]["name"], "widgets");
+        assert_eq!(value["object"]["kind"], "table");
+        assert_eq!(value["columns"][0]["name"], "id");
+        assert_eq!(value["columns"][0]["typeName"], "INTEGER");
+        assert_eq!(value["columns"][0]["nullable"], false);
+        assert_eq!(value["columns"][0]["primaryKey"], true);
+        assert!(value["columns"][0].get("default").is_none());
+        assert_eq!(value["columns"][1]["nullable"], true);
+        assert_eq!(value["foreignKeys"][0]["referencedTable"], "teams");
+        assert_eq!(value["foreignKeys"][0]["referencedColumns"][0], "id");
+        assert!(value["foreignKeys"][0].get("name").is_none());
+        assert!(value["foreignKeys"][0].get("referencedSchema").is_none());
     }
 
     fn users_object() -> ObjectRef {
