@@ -312,6 +312,23 @@ export interface QueryResult {
   error?: QueryError;
 }
 
+/**
+ * Outcome of a successful CSV export written by the backend.
+ *
+ * `bytesWritten` includes the UTF-8 byte-order mark the backend prepends so
+ * spreadsheets detect the encoding.
+ */
+export interface CsvExportSummary {
+  /** Path the file was written to. */
+  path: string;
+  /** Data rows written, excluding the header. */
+  rows: number;
+  /** Columns written. */
+  columns: number;
+  /** Bytes written, including the UTF-8 byte-order mark. */
+  bytesWritten: number;
+}
+
 /** Operation states after which no further state updates are expected. */
 export const TERMINAL_OPERATION_STATES: readonly OperationState[] = [
   "succeeded",

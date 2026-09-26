@@ -1,5 +1,12 @@
 export { ResultGrid, type ResultGridProps } from "./ResultGrid";
 export { ResultsPanel, summarizeOutcome, type ResultsPanelProps } from "./ResultsPanel";
+export { copyTextToClipboard } from "./clipboard";
+export {
+  cellCopyText,
+  resultCopyText,
+  rowCopyText,
+  type ResultCopyOptions,
+} from "./copy";
 export { createMockResultSet, MOCK_COLUMNS, MOCK_ROW_COUNT } from "./mockResult";
 export {
   commandErrorOutcome,

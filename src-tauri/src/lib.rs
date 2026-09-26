@@ -26,6 +26,7 @@ pub fn run() {
             commands::queries::execute_query,
             commands::queries::query_capabilities,
             commands::queries::cancel_query,
+            commands::export::export_query_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the dbtables application");

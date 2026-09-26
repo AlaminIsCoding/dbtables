@@ -1,9 +1,19 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
 import type { GridSelection, Item } from "@glideapps/glide-data-grid";
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
-import type { CellValue, QueryError, QueryResult } from "../../domain";
+import type {
+  CellValue,
+  CsvExportSummary,
+  QueryError,
+  QueryResult,
+} from "../../domain";
+import { toQueryError } from "../../services/errors";
+import { exportQueryCsv } from "../../services/export";
+import { copyTextToClipboard } from "./clipboard";
+import { cellCopyText, resultCopyText, rowCopyText } from "./copy";
 import { ResultGrid } from "./ResultGrid";
 import { queryResultToResultSet } from "./resultSet";
 import type { QueryOutcome } from "./queryOutcome";
@@ -18,6 +28,13 @@ export interface ResultsPanelProps {
   fetchingMore?: boolean;
   /** Requests the next bounded page of the current result. */
   onFetchMore?: () => void;
+  /**
+   * Writes the current result to CSV and resolves with a write summary.
+   *
+   * Defaults to the typed export service. Tests and alternate hosts can supply
+   * their own writer without touching Tauri.
+   */
+  onExportCsv?: (path: string, result: QueryResult) => Promise<CsvExportSummary>;
   className?: string;
 }
 
@@ -286,17 +303,28 @@ function renderBody(outcome: QueryOutcome, handlers: BodyHandlers) {
  * empty, statement-only, failed, command error, cancelled, and uncertain. A
  * partial result keeps its grid visible and offers a bounded "fetch more"
  * action; the full cell value viewer opens for a selected or activated cell.
- * The grid is read-only here; this slice exposes no table editing.
+ * Cell, row, and loaded-result copy actions and CSV export are offered for a
+ * row-returning result. The grid is read-only here; this slice exposes no table
+ * editing.
  */
 export function ResultsPanel({
   outcome,
   canFetchMore = false,
   fetchingMore = false,
   onFetchMore,
+  onExportCsv,
   className,
 }: ResultsPanelProps) {
   const [selectedCell, setSelectedCell] = useState<Item | null>(null);
   const [viewerCell, setViewerCell] = useState<Item | null>(null);
+  const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportPath, setExportPath] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportSummary, setExportSummary] = useState<CsvExportSummary | null>(
+    null,
+  );
 
   const handleSelectionChange = useCallback((selection: GridSelection) => {
     setSelectedCell(selection.current?.cell ?? null);
@@ -306,10 +334,14 @@ export function ResultsPanel({
     setViewerCell(location);
   }, []);
 
+  // The viewer needs a cell-bearing grid; export also applies to a column-only
+  // empty result so its header row can still be written.
   const resultForViewer =
     outcome.kind === "grid" || outcome.kind === "partial"
       ? outcome.result
       : null;
+  const exportableResult =
+    resultForViewer ?? (outcome.kind === "empty" ? outcome.result : null);
 
   const selectedValue = useMemo(
     () =>
@@ -326,6 +358,74 @@ export function ResultsPanel({
   );
 
   const selectedLabel = selectionLabel(selectedCell);
+
+  // A new outcome replaces the data a previous export or copy referred to, so
+  // clear the transient notices rather than showing them against new rows.
+  useEffect(() => {
+    setExportSummary(null);
+    setExportError(null);
+    setCopyNotice(null);
+  }, [exportableResult]);
+
+  const copy = useCallback(async (text: string) => {
+    try {
+      await copyTextToClipboard(text);
+      setCopyNotice(null);
+    } catch {
+      setCopyNotice("Could not copy to the clipboard.");
+    }
+  }, []);
+
+  const handleCopyCell = useCallback(() => {
+    if (selectedValue !== null) {
+      void copy(cellCopyText(selectedValue));
+    }
+  }, [copy, selectedValue]);
+
+  const handleCopyRow = useCallback(() => {
+    if (resultForViewer && selectedCell) {
+      void copy(rowCopyText(resultForViewer, selectedCell[1]));
+    }
+  }, [copy, resultForViewer, selectedCell]);
+
+  const handleCopyAll = useCallback(() => {
+    if (exportableResult) {
+      void copy(resultCopyText(exportableResult));
+    }
+  }, [copy, exportableResult]);
+
+  const writeCsv = onExportCsv ?? exportQueryCsv;
+
+  const handleExport = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!exportableResult) {
+        return;
+      }
+
+      const path = exportPath.trim();
+      if (path.length === 0) {
+        setExportError("Enter a file path to export to.");
+        return;
+      }
+
+      setExporting(true);
+      setExportError(null);
+      setExportSummary(null);
+      try {
+        const summary = await writeCsv(path, exportableResult);
+        setExportSummary(summary);
+      } catch (error) {
+        setExportError(toQueryError(error).message);
+      } finally {
+        setExporting(false);
+      }
+    },
+    [exportPath, exportableResult, writeCsv],
+  );
+
+  const hasColumns = (exportableResult?.columns?.length ?? 0) > 0;
+  const loadedRows = exportableResult?.rows?.length ?? 0;
 
   return (
     <div className={cn("relative flex h-full min-h-0 flex-col", className)}>
@@ -350,6 +450,98 @@ export function ResultsPanel({
           </Button>
         )}
       </div>
+
+      {exportableResult && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-2 py-1">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px]"
+            onClick={handleCopyCell}
+            disabled={selectedValue === null}
+          >
+            Copy cell
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px]"
+            onClick={handleCopyRow}
+            disabled={!resultForViewer || selectedCell === null}
+          >
+            Copy row
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px]"
+            onClick={handleCopyAll}
+            disabled={loadedRows === 0}
+          >
+            Copy all
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-5 px-1.5 text-[10px]"
+            onClick={() => {
+              setExportOpen((open) => !open);
+              setExportError(null);
+            }}
+            disabled={!hasColumns}
+          >
+            Export CSV
+          </Button>
+          {copyNotice ? (
+            <span role="alert" className="text-[10px] text-destructive">
+              {copyNotice}
+            </span>
+          ) : null}
+          {exportSummary ? (
+            <span role="status" className="text-[10px] text-muted-foreground">
+              Exported {exportSummary.rows} row
+              {exportSummary.rows === 1 ? "" : "s"} to {exportSummary.path}
+            </span>
+          ) : null}
+        </div>
+      )}
+
+      {exportOpen && exportableResult && (
+        <form
+          onSubmit={handleExport}
+          className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border bg-muted/30 px-2 py-1"
+        >
+          <input
+            aria-label="CSV file path"
+            value={exportPath}
+            onChange={(event) => {
+              setExportPath(event.target.value);
+              setExportError(null);
+            }}
+            placeholder="C:/path/to/results.csv"
+            spellCheck={false}
+            className="h-6 min-w-[12rem] flex-1 rounded-sm border border-input bg-background px-1.5 font-mono text-[11px] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          />
+          <Button
+            type="submit"
+            size="sm"
+            className="h-5 px-1.5 text-[10px]"
+            disabled={exporting}
+          >
+            {exporting ? "Exporting…" : "Export"}
+          </Button>
+          {outcome.kind === "partial" ? (
+            <span className="text-[10px] text-muted-foreground">
+              Exports the {loadedRows} loaded row{loadedRows === 1 ? "" : "s"}.
+            </span>
+          ) : null}
+          {exportError ? (
+            <span role="alert" className="text-[10px] text-destructive">
+              {exportError}
+            </span>
+          ) : null}
+        </form>
+      )}
 
       <div className="min-h-0 flex-1 overflow-hidden">
         {renderBody(outcome, {
