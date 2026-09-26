@@ -34,8 +34,8 @@ use std::pin::Pin;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, OperationId,
-    QueryError, QueryRequest, QueryResult, Row,
+    CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
+    OperationId, QueryError, QueryRequest, QueryResult, Row,
 };
 
 pub mod mysql;
@@ -543,6 +543,12 @@ impl TablePageRequest {
         self
     }
 
+    /// Sets the page size, replacing the value passed to the constructor.
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = limit;
+        self
+    }
+
     /// Sets the filters to apply.
     pub fn with_filters(mut self, filters: Vec<TableFilter>) -> Self {
         self.filters = filters;
@@ -586,6 +592,287 @@ pub struct TablePage {
     /// Offset to request next, when more rows may exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<u64>,
+}
+
+impl TablePage {
+    /// Whether the returned rows carry a stable identity for later targeting.
+    ///
+    /// `false` means the adapter could not determine a primary key or other safe
+    /// row identifier, so callers must not offer row-targeted actions for these
+    /// rows. An empty identity is surfaced honestly rather than hidden.
+    pub fn has_row_identity(&self) -> bool {
+        !self.row_identity.is_empty()
+    }
+}
+
+/// Upper bound on rows an adapter returns for one table page.
+///
+/// The application applies its own (smaller) policy cap; this ceiling keeps a
+/// caller that bypasses the application from pulling an unbounded page. An
+/// adapter clamps a larger request and echoes the effective limit in the page.
+pub const MAX_TABLE_PAGE_ROWS: u32 = 1_000;
+
+/// Resolves the page size an adapter will actually use.
+///
+/// A `0` limit is rejected rather than treated as "unlimited" or "empty"; a
+/// request above [`MAX_TABLE_PAGE_ROWS`] is clamped to that ceiling. The
+/// effective value is what the returned [`TablePage`] echoes.
+pub fn effective_table_page_limit(limit: u32) -> Result<u32, QueryError> {
+    if limit == 0 {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a table page limit must be greater than zero",
+        ));
+    }
+    Ok(limit.min(MAX_TABLE_PAGE_ROWS))
+}
+
+/// Position of a known column by exact name, or `None` when it is not a column.
+///
+/// Identifier validation is exact so a caller cannot address a column the
+/// adapter did not report from table metadata.
+pub fn column_position(columns: &[ColumnInfo], name: &str) -> Option<usize> {
+    columns.iter().position(|column| column.name == name)
+}
+
+/// Quotes a validated SQL identifier with ANSI double quotes.
+///
+/// Embedded double quotes are doubled. This is defense in depth: callers must
+/// still validate the identifier against table metadata before quoting it.
+pub fn quote_identifier(identifier: &str) -> String {
+    let mut quoted = String::with_capacity(identifier.len() + 2);
+    quoted.push('"');
+    for character in identifier.chars() {
+        if character == '"' {
+            quoted.push('"');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// Quotes a validated SQL identifier with MySQL backticks.
+///
+/// Embedded backticks are doubled. As with [`quote_identifier`], validation
+/// against table metadata is still required first.
+pub fn quote_identifier_backtick(identifier: &str) -> String {
+    let mut quoted = String::with_capacity(identifier.len() + 2);
+    quoted.push('`');
+    for character in identifier.chars() {
+        if character == '`' {
+            quoted.push('`');
+        }
+        quoted.push(character);
+    }
+    quoted.push('`');
+    quoted
+}
+
+/// SQL keyword for a sort direction.
+pub fn sort_direction_sql(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "ASC",
+        SortDirection::Descending => "DESC",
+    }
+}
+
+/// Builds an `ORDER BY` body from validated sort keys, quoting identifiers.
+pub fn build_order_clause(order: &[SortKey], quote: impl Fn(&str) -> String) -> String {
+    order
+        .iter()
+        .map(|key| format!("{} {}", quote(&key.column), sort_direction_sql(key.direction)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Builds the bounded single-relation `SELECT` used to fetch one table page.
+///
+/// `from` is the already-validated, engine-quoted table reference (including any
+/// database/schema qualifier). The projection is `columns` quoted in order, so
+/// the result shape always matches the metadata the caller was shown. Every
+/// filter and sort column is checked against `columns` before it is quoted, and
+/// comparison values are collected separately for parameter binding, so no
+/// caller-controlled text can reach the statement as SQL. `limit` and `offset`
+/// are numeric and are inlined (never identifiers).
+///
+/// Returns the statement and the bound values in placeholder order. The caller
+/// owns the driver-specific fetch and value conversion.
+pub fn build_table_page_query(
+    from: &str,
+    columns: &[ColumnInfo],
+    filters: &[TableFilter],
+    order: &[SortKey],
+    limit: u32,
+    offset: u64,
+    mut placeholder: impl FnMut(usize) -> String,
+    quote: impl Fn(&str) -> String,
+) -> Result<(String, Vec<CellValue>), QueryError> {
+    for key in order {
+        if column_position(columns, &key.column).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("unknown sort column `{}`", key.column),
+            ));
+        }
+    }
+
+    let projection = columns
+        .iter()
+        .map(|column| quote(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (where_clause, values) = build_filter_clause(filters, columns, &mut placeholder, &quote)?;
+    let order_clause = build_order_clause(order, &quote);
+
+    let mut sql = format!("SELECT {projection} FROM {from}");
+    if !where_clause.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+    if !order_clause.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order_clause);
+    }
+    sql.push_str(&format!(" LIMIT {limit} OFFSET {offset}"));
+
+    Ok((sql, values))
+}
+
+/// Validates how many bound values a filter operator accepts.
+///
+/// Scalar comparisons and `LIKE` take exactly one value, `IN` takes one or
+/// more, and the null checks take none. Cardinality is checked independently of
+/// the identifier so no caller-authored predicate can reach the engine.
+pub fn validate_filter_values(filter: &TableFilter) -> Result<(), QueryError> {
+    let count = filter.values.len();
+    match filter.operator {
+        FilterOperator::IsNull | FilterOperator::IsNotNull => {
+            if count != 0 {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!(
+                        "filter on `{}` with a null check must not carry bound values",
+                        filter.column
+                    ),
+                ));
+            }
+        }
+        FilterOperator::In => {
+            if count == 0 {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!(
+                        "filter on `{}` with `in` requires at least one bound value",
+                        filter.column
+                    ),
+                ));
+            }
+        }
+        _ => {
+            if count != 1 {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    format!(
+                        "filter on `{}` requires exactly one bound value for this operator",
+                        filter.column
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds a SQL predicate from filters with validated identifiers.
+///
+/// Every filter column is checked against `columns` before it is quoted with
+/// `quote`. Comparison values are collected for parameter binding and never
+/// concatenated into the statement. `placeholder` receives the 1-based position
+/// of the next bound parameter and returns its token (`?` or `$n`). Returns an
+/// empty predicate and no values when there are no filters.
+pub fn build_filter_clause(
+    filters: &[TableFilter],
+    columns: &[ColumnInfo],
+    mut placeholder: impl FnMut(usize) -> String,
+    quote: impl Fn(&str) -> String,
+) -> Result<(String, Vec<CellValue>), QueryError> {
+    let mut clauses = Vec::with_capacity(filters.len());
+    let mut values: Vec<CellValue> = Vec::new();
+
+    for filter in filters {
+        if column_position(columns, &filter.column).is_none() {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("unknown filter column `{}`", filter.column),
+            ));
+        }
+        validate_filter_values(filter)?;
+
+        let column = quote(&filter.column);
+        let clause = match filter.operator {
+            FilterOperator::Equal => {
+                values.push(filter.values[0].clone());
+                format!("{column} = {}", placeholder(values.len()))
+            }
+            FilterOperator::NotEqual => {
+                values.push(filter.values[0].clone());
+                format!("{column} <> {}", placeholder(values.len()))
+            }
+            FilterOperator::LessThan => {
+                values.push(filter.values[0].clone());
+                format!("{column} < {}", placeholder(values.len()))
+            }
+            FilterOperator::LessThanOrEqual => {
+                values.push(filter.values[0].clone());
+                format!("{column} <= {}", placeholder(values.len()))
+            }
+            FilterOperator::GreaterThan => {
+                values.push(filter.values[0].clone());
+                format!("{column} > {}", placeholder(values.len()))
+            }
+            FilterOperator::GreaterThanOrEqual => {
+                values.push(filter.values[0].clone());
+                format!("{column} >= {}", placeholder(values.len()))
+            }
+            FilterOperator::Like => {
+                values.push(filter.values[0].clone());
+                format!("{column} LIKE {}", placeholder(values.len()))
+            }
+            FilterOperator::In => {
+                let mut tokens = Vec::with_capacity(filter.values.len());
+                for value in &filter.values {
+                    values.push(value.clone());
+                    tokens.push(placeholder(values.len()));
+                }
+                format!("{column} IN ({})", tokens.join(", "))
+            }
+            FilterOperator::IsNull => format!("{column} IS NULL"),
+            FilterOperator::IsNotNull => format!("{column} IS NOT NULL"),
+        };
+        clauses.push(clause);
+    }
+
+    Ok((clauses.join(" AND "), values))
+}
+
+/// Effective ordering for a page: the caller's sort plus any missing row
+/// identity columns appended ascending as deterministic tie-breakers.
+///
+/// Appending the identity columns keeps offset paging stable when the requested
+/// sort is not unique. Columns are matched by exact name so a sort that already
+/// names an identity column is never duplicated.
+pub fn effective_sort_order(sort: &[SortKey], row_identity: &[String]) -> Vec<SortKey> {
+    let mut effective = sort.to_vec();
+    for column in row_identity {
+        if !effective.iter().any(|key| &key.column == column) {
+            effective.push(SortKey {
+                column: column.clone(),
+                direction: SortDirection::Ascending,
+            });
+        }
+    }
+    effective
 }
 
 /// A column identifier paired with a bound value.
@@ -981,12 +1268,15 @@ pub trait DatabaseAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        CancelOutcome, ChangeOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
+        build_filter_clause, build_order_clause, build_table_page_query, column_position,
+        effective_sort_order, effective_table_page_limit, quote_identifier,
+        quote_identifier_backtick, sort_direction_sql, validate_filter_values, CancelOutcome,
+        ChangeOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
         ConnectionState, ConstraintInfo, FilterOperator, IndexInfo, ObjectKind, ObjectRef,
         PendingChange, RowIdentity, RowKey, ScopeListing, SortDirection, SortKey, TableDescription,
-        TableFilter, TablePageRequest, TransactionId,
+        TableFilter, TablePage, TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
     };
-    use crate::domain::{CellValue, ColumnInfo, OperationId};
+    use crate::domain::{CellValue, ColumnInfo, ErrorCategory, OperationId};
 
     #[test]
     fn connection_and_transaction_ids_serialize_as_plain_strings() {
@@ -1228,5 +1518,312 @@ mod tests {
         assert_eq!(unknown.outcome, ChangeOutcome::OutcomeUnknown);
         assert!(!unknown.outcome.is_applied());
         assert!(unknown.error.is_some());
+    }
+
+    #[test]
+    fn page_ceiling_is_a_positive_bound() {
+        assert!(MAX_TABLE_PAGE_ROWS > 0);
+    }
+
+    #[test]
+    fn table_page_reports_whether_a_safe_row_identity_exists() {
+        let page = TablePage {
+            operation_id: OperationId::new("page"),
+            columns: vec![ColumnInfo::named("id")],
+            rows: Vec::new(),
+            row_identity: vec!["id".to_string()],
+            offset: 0,
+            limit: 10,
+            total_rows: None,
+            truncated: false,
+            next_offset: None,
+        };
+        assert!(page.has_row_identity());
+
+        let mut no_identity = page.clone();
+        no_identity.row_identity = Vec::new();
+        assert!(!no_identity.has_row_identity());
+    }
+
+    #[test]
+    fn identifier_quoting_escapes_embedded_quote_characters() {
+        assert_eq!(quote_identifier("plain"), "\"plain\"");
+        assert_eq!(quote_identifier("we\"ird"), "\"we\"\"ird\"");
+
+        assert_eq!(quote_identifier_backtick("plain"), "`plain`");
+        assert_eq!(quote_identifier_backtick("we`ird"), "`we``ird`");
+    }
+
+    #[test]
+    fn column_position_matches_exact_names_only() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("Name")];
+        assert_eq!(column_position(&columns, "id"), Some(0));
+        assert_eq!(column_position(&columns, "Name"), Some(1));
+        assert_eq!(column_position(&columns, "name"), None);
+        assert_eq!(column_position(&columns, "id = 1"), None);
+    }
+
+    #[test]
+    fn build_filter_clause_quotes_identifiers_and_collects_bound_values() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("name")];
+        let filters = vec![
+            TableFilter {
+                column: "name".to_string(),
+                operator: FilterOperator::Equal,
+                values: vec![CellValue::Text("bob".to_string())],
+            },
+            TableFilter {
+                column: "id".to_string(),
+                operator: FilterOperator::In,
+                values: vec![CellValue::Integer(1), CellValue::Integer(3)],
+            },
+        ];
+
+        let (clause, values) =
+            build_filter_clause(&filters, &columns, |_| "?".to_string(), quote_identifier)
+                .expect("valid filters should build");
+
+        assert_eq!(clause, "\"name\" = ? AND \"id\" IN (?, ?)");
+        assert_eq!(
+            values,
+            vec![
+                CellValue::Text("bob".to_string()),
+                CellValue::Integer(1),
+                CellValue::Integer(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_filter_clause_numbers_placeholders_across_filters() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("name")];
+        let filters = vec![
+            TableFilter {
+                column: "id".to_string(),
+                operator: FilterOperator::GreaterThanOrEqual,
+                values: vec![CellValue::Integer(2)],
+            },
+            TableFilter {
+                column: "name".to_string(),
+                operator: FilterOperator::Like,
+                values: vec![CellValue::Text("%a%".to_string())],
+            },
+        ];
+
+        let (clause, values) = build_filter_clause(
+            &filters,
+            &columns,
+            |position| format!("${position}"),
+            quote_identifier,
+        )
+        .expect("valid filters should build");
+
+        assert_eq!(clause, "\"id\" >= $1 AND \"name\" LIKE $2");
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn build_filter_clause_supports_null_checks_without_values() {
+        let columns = vec![ColumnInfo::named("name")];
+        let filters = vec![
+            TableFilter {
+                column: "name".to_string(),
+                operator: FilterOperator::IsNull,
+                values: Vec::new(),
+            },
+            TableFilter {
+                column: "name".to_string(),
+                operator: FilterOperator::IsNotNull,
+                values: Vec::new(),
+            },
+        ];
+
+        let (clause, values) =
+            build_filter_clause(&filters, &columns, |_| "?".to_string(), quote_identifier)
+                .expect("null checks should build");
+
+        assert_eq!(clause, "\"name\" IS NULL AND \"name\" IS NOT NULL");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn build_filter_clause_rejects_unknown_identifiers_and_bad_cardinality() {
+        let columns = vec![ColumnInfo::named("id")];
+
+        let unknown = vec![TableFilter {
+            column: "id = 1".to_string(),
+            operator: FilterOperator::Equal,
+            values: vec![CellValue::Integer(1)],
+        }];
+        let error =
+            build_filter_clause(&unknown, &columns, |_| "?".to_string(), quote_identifier)
+                .expect_err("an unknown identifier must be rejected");
+        assert_eq!(error.category, ErrorCategory::Validation);
+
+        let bad_cardinality = vec![TableFilter {
+            column: "id".to_string(),
+            operator: FilterOperator::Equal,
+            values: Vec::new(),
+        }];
+        let error = build_filter_clause(
+            &bad_cardinality,
+            &columns,
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect_err("a missing value must be rejected");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn validate_filter_values_enforces_cardinality_per_operator() {
+        let filter = |operator, count| TableFilter {
+            column: "id".to_string(),
+            operator,
+            values: vec![CellValue::Integer(1); count],
+        };
+
+        assert!(validate_filter_values(&filter(FilterOperator::Equal, 1)).is_ok());
+        assert!(validate_filter_values(&filter(FilterOperator::Equal, 0)).is_err());
+        assert!(validate_filter_values(&filter(FilterOperator::Like, 2)).is_err());
+        assert!(validate_filter_values(&filter(FilterOperator::In, 0)).is_err());
+        assert!(validate_filter_values(&filter(FilterOperator::In, 3)).is_ok());
+        assert!(validate_filter_values(&filter(FilterOperator::IsNull, 0)).is_ok());
+        assert!(validate_filter_values(&filter(FilterOperator::IsNull, 1)).is_err());
+    }
+
+    #[test]
+    fn effective_sort_appends_missing_identity_columns_as_tie_breakers() {
+        let identity = vec!["id".to_string(), "tenant".to_string()];
+
+        let requested = vec![SortKey {
+            column: "name".to_string(),
+            direction: SortDirection::Descending,
+        }];
+        let effective = effective_sort_order(&requested, &identity);
+        assert_eq!(effective.len(), 3);
+        assert_eq!(effective[0].column, "name");
+        assert_eq!(effective[0].direction, SortDirection::Descending);
+        assert_eq!(effective[1].column, "id");
+        assert_eq!(effective[1].direction, SortDirection::Ascending);
+        assert_eq!(effective[2].column, "tenant");
+
+        // A sort that already names an identity column is not duplicated.
+        let requested = vec![SortKey {
+            column: "id".to_string(),
+            direction: SortDirection::Ascending,
+        }];
+        let effective = effective_sort_order(&requested, &identity);
+        assert_eq!(effective.len(), 2);
+        assert_eq!(effective[0].column, "id");
+        assert_eq!(effective[1].column, "tenant");
+    }
+
+    #[test]
+    fn build_order_clause_quotes_columns_and_directions() {
+        let order = vec![
+            SortKey {
+                column: "id".to_string(),
+                direction: SortDirection::Descending,
+            },
+            SortKey {
+                column: "name".to_string(),
+                direction: SortDirection::Ascending,
+            },
+        ];
+
+        assert_eq!(
+            build_order_clause(&order, quote_identifier),
+            "\"id\" DESC, \"name\" ASC"
+        );
+        assert_eq!(sort_direction_sql(SortDirection::Ascending), "ASC");
+        assert_eq!(sort_direction_sql(SortDirection::Descending), "DESC");
+        assert!(build_order_clause(&[], quote_identifier).is_empty());
+    }
+
+    #[test]
+    fn effective_table_page_limit_rejects_zero_and_clamps_to_the_ceiling() {
+        assert_eq!(effective_table_page_limit(25), Ok(25));
+        assert_eq!(
+            effective_table_page_limit(MAX_TABLE_PAGE_ROWS + 1),
+            Ok(MAX_TABLE_PAGE_ROWS)
+        );
+
+        let error = effective_table_page_limit(0).expect_err("zero is not a valid page size");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn table_page_query_composes_projection_where_order_and_window() {
+        let columns = vec![ColumnInfo::named("id"), ColumnInfo::named("name")];
+        let filters = vec![TableFilter {
+            column: "name".to_string(),
+            operator: FilterOperator::Like,
+            values: vec![CellValue::Text("a%".to_string())],
+        }];
+        let order = vec![SortKey {
+            column: "id".to_string(),
+            direction: SortDirection::Descending,
+        }];
+
+        let (sql, values) = build_table_page_query(
+            "\"users\"",
+            &columns,
+            &filters,
+            &order,
+            25,
+            50,
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect("a valid page query should build");
+
+        assert_eq!(
+            sql,
+            "SELECT \"id\", \"name\" FROM \"users\" WHERE \"name\" LIKE ? \
+             ORDER BY \"id\" DESC LIMIT 25 OFFSET 50"
+        );
+        assert_eq!(values, vec![CellValue::Text("a%".to_string())]);
+    }
+
+    #[test]
+    fn table_page_query_omits_empty_clauses_and_never_inlines_values() {
+        let columns = vec![ColumnInfo::named("id")];
+        let (sql, values) = build_table_page_query(
+            "\"users\"",
+            &columns,
+            &[],
+            &[],
+            10,
+            0,
+            |position| format!("${position}"),
+            quote_identifier,
+        )
+        .expect("an unfiltered page query should build");
+
+        assert_eq!(sql, "SELECT \"id\" FROM \"users\" LIMIT 10 OFFSET 0");
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn table_page_query_rejects_unknown_sort_identifiers() {
+        let columns = vec![ColumnInfo::named("id")];
+        let order = vec![SortKey {
+            column: "id); DROP TABLE users; --".to_string(),
+            direction: SortDirection::Ascending,
+        }];
+
+        let error = build_table_page_query(
+            "\"users\"",
+            &columns,
+            &[],
+            &order,
+            10,
+            0,
+            |_| "?".to_string(),
+            quote_identifier,
+        )
+        .expect_err("an unknown sort column must be rejected before quoting");
+        assert_eq!(error.category, ErrorCategory::Validation);
     }
 }

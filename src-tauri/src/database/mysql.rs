@@ -9,8 +9,10 @@
 //!   primary key from `information_schema`.
 //! - Execute a single SQL statement and return a normalized, capped result with
 //!   column metadata, rows, affected-row count, duration, and structured errors.
+//! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
+//!   primary key as a safe row identity when the object has one.
 //!
-//! Table paging and staged changes arrive in later tasks and report
+//! Staged changes arrive in a later task and report
 //! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
 //! [`Self::capabilities`] reports only what the adapter can honor today.
 //!
@@ -43,10 +45,11 @@ use mysql::prelude::{Protocol, Queryable};
 use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::database::{
-    AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, IndexInfo,
-    ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage,
-    TablePageRequest, TransactionId,
+    build_table_page_query, effective_sort_order, effective_table_page_limit,
+    quote_identifier_backtick, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult,
+    ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind,
+    DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription,
+    TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -574,6 +577,136 @@ fn collect_result<T: Protocol>(
     Ok(normalized)
 }
 
+/// Reads a MySQL object's columns and primary key in ordinal/key order.
+///
+/// The database and table names are bound values in the `information_schema`
+/// predicates, never interpolated. A missing table or view is a validation
+/// error; a view reports columns with no primary key.
+fn mysql_table_shape(
+    handle: &mut Conn,
+    database: &str,
+    object_name: &str,
+) -> Result<(Vec<ColumnInfo>, Vec<String>), QueryError> {
+    let rows: Vec<(String, String, String)> = handle
+        .exec(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+             ORDER BY ORDINAL_POSITION",
+            (database, object_name),
+        )
+        .map_err(map_error)?;
+
+    if rows.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("`{object_name}` is not a table or view in this MySQL database"),
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(rows.len());
+    for (name, column_type, is_nullable) in rows {
+        let nullable = match is_nullable.as_str() {
+            "YES" => Some(true),
+            "NO" => Some(false),
+            _ => None,
+        };
+        columns.push(ColumnInfo {
+            name,
+            type_name: Some(column_type),
+            nullable,
+        });
+    }
+
+    let keys: Vec<(String,)> = handle
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.key_column_usage \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+             AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
+            (database, object_name),
+        )
+        .map_err(map_error)?;
+    let primary_key_columns: Vec<String> = keys.into_iter().map(|(name,)| name).collect();
+
+    Ok((columns, primary_key_columns))
+}
+
+/// Fetches one bounded, filtered, sorted page from a MySQL table or view.
+///
+/// The table reference is qualified with the resolved database and quoted with
+/// backticks. Filters/sorts are validated against the object's columns and their
+/// values are bound through the binary protocol. The primary key, when present,
+/// is appended to the ordering and reported as `row_identity`.
+fn fetch_mysql_page(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    request: TablePageRequest,
+) -> Result<TablePage, QueryError> {
+    let limit = effective_table_page_limit(request.limit)?;
+    let database = resolve_database(handle, default_database, request.object.database.as_deref())?;
+    let (columns, row_identity) = mysql_table_shape(handle, &database, &request.object.name)?;
+    let order = effective_sort_order(&request.sort, &row_identity);
+    let from = format!(
+        "{}.{}",
+        quote_identifier_backtick(&database),
+        quote_identifier_backtick(&request.object.name)
+    );
+
+    // Ask for one row beyond the page so the loop below can tell whether a
+    // further page exists without a separate COUNT, which could scan the whole
+    // relation. The extra row is never returned; it only sets `truncated`.
+    let (sql, values) = build_table_page_query(
+        &from,
+        &columns,
+        &request.filters,
+        &order,
+        limit.saturating_add(1),
+        request.offset,
+        |_| "?".to_string(),
+        quote_identifier_backtick,
+    )?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // separate COUNT, which could scan the whole relation.
+    let parameters: Vec<Value> = values.iter().map(cell_to_value).collect();
+    let mut result = handle.exec_iter(&sql, parameters).map_err(map_error)?;
+    let binary_columns: Vec<bool> = result
+        .columns()
+        .as_ref()
+        .iter()
+        .map(column_is_binary)
+        .collect();
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = result.next() {
+        let row = row.map_err(map_error)?;
+        if rows.len() >= limit as usize {
+            truncated = true;
+            break;
+        }
+        rows.push(row_to_cells(row.unwrap(), &binary_columns));
+    }
+
+    let next_offset = if truncated {
+        Some(request.offset + rows.len() as u64)
+    } else {
+        None
+    };
+
+    Ok(TablePage {
+        operation_id: request.operation_id,
+        columns,
+        rows,
+        row_identity,
+        offset: request.offset,
+        limit,
+        total_rows: None,
+        truncated,
+        next_offset,
+    })
+}
+
 impl DatabaseAdapter for MySqlAdapter {
     fn engine(&self) -> EngineId {
         EngineId::MySql
@@ -738,50 +871,8 @@ impl DatabaseAdapter for MySqlAdapter {
                 let database =
                     resolve_database(handle, default_database, object.database.as_deref())?;
 
-                let rows: Vec<(String, String, String)> = handle
-                    .exec(
-                        "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE \
-                         FROM information_schema.columns \
-                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
-                         ORDER BY ORDINAL_POSITION",
-                        (database.as_str(), object.name.as_str()),
-                    )
-                    .map_err(map_error)?;
-
-                if rows.is_empty() {
-                    return Err(QueryError::new(
-                        ErrorCategory::Validation,
-                        format!(
-                            "`{}` is not a table or view in this MySQL database",
-                            object.name
-                        ),
-                    ));
-                }
-
-                let mut columns = Vec::with_capacity(rows.len());
-                for (name, column_type, is_nullable) in rows {
-                    let nullable = match is_nullable.as_str() {
-                        "YES" => Some(true),
-                        "NO" => Some(false),
-                        _ => None,
-                    };
-                    columns.push(ColumnInfo {
-                        name,
-                        type_name: Some(column_type),
-                        nullable,
-                    });
-                }
-
-                let keys: Vec<(String,)> = handle
-                    .exec(
-                        "SELECT COLUMN_NAME FROM information_schema.key_column_usage \
-                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
-                         AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION",
-                        (database.as_str(), object.name.as_str()),
-                    )
-                    .map_err(map_error)?;
-                let primary_key_columns: Vec<String> =
-                    keys.into_iter().map(|(name,)| name).collect();
+                let (columns, primary_key_columns) =
+                    mysql_table_shape(handle, &database, &object.name)?;
 
                 // Indexes: `statistics` lists one row per index key part, so the
                 // rows are grouped by index name in index-key order. Functional
@@ -882,13 +973,11 @@ impl DatabaseAdapter for MySqlAdapter {
     fn fetch_table_page<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: TablePageRequest,
+        request: TablePageRequest,
     ) -> AdapterFuture<'a, Result<TablePage, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |_handle, _database| {
-                Err(unsupported_error(
-                    "table data browsing is not implemented in this slice",
-                ))
+            self.with_connection(connection, |handle, database| {
+                fetch_mysql_page(handle, database, request)
             })
         })
     }

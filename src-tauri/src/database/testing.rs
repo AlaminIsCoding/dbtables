@@ -15,11 +15,11 @@ use crate::domain::{
 };
 
 use super::{
-    AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
-    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter,
-    FilterOperator, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, RowIdentity,
-    ScopeListing, SortDirection, TableDescription, TableFilter, TablePage, TablePageRequest,
-    TransactionId,
+    validate_filter_values, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult,
+    ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind,
+    DatabaseAdapter, FilterOperator, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange,
+    RowIdentity, ScopeListing, SortDirection, TableDescription, TableFilter, TablePage,
+    TablePageRequest, TransactionId,
 };
 
 /// Small deterministic table the fake exposes for paging and writes.
@@ -148,42 +148,6 @@ fn matches_filter(cell: &CellValue, filter: &TableFilter) -> bool {
 
 fn validation_error(message: impl Into<String>) -> QueryError {
     QueryError::new(ErrorCategory::Validation, message)
-}
-
-/// Validates how many bound values a filter operator accepts.
-///
-/// Scalar comparisons and `LIKE` take exactly one value, `IN` takes one or
-/// more, and the null checks take none. Cardinality is checked separately from
-/// the identifier so no caller-authored predicate reaches the engine.
-fn validate_filter_values(filter: &TableFilter) -> Result<(), QueryError> {
-    let count = filter.values.len();
-    match filter.operator {
-        FilterOperator::IsNull | FilterOperator::IsNotNull => {
-            if count != 0 {
-                return Err(validation_error(format!(
-                    "filter on `{}` with a null check must not carry bound values",
-                    filter.column
-                )));
-            }
-        }
-        FilterOperator::In => {
-            if count == 0 {
-                return Err(validation_error(format!(
-                    "filter on `{}` with `in` requires at least one bound value",
-                    filter.column
-                )));
-            }
-        }
-        _ => {
-            if count != 1 {
-                return Err(validation_error(format!(
-                    "filter on `{}` requires exactly one bound value for this operator",
-                    filter.column
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Confirms a staged write targets the fake `users` base table.

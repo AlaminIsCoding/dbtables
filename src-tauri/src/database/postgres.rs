@@ -9,8 +9,10 @@
 //!   key from `information_schema`.
 //! - Execute a single SQL statement and return a normalized, capped result with
 //!   column metadata, rows, affected-row count, duration, and structured errors.
+//! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
+//!   primary key as a safe row identity when the object has one.
 //!
-//! Table paging and staged changes arrive in later tasks and report
+//! Table paging is implemented; staged changes arrive in a later task and report
 //! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
 //! [`Self::capabilities`] reports only what the adapter can honor today.
 //!
@@ -67,6 +69,7 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{Client, Column, Config, NoTls, Socket};
 
 use crate::database::{
+    build_table_page_query, effective_sort_order, effective_table_page_limit, quote_identifier,
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
     ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, IndexInfo,
     ObjectKind, ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage,
@@ -994,6 +997,151 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// Reads a PostgreSQL object's columns and primary key in ordinal/key order.
+///
+/// The schema and table names are bound values in the `information_schema`
+/// predicates, never interpolated. A missing table or view is a validation
+/// error; a view reports columns with no primary key.
+async fn postgres_table_shape(
+    client: &Client,
+    schema: &str,
+    object_name: &str,
+) -> Result<(Vec<ColumnInfo>, Vec<String>), QueryError> {
+    let rows = client
+        .query(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+            &[&schema, &object_name],
+        )
+        .await
+        .map_err(map_error)?;
+
+    if rows.is_empty() {
+        return Err(validation_error(format!(
+            "`{object_name}` is not a table or view in this PostgreSQL schema"
+        )));
+    }
+
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.try_get(0).map_err(map_error)?;
+        let data_type: String = row.try_get(1).map_err(map_error)?;
+        let is_nullable: String = row.try_get(2).map_err(map_error)?;
+        let nullable = match is_nullable.as_str() {
+            "YES" => Some(true),
+            "NO" => Some(false),
+            _ => None,
+        };
+        columns.push(ColumnInfo {
+            name,
+            type_name: Some(data_type),
+            nullable,
+        });
+    }
+
+    let keys = client
+        .query(
+            "SELECT kcu.column_name FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON kcu.constraint_name = tc.constraint_name \
+              AND kcu.constraint_schema = tc.constraint_schema \
+              AND kcu.table_schema = tc.table_schema \
+              AND kcu.table_name = tc.table_name \
+             WHERE tc.constraint_type = 'PRIMARY KEY' \
+               AND tc.table_schema = $1 AND tc.table_name = $2 \
+             ORDER BY kcu.ordinal_position",
+            &[&schema, &object_name],
+        )
+        .await
+        .map_err(map_error)?;
+
+    let mut primary_key_columns = Vec::with_capacity(keys.len());
+    for row in &keys {
+        let name: String = row.try_get(0).map_err(map_error)?;
+        primary_key_columns.push(name);
+    }
+
+    Ok((columns, primary_key_columns))
+}
+
+/// Fetches one bounded, filtered, sorted page from a PostgreSQL table or view.
+///
+/// The table reference is qualified with the resolved schema and quoted with
+/// ANSI double quotes. Filters/sorts are validated against the object's columns
+/// and bound as `$n` parameters in text format. The primary key, when present,
+/// is appended to the ordering and reported as `row_identity`.
+async fn fetch_postgres_page(
+    client: &Client,
+    default_schema: Option<&str>,
+    request: TablePageRequest,
+) -> Result<TablePage, QueryError> {
+    let limit = effective_table_page_limit(request.limit)?;
+    let schema = resolve_schema(default_schema, request.object.schema.as_deref())?;
+    let (columns, row_identity) =
+        postgres_table_shape(client, &schema, &request.object.name).await?;
+    let order = effective_sort_order(&request.sort, &row_identity);
+    let from = format!(
+        "{}.{}",
+        quote_identifier(&schema),
+        quote_identifier(&request.object.name)
+    );
+
+    // Ask for one row beyond the page so the loop below can tell whether a
+    // further page exists without a separate COUNT, which could scan the whole
+    // relation. The extra row is never returned; it only sets `truncated`.
+    let (sql, values) = build_table_page_query(
+        &from,
+        &columns,
+        &request.filters,
+        &order,
+        limit.saturating_add(1),
+        request.offset,
+        |position| format!("${position}"),
+        quote_identifier,
+    )?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // separate COUNT, which could scan the whole relation.
+    let statement = client.prepare(&sql).await.map_err(map_error)?;
+    let parameters: Vec<PgParameter> = values.into_iter().map(PgParameter).collect();
+    let parameter_refs: Vec<&(dyn ToSql + Sync)> = parameters
+        .iter()
+        .map(|parameter| parameter as &(dyn ToSql + Sync))
+        .collect();
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    let mut stream = std::pin::pin!(client
+        .query_raw(&statement, parameter_refs.iter().copied())
+        .await
+        .map_err(map_error)?);
+    while let Some(row) = stream.try_next().await.map_err(map_error)? {
+        if rows.len() >= limit as usize {
+            truncated = true;
+            break;
+        }
+        rows.push(row_to_cells(&row)?);
+    }
+
+    let next_offset = if truncated {
+        Some(request.offset + rows.len() as u64)
+    } else {
+        None
+    };
+
+    Ok(TablePage {
+        operation_id: request.operation_id,
+        columns,
+        rows,
+        row_identity,
+        offset: request.offset,
+        limit,
+        total_rows: None,
+        truncated,
+        next_offset,
+    })
+}
+
 impl DatabaseAdapter for PostgresAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Postgres
@@ -1176,60 +1324,8 @@ impl DatabaseAdapter for PostgresAdapter {
             ensure_scope_database(&guard.database, object.database.as_deref())?;
             let schema = resolve_schema(guard.default_schema.as_deref(), object.schema.as_deref())?;
 
-            let rows = client
-                .query(
-                    "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-                    &[&schema, &object.name],
-                )
-                .await
-                .map_err(map_error)?;
-
-            if rows.is_empty() {
-                return Err(validation_error(format!(
-                    "`{}` is not a table or view in this PostgreSQL schema",
-                    object.name
-                )));
-            }
-
-            let mut columns = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let name: String = row.try_get(0).map_err(map_error)?;
-                let data_type: String = row.try_get(1).map_err(map_error)?;
-                let is_nullable: String = row.try_get(2).map_err(map_error)?;
-                let nullable = match is_nullable.as_str() {
-                    "YES" => Some(true),
-                    "NO" => Some(false),
-                    _ => None,
-                };
-                columns.push(ColumnInfo {
-                    name,
-                    type_name: Some(data_type),
-                    nullable,
-                });
-            }
-
-            let keys = client
-                .query(
-                    "SELECT kcu.column_name FROM information_schema.table_constraints tc \
-                     JOIN information_schema.key_column_usage kcu \
-                       ON kcu.constraint_name = tc.constraint_name \
-                      AND kcu.constraint_schema = tc.constraint_schema \
-                      AND kcu.table_schema = tc.table_schema \
-                      AND kcu.table_name = tc.table_name \
-                     WHERE tc.constraint_type = 'PRIMARY KEY' \
-                       AND tc.table_schema = $1 AND tc.table_name = $2 \
-                     ORDER BY kcu.ordinal_position",
-                    &[&schema, &object.name],
-                )
-                .await
-                .map_err(map_error)?;
-
-            let mut primary_key_columns = Vec::with_capacity(keys.len());
-            for row in &keys {
-                let name: String = row.try_get(0).map_err(map_error)?;
-                primary_key_columns.push(name);
-            }
+            let (columns, primary_key_columns) =
+                postgres_table_shape(client, &schema, &object.name).await?;
 
             // Indexes: `pg_index` carries uniqueness/primary flags; iterating the
             // index's column positions and asking `pg_get_indexdef` for each one
@@ -1348,15 +1444,15 @@ impl DatabaseAdapter for PostgresAdapter {
     fn fetch_table_page<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: TablePageRequest,
+        request: TablePageRequest,
     ) -> AdapterFuture<'a, Result<TablePage, QueryError>> {
         Box::pin(async move {
-            // Resolve the connection first so an unknown token still reports a
-            // connection error rather than a capability error.
-            let _ = self.connection_slot(connection)?;
-            Err(unsupported_error(
-                "table data browsing is not implemented in this slice",
-            ))
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+
+            ensure_scope_database(&guard.database, request.object.database.as_deref())?;
+            fetch_postgres_page(client, guard.default_schema.as_deref(), request).await
         })
     }
 

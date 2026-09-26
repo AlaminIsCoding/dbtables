@@ -8,8 +8,10 @@
 //! - Describe an object's columns and primary key using table-valued pragmas.
 //! - Execute a single SQL statement and return a normalized, capped result with
 //!   column metadata, rows, affected-row count, duration, and structured errors.
+//! - Fetch bounded, filtered, sorted pages of a table or view, reporting the
+//!   primary key as a safe row identity when the object has one.
 //!
-//! Table paging and staged changes arrive in later tasks and report
+//! Staged changes arrive in a later task and report
 //! [`ErrorCategory::Unsupported`] until then, so no write path is exposed and
 //! [`Self::capabilities`] reports only what the adapter can honor today.
 //!
@@ -42,6 +44,7 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::database::{
+    build_table_page_query, effective_sort_order, effective_table_page_limit, quote_identifier,
     AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId, ConnectionSecret,
     ConnectionState, ConnectionTest, ConstraintInfo, DatabaseAdapter, IndexInfo, ObjectKind,
     ObjectRef, ObjectScope, ScopeListing, TableDescription, TablePage, TablePageRequest,
@@ -499,6 +502,148 @@ fn execute_statement(
     Ok(result)
 }
 
+/// Reads a SQLite object's columns and primary key in ordinal/key order.
+///
+/// `pragma_table_info` accepts its table argument as a bound value, so the
+/// object name is never concatenated into SQL. A missing table or view is a
+/// validation error; a view reports columns with no primary key.
+fn sqlite_table_shape(
+    handle: &Connection,
+    object: &ObjectRef,
+) -> Result<(Vec<ColumnInfo>, Vec<String>), QueryError> {
+    let exists: i64 = handle
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE name = ?1 AND type IN ('table', 'view')",
+            [&object.name],
+            |row| row.get(0),
+        )
+        .map_err(map_error)?;
+
+    if exists == 0 {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!(
+                "`{}` is not a table or view in this SQLite database",
+                object.name
+            ),
+        ));
+    }
+
+    let mut statement = handle
+        .prepare(
+            "SELECT name, type, \"notnull\", pk \
+             FROM pragma_table_info(?1) ORDER BY cid",
+        )
+        .map_err(map_error)?;
+
+    let rows = statement
+        .query_map([&object.name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(map_error)?;
+
+    let mut columns = Vec::new();
+    let mut primary_key: Vec<(i64, String)> = Vec::new();
+    for row in rows {
+        let (name, type_name, not_null, pk) = row.map_err(map_error)?;
+        let type_name = if type_name.trim().is_empty() {
+            None
+        } else {
+            Some(type_name)
+        };
+        columns.push(ColumnInfo {
+            name: name.clone(),
+            type_name,
+            nullable: Some(not_null == 0),
+        });
+        if pk > 0 {
+            primary_key.push((pk, name));
+        }
+    }
+    primary_key.sort_by_key(|(position, _)| *position);
+    let primary_key_columns: Vec<String> =
+        primary_key.into_iter().map(|(_, name)| name).collect();
+
+    Ok((columns, primary_key_columns))
+}
+
+/// Fetches one bounded, filtered, sorted page from a SQLite table or view.
+///
+/// The projection is the object's known columns, filters/sorts are validated
+/// against them, and comparison values are bound as parameters. The primary key
+/// (when present) is appended to the ordering as a deterministic tie-breaker and
+/// reported as `row_identity`; an empty identity honestly signals that rows
+/// cannot be targeted safely.
+fn fetch_sqlite_page(
+    handle: &Connection,
+    request: TablePageRequest,
+) -> Result<TablePage, QueryError> {
+    let limit = effective_table_page_limit(request.limit)?;
+    let (columns, row_identity) = sqlite_table_shape(handle, &request.object)?;
+    let order = effective_sort_order(&request.sort, &row_identity);
+    let from = quote_identifier(&request.object.name);
+
+    // Ask for one row beyond the page so the loop below can tell whether a
+    // further page exists without a separate COUNT, which could scan the whole
+    // relation. The extra row is never returned; it only sets `truncated`.
+    let (sql, values) = build_table_page_query(
+        &from,
+        &columns,
+        &request.filters,
+        &order,
+        limit.saturating_add(1),
+        request.offset,
+        |_| "?".to_string(),
+        quote_identifier,
+    )?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // separate COUNT, which could scan the whole relation.
+    let mut statement = handle.prepare(&sql).map_err(map_error)?;
+    let parameters = bind_parameters(&values);
+    let mut cursor = statement
+        .query(rusqlite::params_from_iter(parameters.iter()))
+        .map_err(map_error)?;
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut truncated = false;
+    while let Some(row) = cursor.next().map_err(map_error)? {
+        if rows.len() >= limit as usize {
+            truncated = true;
+            break;
+        }
+        let mut cells = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            cells.push(cell_from_value_ref(row.get_ref(index).map_err(map_error)?));
+        }
+        rows.push(cells);
+    }
+
+    let next_offset = if truncated {
+        Some(request.offset + rows.len() as u64)
+    } else {
+        None
+    };
+
+    Ok(TablePage {
+        operation_id: request.operation_id,
+        columns,
+        rows,
+        row_identity,
+        offset: request.offset,
+        limit,
+        total_rows: None,
+        truncated,
+        next_offset,
+    })
+}
+
 impl DatabaseAdapter for SqliteAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Sqlite
@@ -644,66 +789,7 @@ impl DatabaseAdapter for SqliteAdapter {
     ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
         Box::pin(async move {
             self.with_connection(connection, |handle| {
-                let exists: i64 = handle
-                    .query_row(
-                        "SELECT COUNT(*) FROM sqlite_master \
-                         WHERE name = ?1 AND type IN ('table', 'view')",
-                        [&object.name],
-                        |row| row.get(0),
-                    )
-                    .map_err(map_error)?;
-
-                if exists == 0 {
-                    return Err(QueryError::new(
-                        ErrorCategory::Validation,
-                        format!(
-                            "`{}` is not a table or view in this SQLite database",
-                            object.name
-                        ),
-                    ));
-                }
-
-                // `pragma_table_info` accepts its table argument as a bound
-                // value, so the object name is never concatenated into SQL.
-                let mut statement = handle
-                    .prepare(
-                        "SELECT name, type, \"notnull\", pk \
-                         FROM pragma_table_info(?1) ORDER BY cid",
-                    )
-                    .map_err(map_error)?;
-
-                let rows = statement
-                    .query_map([&object.name], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })
-                    .map_err(map_error)?;
-
-                let mut columns = Vec::new();
-                let mut primary_key: Vec<(i64, String)> = Vec::new();
-                for row in rows {
-                    let (name, type_name, not_null, pk) = row.map_err(map_error)?;
-                    let type_name = if type_name.trim().is_empty() {
-                        None
-                    } else {
-                        Some(type_name)
-                    };
-                    columns.push(ColumnInfo {
-                        name: name.clone(),
-                        type_name,
-                        nullable: Some(not_null == 0),
-                    });
-                    if pk > 0 {
-                        primary_key.push((pk, name));
-                    }
-                }
-                primary_key.sort_by_key(|(position, _)| *position);
-                let primary_key_columns: Vec<String> =
-                    primary_key.into_iter().map(|(_, name)| name).collect();
+                let (columns, primary_key_columns) = sqlite_table_shape(handle, object)?;
 
                 // Indexes and constraints are reported as inspected lists, never
                 // as an empty success: SQLite always exposes `pragma_index_list`
@@ -743,14 +829,10 @@ impl DatabaseAdapter for SqliteAdapter {
     fn fetch_table_page<'a>(
         &'a self,
         connection: &'a ConnectionId,
-        _request: TablePageRequest,
+        request: TablePageRequest,
     ) -> AdapterFuture<'a, Result<TablePage, QueryError>> {
         Box::pin(async move {
-            self.with_connection(connection, |_| {
-                Err(unsupported_error(
-                    "table data browsing is not implemented in this slice",
-                ))
-            })
+            self.with_connection(connection, |handle| fetch_sqlite_page(handle, request))
         })
     }
 
@@ -844,8 +926,9 @@ mod fixture_tests {
 
     use super::SqliteAdapter;
     use crate::database::{
-        ChangeRequest, ConnectionId, ConnectionState, ConstraintKind, DatabaseAdapter, ObjectKind,
-        ObjectRef, ObjectScope, PendingChange, RowKey, TablePageRequest, TransactionId,
+        ChangeRequest, ConnectionId, ConnectionState, ConstraintKind, DatabaseAdapter,
+        FilterOperator, ObjectKind, ObjectRef, ObjectScope, PendingChange, RowKey, SortDirection,
+        SortKey, TableFilter, TablePageRequest, TransactionId, MAX_TABLE_PAGE_ROWS,
     };
     use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
@@ -1260,12 +1343,155 @@ mod fixture_tests {
             &connection,
             TablePageRequest::new("page-1", users_object(), 10),
         ))
-        .expect_err("table browsing belongs to a later slice");
-        assert_eq!(page.category, ErrorCategory::Unsupported);
+        .expect("table browsing is implemented for the read-only slice");
+        assert_eq!(page.row_identity, ["id"]);
+        assert_eq!(page.rows.len(), 3);
 
         let cancelled = block_on(adapter.cancel(&connection, &OperationId::new("op-select")))
             .expect_err("SQLite cancellation is unsupported");
         assert_eq!(cancelled.category, ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn fetch_table_page_pages_deterministically_with_a_row_identity() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let first = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("page-1", users_object(), 2).with_sort(vec![SortKey {
+                column: "name".to_string(),
+                direction: SortDirection::Descending,
+            }]),
+        ))
+        .expect("first page should succeed");
+
+        assert_eq!(first.operation_id.as_str(), "page-1");
+        let columns: Vec<&str> = first.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(columns, ["id", "name", "email", "balance", "team_id"]);
+        assert_eq!(first.row_identity, ["id"]);
+        assert_eq!(first.limit, 2);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.rows.len(), 2);
+        assert!(first.truncated);
+        assert_eq!(first.next_offset, Some(2));
+        assert_eq!(first.rows[0][1], CellValue::Text("carol".to_string()));
+        assert_eq!(first.rows[1][1], CellValue::Text("bob".to_string()));
+
+        let second = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("page-2", users_object(), 2)
+                .with_offset(2)
+                .with_sort(vec![SortKey {
+                    column: "name".to_string(),
+                    direction: SortDirection::Descending,
+                }]),
+        ))
+        .expect("second page should succeed");
+
+        assert_eq!(second.offset, 2);
+        assert_eq!(second.rows.len(), 1);
+        assert!(!second.truncated);
+        assert_eq!(second.next_offset, None);
+        assert_eq!(second.rows[0][1], CellValue::Text("alice".to_string()));
+    }
+
+    #[test]
+    fn fetch_table_page_binds_filters_and_rejects_unknown_identifiers() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let page = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("filter-1", users_object(), 10).with_filters(vec![
+                TableFilter {
+                    column: "name".to_string(),
+                    operator: FilterOperator::Like,
+                    values: vec![CellValue::Text("a%".to_string())],
+                },
+                TableFilter {
+                    column: "balance".to_string(),
+                    operator: FilterOperator::GreaterThan,
+                    values: vec![CellValue::Integer(10)],
+                },
+            ]),
+        ))
+        .expect("valid filters should succeed");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0][1], CellValue::Text("alice".to_string()));
+
+        let filter_error = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("filter-2", users_object(), 10).with_filters(vec![
+                TableFilter {
+                    column: "name = 'alice'".to_string(),
+                    operator: FilterOperator::Equal,
+                    values: vec![CellValue::Text("alice".to_string())],
+                },
+            ]),
+        ))
+        .expect_err("an unknown filter column must be rejected");
+        assert_eq!(filter_error.category, ErrorCategory::Validation);
+
+        let sort_error = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("sort-1", users_object(), 10).with_sort(vec![SortKey {
+                column: "id); DROP TABLE users; --".to_string(),
+                direction: SortDirection::Ascending,
+            }]),
+        ))
+        .expect_err("an unknown sort column must be rejected");
+        assert_eq!(sort_error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn fetch_table_page_reports_no_identity_for_a_view() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let view = ObjectRef {
+            database: None,
+            schema: None,
+            name: "active_users".to_string(),
+            kind: ObjectKind::View,
+        };
+        let page = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("view-page", view, 10),
+        ))
+        .expect("paging a view should succeed");
+
+        assert_eq!(page.rows.len(), 3);
+        assert!(
+            page.row_identity.is_empty(),
+            "a view has no safe row identity and must say so"
+        );
+        assert!(!page.has_row_identity());
+    }
+
+    #[test]
+    fn fetch_table_page_rejects_zero_and_clamps_large_limits() {
+        let fixture = TempDatabase::new();
+        let adapter = SqliteAdapter::new();
+        let connection = connected(&adapter, &fixture);
+
+        let zero = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("page-zero", users_object(), 0),
+        ))
+        .expect_err("a zero page size must be rejected");
+        assert_eq!(zero.category, ErrorCategory::Validation);
+
+        let clamped = block_on(adapter.fetch_table_page(
+            &connection,
+            TablePageRequest::new("page-clamped", users_object(), MAX_TABLE_PAGE_ROWS + 5),
+        ))
+        .expect("an oversized limit should be clamped, not rejected");
+        assert_eq!(clamped.limit, MAX_TABLE_PAGE_ROWS);
     }
 
     #[test]
