@@ -103,10 +103,12 @@ describe("getQueryCapabilities", () => {
     invokeMock.mockReset();
   });
 
-  it("invokes the query_capabilities command", async () => {
+  it("invokes the query_capabilities command for the connection", async () => {
     invokeMock.mockResolvedValue(capabilities);
 
-    await expect(getQueryCapabilities()).resolves.toEqual(capabilities);
-    expect(invokeMock).toHaveBeenCalledWith(QUERY_CAPABILITIES_COMMAND);
+    await expect(getQueryCapabilities("c1")).resolves.toEqual(capabilities);
+    expect(invokeMock).toHaveBeenCalledWith(QUERY_CAPABILITIES_COMMAND, {
+      connectionId: "c1",
+    });
   });
 });

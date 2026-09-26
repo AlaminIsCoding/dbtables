@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::application::table_data::{self, ChangeGroupResult};
-use crate::database::{ChangeRequest, ConnectionId, SqliteAdapter, TablePage, TablePageRequest};
+use crate::database::{ChangeRequest, ConnectionId, DatabaseState, TablePage, TablePageRequest};
 use crate::domain::QueryError;
 
 /// Fetches one bounded, filtered, sorted page of a table or view.
@@ -13,11 +13,12 @@ use crate::domain::QueryError;
 /// could establish, or none when the object has no safe identifier.
 #[tauri::command]
 pub async fn fetch_table_page(
-    adapter: State<'_, SqliteAdapter>,
+    state: State<'_, DatabaseState>,
     connection_id: ConnectionId,
     request: TablePageRequest,
 ) -> Result<TablePage, QueryError> {
-    table_data::fetch_table_page(&*adapter, &connection_id, request).await
+    let adapter = state.adapter_for(&connection_id)?;
+    table_data::fetch_table_page(adapter, &connection_id, request).await
 }
 
 /// Applies a batch of staged inserts/updates/deletes as one guarded group.
@@ -30,9 +31,10 @@ pub async fn fetch_table_page(
 /// identity) rejects with a `QueryError` before any row is written.
 #[tauri::command]
 pub async fn apply_table_changes(
-    adapter: State<'_, SqliteAdapter>,
+    state: State<'_, DatabaseState>,
     connection_id: ConnectionId,
     requests: Vec<ChangeRequest>,
 ) -> Result<ChangeGroupResult, QueryError> {
-    table_data::apply_changes(&*adapter, &connection_id, requests).await
+    let adapter = state.adapter_for(&connection_id)?;
+    table_data::apply_changes(adapter, &connection_id, requests).await
 }

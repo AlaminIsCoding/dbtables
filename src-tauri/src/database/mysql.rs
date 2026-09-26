@@ -45,12 +45,14 @@ use mysql::prelude::{Protocol, Queryable};
 use mysql::{Column, Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::database::{
-    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
-    conflict_columns, effective_sort_order, effective_table_page_limit,
-    quote_identifier_backtick, validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest,
-    ChangeResult, ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo,
-    ConstraintKind, DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange,
-    ScopeListing, TableDescription, TablePage, TablePageRequest, TransactionId,
+    build_delete_statement, build_filter_clause, build_insert_statement, build_table_page_query,
+    build_update_statement, conflict_columns, effective_sort_order, effective_table_page_limit,
+    quote_identifier_backtick, require_identifier, validate_default_expression,
+    validate_row_identity, validate_type_name, AdapterFuture, CancelOutcome, ChangeRequest,
+    ChangeResult, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
+    ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, ForeignKeyDefinition,
+    IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDefinition,
+    TableDescription, TableFilter, TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -797,6 +799,442 @@ fn apply_mysql_change(
     }
 }
 
+/// Executes a generated DDL statement, discarding any result set.
+fn execute_mysql_ddl(handle: &mut Conn, sql: &str) -> Result<(), QueryError> {
+    handle.query_drop(sql).map_err(map_error)
+}
+
+/// Renders a validated MySQL column definition for `CREATE`/`ALTER ... ADD`.
+fn render_mysql_column(column: &ColumnDefinition) -> Result<String, QueryError> {
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    validate_type_name(&column.type_name)?;
+
+    let mut sql = format!(
+        "{} {}",
+        quote_identifier_backtick(name),
+        column.type_name.trim()
+    );
+    if !column.nullable {
+        sql.push_str(" NOT NULL");
+    }
+    if let Some(default) = &column.default {
+        validate_default_expression(name, default)?;
+        sql.push_str(" DEFAULT ");
+        sql.push_str(default.trim());
+    }
+    Ok(sql)
+}
+
+/// Whether `columns` contains `name`, ignoring ASCII case.
+fn mysql_has_column(columns: &[ColumnInfo], name: &str) -> bool {
+    let target = name.trim();
+    columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(target))
+}
+
+/// Fully-qualified, backtick-quoted table reference for the resolved database.
+fn mysql_qualified(database: &str, table: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_identifier_backtick(database),
+        quote_identifier_backtick(table)
+    )
+}
+
+/// Renders a validated MySQL foreign-key clause.
+fn render_mysql_foreign_key(
+    handle: &mut Conn,
+    database: &str,
+    local_columns: &[ColumnInfo],
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<String, QueryError> {
+    if foreign_key.columns.is_empty()
+        || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a foreign key must pair the same number of local and referenced columns",
+        ));
+    }
+    if foreign_key.referenced_table.trim().is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a foreign key must name a referenced table",
+        ));
+    }
+    for column in &foreign_key.columns {
+        if !mysql_has_column(local_columns, column) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("foreign key names unknown column `{column}`"),
+            ));
+        }
+    }
+
+    // MySQL treats a schema as a database, so a referenced schema names the
+    // database to reference; it defaults to the table's own database.
+    let ref_database = foreign_key
+        .referenced_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(database);
+    let ref_table = foreign_key.referenced_table.trim();
+    let (ref_columns, _) = mysql_table_shape(handle, ref_database, ref_table)?;
+    for column in &foreign_key.referenced_columns {
+        if !mysql_has_column(&ref_columns, column) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("foreign key references unknown column `{column}` on `{ref_table}`"),
+            ));
+        }
+    }
+
+    let locals = foreign_key
+        .columns
+        .iter()
+        .map(|column| quote_identifier_backtick(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let referenced = foreign_key
+        .referenced_columns
+        .iter()
+        .map(|column| quote_identifier_backtick(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = mysql_qualified(ref_database, ref_table);
+
+    Ok(
+        match foreign_key
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => format!(
+                "CONSTRAINT {} FOREIGN KEY ({locals}) REFERENCES {target} ({referenced})",
+                quote_identifier_backtick(name)
+            ),
+            None => {
+                format!("FOREIGN KEY ({locals}) REFERENCES {target} ({referenced})")
+            }
+        },
+    )
+}
+
+/// Creates a table and returns a description built from the validated definition.
+fn create_mysql_table(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    definition: &TableDefinition,
+) -> Result<TableDescription, QueryError> {
+    if definition.object.kind != ObjectKind::Table {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "only base tables can be created",
+        ));
+    }
+    let database =
+        resolve_database(handle, default_database, definition.object.database.as_deref())?;
+    let table = definition.object.name.trim();
+    require_identifier(table, "table")?;
+    if definition.columns.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "a table definition requires at least one column",
+        ));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut primary_key: Option<String> = None;
+    let mut pieces: Vec<String> = Vec::with_capacity(
+        definition.columns.len() + 1 + definition.foreign_keys.len(),
+    );
+    let mut columns_info: Vec<ColumnInfo> = Vec::with_capacity(definition.columns.len());
+
+    for column in &definition.columns {
+        let name = column.name.trim();
+        require_identifier(name, "column")?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("table `{table}` defines column `{name}` more than once"),
+            ));
+        }
+        if column.primary_key {
+            if primary_key.is_some() {
+                return Err(QueryError::new(
+                    ErrorCategory::Validation,
+                    "a table may have at most one primary-key column in this slice",
+                ));
+            }
+            primary_key = Some(name.to_string());
+        }
+        pieces.push(render_mysql_column(column)?);
+        columns_info.push(ColumnInfo {
+            name: name.to_string(),
+            type_name: Some(column.type_name.trim().to_string()),
+            nullable: Some(column.nullable),
+        });
+    }
+
+    for foreign_key in &definition.foreign_keys {
+        pieces.push(render_mysql_foreign_key(
+            handle,
+            &database,
+            &columns_info,
+            foreign_key,
+        )?);
+    }
+    if let Some(primary_key) = &primary_key {
+        pieces.push(format!(
+            "PRIMARY KEY ({})",
+            quote_identifier_backtick(primary_key)
+        ));
+    }
+
+    let sql = format!(
+        "CREATE TABLE {} ({})",
+        mysql_qualified(&database, table),
+        pieces.join(", ")
+    );
+    execute_mysql_ddl(handle, &sql)?;
+
+    Ok(TableDescription::new(
+        columns_info,
+        primary_key.into_iter().collect(),
+    ))
+}
+
+/// Drops a base table, honoring `cascade` where the engine accepts it.
+fn drop_mysql_table(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    cascade: bool,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    require_identifier(&object.name, "table")?;
+    let suffix = if cascade { " CASCADE" } else { "" };
+    let sql = format!(
+        "DROP TABLE {}{suffix}",
+        mysql_qualified(&database, object.name.trim())
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Adds a column to an existing table.
+fn add_mysql_column(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    column: &ColumnDefinition,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    if mysql_has_column(&columns, name) {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` already has a column `{name}`", object.name),
+        ));
+    }
+    if column.primary_key {
+        return Err(unsupported_error(
+            "MySQL cannot add a primary-key column to an existing table in this slice",
+        ));
+    }
+    let definition = render_mysql_column(column)?;
+    let sql = format!(
+        "ALTER TABLE {} ADD COLUMN {definition}",
+        mysql_qualified(&database, &object.name)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Renames a column on an existing table (MySQL 8 `RENAME COLUMN`).
+fn rename_mysql_column(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    from: &str,
+    to: &str,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let from = from.trim();
+    let to = to.trim();
+    require_identifier(from, "column")?;
+    require_identifier(to, "column")?;
+    if !mysql_has_column(&columns, from) {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` has no column `{from}`", object.name),
+        ));
+    }
+    if mysql_has_column(&columns, to) && !from.eq_ignore_ascii_case(to) {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` already has a column `{to}`", object.name),
+        ));
+    }
+    let sql = format!(
+        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+        mysql_qualified(&database, &object.name),
+        quote_identifier_backtick(from),
+        quote_identifier_backtick(to)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Drops a column from an existing table.
+fn drop_mysql_column(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    column: &str,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let column = column.trim();
+    require_identifier(column, "column")?;
+    if !mysql_has_column(&columns, column) {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` has no column `{column}`", object.name),
+        ));
+    }
+    let sql = format!(
+        "ALTER TABLE {} DROP COLUMN {}",
+        mysql_qualified(&database, &object.name),
+        quote_identifier_backtick(column)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Adds a foreign-key constraint to an existing table.
+fn add_mysql_foreign_key(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let clause = render_mysql_foreign_key(handle, &database, &columns, foreign_key)?;
+    let sql = format!(
+        "ALTER TABLE {} ADD {clause}",
+        mysql_qualified(&database, &object.name)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Drops a named foreign-key constraint from an existing table.
+fn drop_mysql_foreign_key(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let name = name.trim();
+    require_identifier(name, "constraint")?;
+    let sql = format!(
+        "ALTER TABLE {} DROP FOREIGN KEY {}",
+        mysql_qualified(&database, &object.name),
+        quote_identifier_backtick(name)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Creates an index on one or more validated columns of a table.
+fn create_mysql_index(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+    columns: &[String],
+    unique: bool,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (table_columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    if columns.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            "an index requires at least one column",
+        ));
+    }
+    let mut quoted = Vec::with_capacity(columns.len());
+    for column in columns {
+        let column = column.trim();
+        if !mysql_has_column(&table_columns, column) {
+            return Err(QueryError::new(
+                ErrorCategory::Validation,
+                format!("index names unknown column `{column}`"),
+            ));
+        }
+        quoted.push(quote_identifier_backtick(column));
+    }
+    let unique = if unique { "UNIQUE " } else { "" };
+    let sql = format!(
+        "CREATE {unique}INDEX {} ON {} ({})",
+        quote_identifier_backtick(name),
+        mysql_qualified(&database, &object.name),
+        quoted.join(", ")
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Drops an index by name from its table.
+fn drop_mysql_index(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    let sql = format!(
+        "DROP INDEX {} ON {}",
+        quote_identifier_backtick(name),
+        mysql_qualified(&database, &object.name)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Counts a table's rows with the same validated filter clause as paging.
+fn count_mysql_rows(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    filters: &[TableFilter],
+) -> Result<u64, QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let (columns, _) = mysql_table_shape(handle, &database, &object.name)?;
+    let (where_clause, values) = build_filter_clause(
+        filters,
+        &columns,
+        |_| "?".to_string(),
+        quote_identifier_backtick,
+    )?;
+
+    let mut sql = format!("SELECT COUNT(*) FROM {}", mysql_qualified(&database, &object.name));
+    if !where_clause.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+
+    let parameters: Vec<Value> = values.iter().map(cell_to_value).collect();
+    let count: Option<i64> = handle.exec_first(&sql, parameters).map_err(map_error)?;
+    Ok(count.unwrap_or(0).max(0) as u64)
+}
+
 impl DatabaseAdapter for MySqlAdapter {
     fn engine(&self) -> EngineId {
         EngineId::MySql
@@ -836,6 +1274,31 @@ impl DatabaseAdapter for MySqlAdapter {
                 engine: EngineId::MySql,
                 server_version: version,
             })
+        })
+    }
+
+    fn list_databases<'a>(
+        &'a self,
+        descriptor: &'a ConnectionDescriptor,
+        secret: Option<&'a ConnectionSecret>,
+    ) -> AdapterFuture<'a, Result<Vec<String>, QueryError>> {
+        Box::pin(async move {
+            let server = mysql_server(descriptor)?;
+            let opts = build_opts(server, secret)?;
+            let mut handle = Conn::new(opts).map_err(map_error)?;
+            // Server-level listing: opens an ephemeral connection (no database
+            // selected) and filters the engine's own schemas so a picker shows
+            // only user databases. The handle is dropped at the end of the block.
+            let rows: Vec<(String,)> = handle
+                .exec(
+                    "SELECT SCHEMA_NAME FROM information_schema.schemata \
+                     WHERE SCHEMA_NAME NOT IN \
+                     ('information_schema', 'mysql', 'performance_schema', 'sys') \
+                     ORDER BY SCHEMA_NAME",
+                    (),
+                )
+                .map_err(map_error)?;
+            Ok(rows.into_iter().map(|(name,)| name).collect())
         })
     }
 
@@ -1101,6 +1564,138 @@ impl DatabaseAdapter for MySqlAdapter {
         Box::pin(async move {
             self.with_connection(connection, |handle, database| {
                 apply_mysql_change(handle, database, request)
+            })
+        })
+    }
+
+    fn create_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        definition: &'a TableDefinition,
+    ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                create_mysql_table(handle, database, definition)
+            })
+        })
+    }
+
+    fn drop_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        cascade: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                drop_mysql_table(handle, database, object, cascade)
+            })
+        })
+    }
+
+    fn add_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a ColumnDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                add_mysql_column(handle, database, object, column)
+            })
+        })
+    }
+
+    fn rename_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        from: &'a str,
+        to: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                rename_mysql_column(handle, database, object, from, to)
+            })
+        })
+    }
+
+    fn drop_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                drop_mysql_column(handle, database, object, column)
+            })
+        })
+    }
+
+    fn add_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        foreign_key: &'a ForeignKeyDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                add_mysql_foreign_key(handle, database, object, foreign_key)
+            })
+        })
+    }
+
+    fn drop_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                drop_mysql_foreign_key(handle, database, object, name)
+            })
+        })
+    }
+
+    fn create_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+        columns: &'a [String],
+        unique: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                create_mysql_index(handle, database, object, name, columns, unique)
+            })
+        })
+    }
+
+    fn drop_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                drop_mysql_index(handle, database, object, name)
+            })
+        })
+    }
+
+    fn count_table_rows<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        filters: &'a [TableFilter],
+    ) -> AdapterFuture<'a, Result<u64, QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                count_mysql_rows(handle, database, object, filters)
             })
         })
     }
@@ -1469,9 +2064,10 @@ mod integration_tests {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
-    use super::MySqlAdapter;
+    use super::{mysql_has_column, mysql_qualified, render_mysql_column, MySqlAdapter};
     use crate::database::{
-        ConnectionId, ConnectionSecret, ConnectionState, DatabaseAdapter, ObjectScope,
+        ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState, DatabaseAdapter,
+        ObjectScope,
     };
     use crate::domain::connection::{ServerConnection, TlsMode};
     use crate::domain::{
@@ -1603,5 +2199,48 @@ mod integration_tests {
                 .category,
             ErrorCategory::Connection
         );
+    }
+
+    #[test]
+    fn render_mysql_column_quotes_names_and_rejects_unsafe_text() {
+        let mut column = ColumnDefinition::new("n`ame", "VARCHAR(255)");
+        column.nullable = false;
+        column.default = Some("CURRENT_TIMESTAMP".to_string());
+        assert_eq!(
+            render_mysql_column(&column).expect("valid column"),
+            "`n``ame` VARCHAR(255) NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        );
+
+        let unsafe_default = ColumnDefinition {
+            default: Some("0; DROP TABLE users".to_string()),
+            ..ColumnDefinition::new("status", "INTEGER")
+        };
+        assert_eq!(
+            render_mysql_column(&unsafe_default)
+                .expect_err("unsafe default must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let unsafe_type = ColumnDefinition::new("x", "INTEGER; DROP TABLE users");
+        assert_eq!(
+            render_mysql_column(&unsafe_type)
+                .expect_err("unsafe type must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn mysql_qualified_and_column_matching_are_exact_enough() {
+        assert_eq!(mysql_qualified("app", "users"), "`app`.`users`");
+
+        let columns = vec![crate::domain::ColumnInfo {
+            name: "Id".to_string(),
+            type_name: Some("INTEGER".to_string()),
+            nullable: Some(false),
+        }];
+        assert!(mysql_has_column(&columns, "id"));
+        assert!(!mysql_has_column(&columns, "name"));
     }
 }

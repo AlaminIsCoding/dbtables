@@ -195,9 +195,9 @@ export function useQuerySession(options?: UseQuerySessionOptions): QuerySession 
     }
   }, []);
 
-  const loadCapabilities = useCallback(async () => {
+  const loadCapabilities = useCallback(async (connectionId: string) => {
     try {
-      setCapabilities(await getQueryCapabilities());
+      setCapabilities(await getQueryCapabilities(connectionId));
     } catch {
       // Capability discovery is best-effort: an unknown adapter must never
       // advertise a feature, so fall back to "nothing supported".
@@ -243,7 +243,7 @@ export function useQuerySession(options?: UseQuerySessionOptions): QuerySession 
       }
     })();
 
-    void loadCapabilities();
+    void loadCapabilities(externalConnectionId);
   }, [external, externalConnectionId, loadCapabilities]);
 
   const openDatabase = useCallback(
@@ -293,7 +293,7 @@ export function useQuerySession(options?: UseQuerySessionOptions): QuerySession 
           filePath: trimmed,
           objects: { status: "loading" },
         });
-        await Promise.all([loadObjects(connectionId), loadCapabilities()]);
+        await Promise.all([loadObjects(connectionId), loadCapabilities(connectionId)]);
       } catch (error) {
         connectionIdRef.current = null;
         setInternalConnection({ status: "error", error: toQueryError(error) });

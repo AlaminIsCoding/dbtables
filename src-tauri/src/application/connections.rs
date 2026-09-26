@@ -63,6 +63,20 @@ pub async fn test_connection(
     adapter.test_connection(descriptor, secret).await
 }
 
+/// Lists the databases a server descriptor exposes.
+///
+/// Server-level and connection-less: an adapter may open an ephemeral
+/// connection, list, and close it. Engines with a single fixed database return
+/// an `unsupported` error, which callers surface as "no picker".
+pub async fn list_databases(
+    adapter: &dyn DatabaseAdapter,
+    descriptor: &ConnectionDescriptor,
+    secret: Option<&ConnectionSecret>,
+) -> Result<Vec<String>, QueryError> {
+    ensure_engine(adapter, descriptor)?;
+    adapter.list_databases(descriptor, secret).await
+}
+
 /// Opens a connection and returns its opaque handle.
 pub async fn connect(
     adapter: &dyn DatabaseAdapter,

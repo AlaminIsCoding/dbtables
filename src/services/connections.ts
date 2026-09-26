@@ -16,6 +16,7 @@ export const SAVE_CONNECTION_PROFILE_COMMAND = "save_connection_profile";
 export const DELETE_CONNECTION_PROFILE_COMMAND = "delete_connection_profile";
 export const TEST_CONNECTION_PROFILE_COMMAND = "test_connection_profile";
 export const CONNECT_PROFILE_COMMAND = "connect_profile";
+export const LIST_PROFILE_DATABASES_COMMAND = "list_profile_databases";
 
 /**
  * Submitted profile fields for a create/update or a connection test.
@@ -118,4 +119,18 @@ export async function testConnectionProfile(
  */
 export async function connectProfile(profileId: string): Promise<string> {
   return invoke<string>(CONNECT_PROFILE_COMMAND, { profileId });
+}
+
+/**
+ * Lists the databases a server profile can address.
+ *
+ * Server-level and asked before a database is chosen, so it takes the same
+ * write-only input as a test: a supplied password wins, otherwise the saved
+ * secret for `input.id` is used. Engines with a single fixed database reject
+ * with an `unsupported` error, which callers treat as "no picker".
+ */
+export async function listProfileDatabases(
+  input: ConnectionProfileInput,
+): Promise<string[]> {
+  return invoke<string[]>(LIST_PROFILE_DATABASES_COMMAND, { input });
 }

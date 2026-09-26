@@ -42,11 +42,13 @@ use crate::domain::{
 pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
+pub mod state;
 pub mod testing;
 
 pub use mysql::MySqlAdapter;
 pub use postgres::PostgresAdapter;
 pub use sqlite::SqliteAdapter;
+pub use state::DatabaseState;
 
 /// Future returned by every adapter operation.
 ///
@@ -803,6 +805,73 @@ pub fn quote_identifier_backtick(identifier: &str) -> String {
     }
     quoted.push('`');
     quoted
+}
+
+/// Rejects an empty identifier.
+///
+/// Identifiers are still quoted by the adapter ([`quote_identifier`] /
+/// [`quote_identifier_backtick`]), so this is a readability guard rather than
+/// the injection defense.
+pub fn require_identifier(value: &str, what: &str) -> Result<(), QueryError> {
+    if value.trim().is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("a {what} name must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+/// Confirms a SQL type text is a simple, safe type declaration.
+///
+/// Only letters, digits, whitespace, underscores, parentheses, and commas are
+/// allowed, which covers engine type text such as `VARCHAR(255)`,
+/// `NUMERIC(10, 2)`, or `DOUBLE PRECISION` while rejecting statement
+/// punctuation.
+pub fn validate_type_name(type_name: &str) -> Result<(), QueryError> {
+    let type_name = type_name.trim();
+    if type_name.is_empty()
+        || !type_name.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '_'
+                || character.is_ascii_whitespace()
+                || character == '('
+                || character == ')'
+                || character == ','
+        })
+    {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("`{type_name}` is not a valid SQL type name"),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a default expression that could terminate or comment out a clause.
+///
+/// The default is engine SQL text (for example `CURRENT_TIMESTAMP` or `0`), so
+/// it is the one DDL field that is not an identifier. A statement terminator or
+/// comment marker would let caller text escape the column clause, so both are
+/// rejected before any statement is built.
+pub fn validate_default_expression(
+    column: &str,
+    default: &str,
+) -> Result<(), QueryError> {
+    let default = default.trim();
+    if default.is_empty() {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("column `{column}` has an empty default expression"),
+        ));
+    }
+    if default.contains(';') || default.contains("--") || default.contains("/*") {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("column `{column}` has an unsafe default expression"),
+        ));
+    }
+    Ok(())
 }
 
 /// SQL keyword for a sort direction.
@@ -1811,6 +1880,27 @@ pub trait DatabaseAdapter: Send + Sync {
             ))
         })
     }
+
+    /// Lists the databases (catalogs) a server exposes for a descriptor.
+    ///
+    /// This is a server-level question asked *before* a database is chosen, so
+    /// it deliberately takes a descriptor and secret rather than a
+    /// [`ConnectionId`]: an adapter may open an ephemeral connection, list, and
+    /// close it. Engines with a single fixed database (SQLite) return
+    /// [`ErrorCategory::Unsupported`] so the UI omits the picker instead of
+    /// showing one invented name.
+    fn list_databases<'a>(
+        &'a self,
+        _descriptor: &'a ConnectionDescriptor,
+        _secret: Option<&'a ConnectionSecret>,
+    ) -> AdapterFuture<'a, Result<Vec<String>, QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support listing databases",
+            ))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1819,8 +1909,9 @@ mod tests {
         build_delete_statement, build_filter_clause, build_insert_statement, build_order_clause,
         build_table_page_query, build_update_statement, column_position, conflict_columns,
         effective_sort_order, effective_table_page_limit, quote_identifier,
-        quote_identifier_backtick, sort_direction_sql, validate_filter_values,
-        validate_pending_change, validate_row_identity, CancelOutcome, ChangeOutcome, ChangeRequest,
+        quote_identifier_backtick, require_identifier, sort_direction_sql,
+        validate_default_expression, validate_filter_values, validate_pending_change,
+        validate_row_identity, validate_type_name, CancelOutcome, ChangeOutcome, ChangeRequest,
         ChangeResult, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
         ConstraintInfo, FilterOperator, ForeignKeyDefinition, IndexInfo, ObjectKind, ObjectRef,
         PendingChange, RowIdentity, RowKey, ScopeListing, SortDirection, SortKey, TableDefinition,
@@ -2585,5 +2676,43 @@ mod tests {
 
         let keys_only = RowIdentity::key("id", CellValue::Integer(1));
         assert_eq!(conflict_columns(&keys_only), ["id"]);
+    }
+
+    #[test]
+    fn require_identifier_rejects_only_empty_names() {
+        assert!(require_identifier("users", "table").is_ok());
+        // Quoting is the injection defense, so unusual-but-nonempty names pass.
+        assert!(require_identifier("weird name", "column").is_ok());
+
+        let error = require_identifier("   ", "table").expect_err("blank must fail");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn validate_type_name_allows_ordinary_types_and_rejects_punctuation() {
+        for type_name in ["INTEGER", "VARCHAR(255)", "NUMERIC(10, 2)", "DOUBLE PRECISION"] {
+            assert!(
+                validate_type_name(type_name).is_ok(),
+                "{type_name} should be valid"
+            );
+        }
+
+        for type_name in ["INTEGER; DROP TABLE users", "text--comment", "text/*x*/", ""] {
+            let error = validate_type_name(type_name)
+                .expect_err("unsafe type text must be rejected");
+            assert_eq!(error.category, ErrorCategory::Validation);
+        }
+    }
+
+    #[test]
+    fn validate_default_expression_rejects_terminators_and_comments() {
+        assert!(validate_default_expression("status", "0").is_ok());
+        assert!(validate_default_expression("created", "CURRENT_TIMESTAMP").is_ok());
+
+        for default in ["1; DROP TABLE users", "0 -- x", "0 /* x */", "  "] {
+            let error = validate_default_expression("status", default)
+                .expect_err("unsafe default must be rejected");
+            assert_eq!(error.category, ErrorCategory::Validation);
+        }
     }
 }

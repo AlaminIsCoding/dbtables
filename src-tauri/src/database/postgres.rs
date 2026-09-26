@@ -67,12 +67,14 @@ use tokio_postgres::tls::{MakeTlsConnect, TlsConnect};
 use tokio_postgres::{Client, Column, Config, NoTls, Socket};
 
 use crate::database::{
-    build_delete_statement, build_insert_statement, build_table_page_query, build_update_statement,
-    conflict_columns, effective_sort_order, effective_table_page_limit, quote_identifier,
-    validate_row_identity, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult, ConnectionId,
-    ConnectionSecret, ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind,
-    DatabaseAdapter, IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing,
-    TableDescription, TablePage, TablePageRequest, TransactionId,
+    build_delete_statement, build_filter_clause, build_insert_statement, build_table_page_query,
+    build_update_statement, conflict_columns, effective_sort_order, effective_table_page_limit,
+    quote_identifier, require_identifier, validate_default_expression, validate_row_identity,
+    validate_type_name, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult,
+    ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest,
+    ConstraintInfo, ConstraintKind, DatabaseAdapter, ForeignKeyDefinition, IndexInfo, ObjectKind,
+    ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDefinition, TableDescription,
+    TableFilter, TablePage, TablePageRequest, TransactionId,
 };
 use crate::domain::{
     CellValue, ColumnInfo, ConnectionDescriptor, EngineCapabilities, EngineId, ErrorCategory,
@@ -1231,6 +1233,410 @@ async fn apply_postgres_change(
     }
 }
 
+/// Renders a validated PostgreSQL column definition for `CREATE`/`ALTER ... ADD`.
+fn render_postgres_column(column: &ColumnDefinition) -> Result<String, QueryError> {
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    validate_type_name(&column.type_name)?;
+
+    let mut sql = format!("{} {}", quote_identifier(name), column.type_name.trim());
+    if !column.nullable {
+        sql.push_str(" NOT NULL");
+    }
+    if let Some(default) = &column.default {
+        validate_default_expression(name, default)?;
+        sql.push_str(" DEFAULT ");
+        sql.push_str(default.trim());
+    }
+    Ok(sql)
+}
+
+/// Whether `columns` contains `name`, ignoring ASCII case.
+fn postgres_has_column(columns: &[ColumnInfo], name: &str) -> bool {
+    let target = name.trim();
+    columns
+        .iter()
+        .any(|column| column.name.eq_ignore_ascii_case(target))
+}
+
+/// Schema-qualified, double-quoted reference used in generated statements.
+fn postgres_qualified(schema: &str, name: &str) -> String {
+    format!("{}.{}", quote_identifier(schema), quote_identifier(name))
+}
+
+/// Renders a validated PostgreSQL foreign-key clause.
+async fn render_postgres_foreign_key(
+    client: &Client,
+    schema: &str,
+    local_columns: &[ColumnInfo],
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<String, QueryError> {
+    if foreign_key.columns.is_empty()
+        || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+    {
+        return Err(validation_error(
+            "a foreign key must pair the same number of local and referenced columns",
+        ));
+    }
+    if foreign_key.referenced_table.trim().is_empty() {
+        return Err(validation_error(
+            "a foreign key must name a referenced table",
+        ));
+    }
+    for column in &foreign_key.columns {
+        if !postgres_has_column(local_columns, column) {
+            return Err(validation_error(format!(
+                "foreign key names unknown column `{column}`"
+            )));
+        }
+    }
+
+    // PostgreSQL exposes schemas, so a referenced schema names the schema that
+    // holds the referenced table; it defaults to the local table's schema.
+    let ref_schema = foreign_key
+        .referenced_schema
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(schema);
+    let ref_table = foreign_key.referenced_table.trim();
+    let (ref_columns, _) = postgres_table_shape(client, ref_schema, ref_table).await?;
+    for column in &foreign_key.referenced_columns {
+        if !postgres_has_column(&ref_columns, column) {
+            return Err(validation_error(format!(
+                "foreign key references unknown column `{column}` on `{ref_table}`"
+            )));
+        }
+    }
+
+    let locals = foreign_key
+        .columns
+        .iter()
+        .map(|column| quote_identifier(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let referenced = foreign_key
+        .referenced_columns
+        .iter()
+        .map(|column| quote_identifier(column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = postgres_qualified(ref_schema, ref_table);
+
+    Ok(
+        match foreign_key
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => format!(
+                "CONSTRAINT {} FOREIGN KEY ({locals}) REFERENCES {target} ({referenced})",
+                quote_identifier(name)
+            ),
+            None => format!("FOREIGN KEY ({locals}) REFERENCES {target} ({referenced})"),
+        },
+    )
+}
+
+/// Creates a table and returns a description built from the validated definition.
+async fn create_postgres_table(
+    client: &Client,
+    default_schema: Option<&str>,
+    definition: &TableDefinition,
+) -> Result<TableDescription, QueryError> {
+    if definition.object.kind != ObjectKind::Table {
+        return Err(validation_error("only base tables can be created"));
+    }
+    let schema = resolve_schema(default_schema, definition.object.schema.as_deref())?;
+    let table = definition.object.name.trim();
+    require_identifier(table, "table")?;
+    if definition.columns.is_empty() {
+        return Err(validation_error(
+            "a table definition requires at least one column",
+        ));
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut primary_key: Option<String> = None;
+    let mut pieces: Vec<String> =
+        Vec::with_capacity(definition.columns.len() + 1 + definition.foreign_keys.len());
+    let mut columns_info: Vec<ColumnInfo> = Vec::with_capacity(definition.columns.len());
+
+    for column in &definition.columns {
+        let name = column.name.trim();
+        require_identifier(name, "column")?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(validation_error(format!(
+                "table `{table}` defines column `{name}` more than once"
+            )));
+        }
+        if column.primary_key {
+            if primary_key.is_some() {
+                return Err(validation_error(
+                    "a table may have at most one primary-key column in this slice",
+                ));
+            }
+            primary_key = Some(name.to_string());
+        }
+        pieces.push(render_postgres_column(column)?);
+        columns_info.push(ColumnInfo {
+            name: name.to_string(),
+            type_name: Some(column.type_name.trim().to_string()),
+            nullable: Some(column.nullable),
+        });
+    }
+
+    for foreign_key in &definition.foreign_keys {
+        pieces.push(render_postgres_foreign_key(client, &schema, &columns_info, foreign_key).await?);
+    }
+    if let Some(primary_key) = &primary_key {
+        pieces.push(format!("PRIMARY KEY ({})", quote_identifier(primary_key)));
+    }
+
+    let sql = format!(
+        "CREATE TABLE {} ({})",
+        postgres_qualified(&schema, table),
+        pieces.join(", ")
+    );
+    client.batch_execute(&sql).await.map_err(map_error)?;
+
+    Ok(TableDescription::new(
+        columns_info,
+        primary_key.into_iter().collect(),
+    ))
+}
+
+/// Drops a base table, honoring `cascade` where requested.
+async fn drop_postgres_table(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    cascade: bool,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    require_identifier(&object.name, "table")?;
+    let suffix = if cascade { " CASCADE" } else { "" };
+    let sql = format!(
+        "DROP TABLE {}{suffix}",
+        postgres_qualified(&schema, object.name.trim())
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Adds a column to an existing table.
+async fn add_postgres_column(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    column: &ColumnDefinition,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let name = column.name.trim();
+    require_identifier(name, "column")?;
+    if postgres_has_column(&columns, name) {
+        return Err(validation_error(format!(
+            "table `{}` already has a column `{name}`",
+            object.name
+        )));
+    }
+    if column.primary_key {
+        return Err(unsupported_error(
+            "PostgreSQL cannot add a primary-key column to an existing table in this slice",
+        ));
+    }
+    let definition = render_postgres_column(column)?;
+    let sql = format!(
+        "ALTER TABLE {} ADD COLUMN {definition}",
+        postgres_qualified(&schema, &object.name)
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Renames a column on an existing table.
+async fn rename_postgres_column(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    from: &str,
+    to: &str,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let from = from.trim();
+    let to = to.trim();
+    require_identifier(from, "column")?;
+    require_identifier(to, "column")?;
+    if !postgres_has_column(&columns, from) {
+        return Err(validation_error(format!(
+            "table `{}` has no column `{from}`",
+            object.name
+        )));
+    }
+    if postgres_has_column(&columns, to) && !from.eq_ignore_ascii_case(to) {
+        return Err(validation_error(format!(
+            "table `{}` already has a column `{to}`",
+            object.name
+        )));
+    }
+    let sql = format!(
+        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+        postgres_qualified(&schema, &object.name),
+        quote_identifier(from),
+        quote_identifier(to)
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Drops a column from an existing table.
+async fn drop_postgres_column(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    column: &str,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let column = column.trim();
+    require_identifier(column, "column")?;
+    if !postgres_has_column(&columns, column) {
+        return Err(validation_error(format!(
+            "table `{}` has no column `{column}`",
+            object.name
+        )));
+    }
+    let sql = format!(
+        "ALTER TABLE {} DROP COLUMN {}",
+        postgres_qualified(&schema, &object.name),
+        quote_identifier(column)
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Adds a foreign-key constraint to an existing table.
+async fn add_postgres_foreign_key(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    foreign_key: &ForeignKeyDefinition,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let clause = render_postgres_foreign_key(client, &schema, &columns, foreign_key).await?;
+    let sql = format!(
+        "ALTER TABLE {} ADD {clause}",
+        postgres_qualified(&schema, &object.name)
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Drops a named constraint from an existing table.
+async fn drop_postgres_foreign_key(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let name = name.trim();
+    require_identifier(name, "constraint")?;
+    let sql = format!(
+        "ALTER TABLE {} DROP CONSTRAINT {}",
+        postgres_qualified(&schema, &object.name),
+        quote_identifier(name)
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Creates an index on one or more validated columns of a table.
+async fn create_postgres_index(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+    columns: &[String],
+    unique: bool,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (table_columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    if columns.is_empty() {
+        return Err(validation_error("an index requires at least one column"));
+    }
+    let mut quoted = Vec::with_capacity(columns.len());
+    for column in columns {
+        let column = column.trim();
+        if !postgres_has_column(&table_columns, column) {
+            return Err(validation_error(format!(
+                "index names unknown column `{column}`"
+            )));
+        }
+        quoted.push(quote_identifier(column));
+    }
+    let unique = if unique { "UNIQUE " } else { "" };
+    let sql = format!(
+        "CREATE {unique}INDEX {} ON {} ({})",
+        quote_identifier(name),
+        postgres_qualified(&schema, &object.name),
+        quoted.join(", ")
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Drops an index by name from the object's schema.
+async fn drop_postgres_index(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    name: &str,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let name = name.trim();
+    require_identifier(name, "index")?;
+    let sql = format!("DROP INDEX {}", postgres_qualified(&schema, name));
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
+/// Counts a table's rows with the same validated filter clause as paging.
+async fn count_postgres_rows(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    filters: &[TableFilter],
+) -> Result<u64, QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let (where_clause, values) = build_filter_clause(
+        filters,
+        &columns,
+        |position| format!("${position}"),
+        quote_identifier,
+    )?;
+
+    let mut sql = format!(
+        "SELECT COUNT(*) FROM {}",
+        postgres_qualified(&schema, &object.name)
+    );
+    if !where_clause.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    }
+
+    let parameters: Vec<PgParameter> = values.into_iter().map(PgParameter).collect();
+    let parameter_refs: Vec<&(dyn ToSql + Sync)> = parameters
+        .iter()
+        .map(|parameter| parameter as &(dyn ToSql + Sync))
+        .collect();
+    let row = client
+        .query_one(&sql, &parameter_refs)
+        .await
+        .map_err(map_error)?;
+    let count: i64 = row.try_get(0).map_err(map_error)?;
+    Ok(count.max(0) as u64)
+}
+
 impl DatabaseAdapter for PostgresAdapter {
     fn engine(&self) -> EngineId {
         EngineId::Postgres
@@ -1271,6 +1677,66 @@ impl DatabaseAdapter for PostgresAdapter {
                 engine: EngineId::Postgres,
                 server_version: version,
             })
+        })
+    }
+
+    fn list_databases<'a>(
+        &'a self,
+        descriptor: &'a ConnectionDescriptor,
+        secret: Option<&'a ConnectionSecret>,
+    ) -> AdapterFuture<'a, Result<Vec<String>, QueryError>> {
+        Box::pin(async move {
+            let server = postgres_server(descriptor)?;
+            let requested = server
+                .database
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+
+            // A PostgreSQL connection is bound to one database, so listing the
+            // server's databases needs a reachable bootstrap database. Try the
+            // conventional maintenance databases first, then the descriptor's
+            // own database, then the driver default (the login role's name).
+            let mut candidates: Vec<Option<String>> = vec![
+                Some("postgres".to_string()),
+                Some("template1".to_string()),
+            ];
+            if let Some(name) = requested {
+                if name != "postgres" && name != "template1" {
+                    candidates.push(Some(name.to_string()));
+                }
+            }
+            candidates.push(None);
+
+            let mut last_error: Option<QueryError> = None;
+            for candidate in candidates {
+                let mut scoped = server.clone();
+                scoped.database = candidate;
+
+                match open_writable(&scoped, secret).await {
+                    Ok((client, _database, _schema)) => {
+                        let rows = client
+                            .query(
+                                "SELECT datname FROM pg_database \
+                                 WHERE NOT datistemplate AND datallowconn \
+                                 ORDER BY datname",
+                                &[],
+                            )
+                            .await
+                            .map_err(map_error)?;
+                        let mut names = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            names.push(row.try_get::<_, String>(0).map_err(map_error)?);
+                        }
+                        return Ok(names);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                configuration_error("a PostgreSQL database is required to list databases")
+            }))
         })
     }
 
@@ -1574,6 +2040,157 @@ impl DatabaseAdapter for PostgresAdapter {
             let client = connected_client(&guard, connection)?;
             ensure_scope_database(&guard.database, request.object.database.as_deref())?;
             apply_postgres_change(client, guard.default_schema.as_deref(), request).await
+        })
+    }
+
+    fn create_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        definition: &'a TableDefinition,
+    ) -> AdapterFuture<'a, Result<TableDescription, QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            create_postgres_table(client, guard.default_schema.as_deref(), definition).await
+        })
+    }
+
+    fn drop_table<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        cascade: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            drop_postgres_table(client, guard.default_schema.as_deref(), object, cascade).await
+        })
+    }
+
+    fn add_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a ColumnDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            add_postgres_column(client, guard.default_schema.as_deref(), object, column).await
+        })
+    }
+
+    fn rename_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        from: &'a str,
+        to: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            rename_postgres_column(client, guard.default_schema.as_deref(), object, from, to).await
+        })
+    }
+
+    fn drop_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        column: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            drop_postgres_column(client, guard.default_schema.as_deref(), object, column).await
+        })
+    }
+
+    fn add_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        foreign_key: &'a ForeignKeyDefinition,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            add_postgres_foreign_key(client, guard.default_schema.as_deref(), object, foreign_key)
+                .await
+        })
+    }
+
+    fn drop_foreign_key<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            drop_postgres_foreign_key(client, guard.default_schema.as_deref(), object, name).await
+        })
+    }
+
+    fn create_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+        columns: &'a [String],
+        unique: bool,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            create_postgres_index(
+                client,
+                guard.default_schema.as_deref(),
+                object,
+                name,
+                columns,
+                unique,
+            )
+            .await
+        })
+    }
+
+    fn drop_index<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        name: &'a str,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            drop_postgres_index(client, guard.default_schema.as_deref(), object, name).await
+        })
+    }
+
+    fn count_table_rows<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        filters: &'a [TableFilter],
+    ) -> AdapterFuture<'a, Result<u64, QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            count_postgres_rows(client, guard.default_schema.as_deref(), object, filters).await
         })
     }
 
@@ -2003,9 +2620,12 @@ mod tests {
 /// prints a password.
 #[cfg(test)]
 mod integration_tests {
-    use super::PostgresAdapter;
+    use super::{
+        postgres_has_column, postgres_qualified, render_postgres_column, PostgresAdapter,
+    };
     use crate::database::{
-        ConnectionId, ConnectionSecret, ConnectionState, DatabaseAdapter, ObjectScope,
+        ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState, DatabaseAdapter,
+        ObjectScope,
     };
     use crate::domain::connection::{ServerConnection, TlsMode};
     use crate::domain::{
@@ -2160,5 +2780,48 @@ mod integration_tests {
                 ErrorCategory::Connection
             );
         });
+    }
+
+    #[test]
+    fn render_postgres_column_quotes_names_and_rejects_unsafe_text() {
+        let mut column = ColumnDefinition::new("cur\"ous", "TEXT");
+        column.nullable = false;
+        column.default = Some("CURRENT_TIMESTAMP".to_string());
+        assert_eq!(
+            render_postgres_column(&column).expect("valid column"),
+            "\"cur\"\"ous\" TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"
+        );
+
+        let unsafe_default = ColumnDefinition {
+            default: Some("0; DROP TABLE users".to_string()),
+            ..ColumnDefinition::new("status", "INTEGER")
+        };
+        assert_eq!(
+            render_postgres_column(&unsafe_default)
+                .expect_err("unsafe default must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let unsafe_type = ColumnDefinition::new("x", "TEXT; DROP TABLE users");
+        assert_eq!(
+            render_postgres_column(&unsafe_type)
+                .expect_err("unsafe type must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn postgres_qualified_and_column_matching_are_exact_enough() {
+        assert_eq!(postgres_qualified("public", "users"), "\"public\".\"users\"");
+
+        let columns = vec![crate::domain::ColumnInfo {
+            name: "Id".to_string(),
+            type_name: Some("integer".to_string()),
+            nullable: Some(false),
+        }];
+        assert!(postgres_has_column(&columns, "id"));
+        assert!(!postgres_has_column(&columns, "name"));
     }
 }

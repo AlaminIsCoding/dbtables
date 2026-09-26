@@ -153,6 +153,33 @@ impl ProfileService {
         connections::test_connection(adapter, &input.descriptor, secret.as_ref()).await
     }
 
+    /// Lists the databases a submitted server descriptor exposes.
+    ///
+    /// The secret is resolved the same way as [`ProfileService::test_connection`]:
+    /// a supplied password wins, otherwise a saved secret for `input.id` is used.
+    pub async fn list_databases(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        input: &ConnectionProfileInput,
+    ) -> Result<Vec<String>, QueryError> {
+        let secret = self.resolve_input_secret(input)?;
+        connections::list_databases(adapter, &input.descriptor, secret.as_ref()).await
+    }
+
+    /// Reads a saved profile's secret-free descriptor.
+    ///
+    /// Used by the command layer to pick the right engine adapter before opening
+    /// the profile, without exposing the profile's stored secret.
+    pub fn descriptor_for(&self, id: &ProfileId) -> Result<ConnectionDescriptor, QueryError> {
+        let profile = self.repository.get(id)?.ok_or_else(|| {
+            crate::domain::QueryError::new(
+                crate::domain::ErrorCategory::Validation,
+                format!("profile `{id}` does not exist"),
+            )
+        })?;
+        Ok(profile.descriptor)
+    }
+
     /// Opens a saved profile and returns its opaque connection token.
     pub async fn connect(
         &self,

@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::application::queries;
-use crate::database::{CancelOutcome, ConnectionId, SqliteAdapter};
+use crate::database::{CancelOutcome, ConnectionId, DatabaseState};
 use crate::domain::{
     EngineCapabilities, OperationId, QueryError, QueryRequest, QueryResult,
 };
@@ -13,20 +13,26 @@ use crate::domain::{
 /// failures such as an unknown connection reject the call.
 #[tauri::command]
 pub async fn execute_query(
-    adapter: State<'_, SqliteAdapter>,
+    state: State<'_, DatabaseState>,
     connection_id: ConnectionId,
     request: QueryRequest,
 ) -> Result<QueryResult, QueryError> {
-    queries::execute_query(&*adapter, &connection_id, request).await
+    let adapter = state.adapter_for(&connection_id)?;
+    queries::execute_query(adapter, &connection_id, request).await
 }
 
-/// Reports the driver capabilities for the active adapter.
+/// Reports the driver capabilities for a connection's engine.
 ///
-/// The UI gates engine-specific controls such as cancellation on this instead
-/// of assuming every connection supports them.
+/// Capabilities are per-connection because each engine's adapter differs; the
+/// UI gates engine-specific controls such as cancellation on this instead of
+/// assuming every connection supports them.
 #[tauri::command]
-pub fn query_capabilities(adapter: State<'_, SqliteAdapter>) -> EngineCapabilities {
-    queries::capabilities(&*adapter)
+pub fn query_capabilities(
+    state: State<'_, DatabaseState>,
+    connection_id: ConnectionId,
+) -> Result<EngineCapabilities, QueryError> {
+    let adapter = state.adapter_for(&connection_id)?;
+    Ok(queries::capabilities(adapter))
 }
 
 /// Requests cancellation of a running operation.
@@ -36,9 +42,10 @@ pub fn query_capabilities(adapter: State<'_, SqliteAdapter>) -> EngineCapabiliti
 /// that the operation was rolled back.
 #[tauri::command]
 pub async fn cancel_query(
-    adapter: State<'_, SqliteAdapter>,
+    state: State<'_, DatabaseState>,
     connection_id: ConnectionId,
     operation_id: OperationId,
 ) -> Result<CancelOutcome, QueryError> {
-    queries::cancel_query(&*adapter, &connection_id, &operation_id).await
+    let adapter = state.adapter_for(&connection_id)?;
+    queries::cancel_query(adapter, &connection_id, &operation_id).await
 }

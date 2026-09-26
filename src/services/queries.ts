@@ -44,11 +44,14 @@ export async function cancelQuery(
 }
 
 /**
- * Reports the driver capabilities for the active adapter.
+ * Reports the driver capabilities for a connection's engine.
  *
- * The UI uses this to gate engine-specific behavior such as cancellation
- * instead of assuming every engine supports it.
+ * Capabilities are per-connection because each engine's adapter differs; the UI
+ * uses this to gate engine-specific behavior such as cancellation instead of
+ * assuming every engine supports it.
  */
-export async function getQueryCapabilities(): Promise<EngineCapabilities> {
-  return invoke<EngineCapabilities>(QUERY_CAPABILITIES_COMMAND);
+export async function getQueryCapabilities(
+  connectionId: string,
+): Promise<EngineCapabilities> {
+  return invoke<EngineCapabilities>(QUERY_CAPABILITIES_COMMAND, { connectionId });
 }

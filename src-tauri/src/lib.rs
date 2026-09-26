@@ -4,7 +4,7 @@ pub mod database;
 pub mod domain;
 pub mod persistence;
 
-use database::SqliteAdapter;
+use database::DatabaseState;
 use application::profiles::ProfileService;
 use persistence::{FileProfileRepository, KeyringSecretStore};
 use std::sync::Arc;
@@ -17,10 +17,12 @@ pub const APP_NAME: &str = "dbtables";
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // The adapter owns the open connections for the process lifetime.
-        // Tauri manages it so command handlers can share one registry without
-        // exposing driver-native handles to the frontend.
-        .manage(SqliteAdapter::new())
+        // File dialogs (SQLite open/create) are provided by the dialog plugin.
+        .plugin(tauri_plugin_dialog::init())
+        // The registry owns one adapter per engine and maps each open
+        // connection to its engine. Tauri manages it so command handlers share
+        // one router without exposing driver-native handles to the frontend.
+        .manage(DatabaseState::new())
         .setup(|app| {
             let settings_path = app.path().app_config_dir()?.join("settings.json");
             let profiles = ProfileService::new(
@@ -40,6 +42,7 @@ pub fn run() {
             commands::connections::delete_connection_profile,
             commands::connections::test_connection_profile,
             commands::connections::connect_profile,
+            commands::connections::list_profile_databases,
             commands::metadata::list_objects,
             commands::metadata::list_scopes,
             commands::metadata::describe_table,
