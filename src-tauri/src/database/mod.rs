@@ -38,7 +38,10 @@ use crate::domain::{
     QueryError, QueryRequest, QueryResult, Row,
 };
 
+pub mod sqlite;
 pub mod testing;
+
+pub use sqlite::SqliteAdapter;
 
 /// Future returned by every adapter operation.
 ///
