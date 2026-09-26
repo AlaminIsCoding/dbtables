@@ -1,9 +1,9 @@
 import { useState } from "react";
 
 import { Sidebar } from "@/components/layout/Sidebar";
-import { ConnectScreen } from "@/components/layout/ConnectScreen";
 import { TopBar } from "@/components/layout/TopBar";
 import { Workspace } from "@/components/layout/Workspace";
+import { ConnectionsPage } from "@/features/connections";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -14,6 +14,10 @@ function Shell() {
   const { theme, toggleTheme } = useTheme();
   const { connectionId } = useWorkspace();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [connectionsOpen, setConnectionsOpen] = useState(false);
+
+  const connected = connectionId !== null;
+  const showConnections = !connected || connectionsOpen;
 
   return (
     <TooltipProvider delayDuration={400}>
@@ -22,15 +26,21 @@ function Shell() {
           theme={theme}
           onToggleTheme={toggleTheme}
           onToggleSidebar={() => setSidebarOpen((open) => !open)}
+          onOpenConnections={() => setConnectionsOpen(true)}
+          connectionsOpen={connectionsOpen}
         />
         <div className="flex min-h-0 flex-1">
-          {connectionId ? (
+          {showConnections ? (
+            <ConnectionsPage
+              onClose={
+                connected ? () => setConnectionsOpen(false) : undefined
+              }
+            />
+          ) : (
             <>
               <Sidebar collapsed={!sidebarOpen} />
               <Workspace />
             </>
-          ) : (
-            <ConnectScreen />
           )}
         </div>
       </div>

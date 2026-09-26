@@ -49,12 +49,15 @@ const profile = {
 };
 
 describe("App workspace shell", () => {
-  it("shows the connect screen and disables workspace actions while disconnected", async () => {
+  it("shows the connections page and disables workspace actions while disconnected", async () => {
     render(<App />);
 
     expect(screen.getByAltText("dbtables")).toBeTruthy();
     expect(
-      await screen.findByText("Connect to a database"),
+      await screen.findByRole("heading", { name: "Connections" }),
+    ).toBeTruthy();
+    expect(
+      await screen.findByText(/No saved connections yet/),
     ).toBeTruthy();
     // No schema sidebar until a database is open.
     expect(
@@ -74,7 +77,9 @@ describe("App workspace shell", () => {
     connectMock.mockResolvedValue("conn-1");
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Connect app_production" }),
+    );
 
     await waitFor(() =>
       expect(

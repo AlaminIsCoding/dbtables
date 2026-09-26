@@ -2,6 +2,7 @@ import { useId } from "react";
 
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
+import { EngineLogo } from "../../components/engine-logo";
 import type { EngineId, QueryError, TlsMode } from "../../domain";
 import {
   ENGINE_IDS,
@@ -32,6 +33,18 @@ export interface ProfileFormProps {
   test: TestStatus;
   /** Save error to show above the actions. */
   error?: QueryError | null;
+  /** Databases discovered for the current server settings. */
+  databases?: string[];
+  /** Whether a database lookup is in progress. */
+  loadingDatabases?: boolean;
+  /** Error from the last database lookup. */
+  databasesError?: QueryError | null;
+  /** Requests the server's database list for the current draft. */
+  onLoadDatabases?: () => void;
+  /** Picks an existing SQLite database file. */
+  onBrowseFile?: () => void;
+  /** Chooses a path for a new SQLite database. */
+  onNewDatabaseFile?: () => void;
   className?: string;
 }
 
@@ -86,6 +99,12 @@ export function ProfileForm({
   testing,
   test,
   error,
+  databases = [],
+  loadingDatabases = false,
+  databasesError = null,
+  onLoadDatabases,
+  onBrowseFile,
+  onNewDatabaseFile,
   className,
 }: ProfileFormProps) {
   const baseId = useId();
@@ -95,6 +114,7 @@ export function ProfileForm({
   const hostId = `${baseId}-host`;
   const portId = `${baseId}-port`;
   const databaseId = `${baseId}-database`;
+  const databaseListId = `${baseId}-database-options`;
   const usernameId = `${baseId}-username`;
   const tlsId = `${baseId}-tls`;
   const passwordId = `${baseId}-password`;
@@ -129,20 +149,23 @@ export function ProfileForm({
         <label htmlFor={engineId} className={labelClass}>
           Engine
         </label>
-        <select
-          id={engineId}
-          value={draft.engine}
-          onChange={(event) =>
-            onChange(withEngine(draft, event.target.value as EngineId))
-          }
-          className={inputClass}
-        >
-          {ENGINE_IDS.map((engine) => (
-            <option key={engine} value={engine}>
-              {ENGINE_LABELS[engine]}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-2">
+          <EngineLogo engine={draft.engine} className="size-5" />
+          <select
+            id={engineId}
+            value={draft.engine}
+            onChange={(event) =>
+              onChange(withEngine(draft, event.target.value as EngineId))
+            }
+            className={inputClass}
+          >
+            {ENGINE_IDS.map((engine) => (
+              <option key={engine} value={engine}>
+                {ENGINE_LABELS[engine]}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {draft.engine === "sqlite" ? (
@@ -150,16 +173,34 @@ export function ProfileForm({
           <label htmlFor={filePathId} className={labelClass}>
             Database file
           </label>
-          <input
-            id={filePathId}
-            value={draft.filePath}
-            onChange={(event) =>
-              onChange({ ...draft, filePath: event.target.value })
-            }
-            placeholder="C:/path/to/database.sqlite"
-            spellCheck={false}
-            className={cn(inputClass, "font-mono")}
-          />
+          <div className="flex items-center gap-1">
+            <input
+              id={filePathId}
+              value={draft.filePath}
+              onChange={(event) =>
+                onChange({ ...draft, filePath: event.target.value })
+              }
+              placeholder="C:/path/to/database.sqlite"
+              spellCheck={false}
+              className={cn(inputClass, "min-w-0 flex-1 font-mono")}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              onClick={onBrowseFile}
+              disabled={!onBrowseFile}
+            >
+              Browse…
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={onNewDatabaseFile}
+              disabled={!onNewDatabaseFile}
+            >
+              New…
+            </Button>
+          </div>
         </div>
       ) : (
         <>
@@ -199,16 +240,39 @@ export function ProfileForm({
             <label htmlFor={databaseId} className={labelClass}>
               Database
             </label>
-            <input
-              id={databaseId}
-              value={draft.database}
-              onChange={(event) =>
-                onChange({ ...draft, database: event.target.value })
-              }
-              placeholder="optional"
-              spellCheck={false}
-              className={inputClass}
-            />
+            <div className="flex items-center gap-1">
+              <input
+                id={databaseId}
+                list={databases.length > 0 ? databaseListId : undefined}
+                value={draft.database}
+                onChange={(event) =>
+                  onChange({ ...draft, database: event.target.value })
+                }
+                placeholder="optional"
+                spellCheck={false}
+                className={cn(inputClass, "min-w-0 flex-1")}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                onClick={onLoadDatabases}
+                disabled={!onLoadDatabases || loadingDatabases}
+              >
+                {loadingDatabases ? "Loading…" : "Load"}
+              </Button>
+            </div>
+            {databases.length > 0 ? (
+              <datalist id={databaseListId}>
+                {databases.map((database) => (
+                  <option key={database} value={database} />
+                ))}
+              </datalist>
+            ) : null}
+            {databasesError ? (
+              <p role="alert" className="text-[10px] text-destructive">
+                {databasesError.message}
+              </p>
+            ) : null}
           </div>
 
           <div className="flex flex-col gap-1">

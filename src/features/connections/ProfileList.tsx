@@ -1,5 +1,6 @@
 import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
+import { EngineLogo } from "../../components/engine-logo";
 import type { ConnectionProfile } from "../../domain";
 import { ENGINE_LABELS, describeProfile } from "./profileDraft";
 import type {
@@ -76,6 +77,7 @@ export function ProfileList({
             )}
           >
             <div className="flex items-center gap-1.5">
+              <EngineLogo engine={profile.descriptor.engine} className="size-4" />
               <span
                 aria-hidden="true"
                 className={cn(

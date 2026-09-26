@@ -1,10 +1,10 @@
-import { useState } from "react";
 import {
   ChevronDownIcon,
   DatabaseIcon,
   MessageSquareIcon,
   MoonIcon,
   PanelLeftIcon,
+  PlugZapIcon,
   PowerIcon,
   SquarePenIcon,
   SunIcon,
@@ -26,23 +26,27 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
-import { ConnectionsDialog } from "./ConnectionsDialog";
-
 export interface TopBarProps {
   theme: Theme;
   onToggleTheme: () => void;
   onToggleSidebar: () => void;
+  /** Opens the full-screen connections page. */
+  onOpenConnections: () => void;
+  /** Whether the connections page is currently shown (for button emphasis). */
+  connectionsOpen?: boolean;
   className?: string;
 }
 
 /**
- * Application top bar: sidebar toggle, brand, connection switcher, new query,
- * messages, and theme toggle.
+ * Application top bar: sidebar toggle, brand, connection switcher, connections,
+ * new query, messages, and theme toggle.
  */
 export function TopBar({
   theme,
   onToggleTheme,
   onToggleSidebar,
+  onOpenConnections,
+  connectionsOpen = false,
   className,
 }: TopBarProps) {
   const {
@@ -53,7 +57,6 @@ export function TopBar({
     messagesOpen,
     setMessagesOpen,
   } = useWorkspace();
-  const [managerOpen, setManagerOpen] = useState(false);
 
   const profiles =
     connections.profiles.status === "ready" ? connections.profiles.profiles : [];
@@ -115,7 +118,7 @@ export function TopBar({
             ))
           )}
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => setManagerOpen(true)}>
+          <DropdownMenuItem onSelect={() => onOpenConnections()}>
             Manage connections…
           </DropdownMenuItem>
           {connectionId ? (
@@ -131,6 +134,16 @@ export function TopBar({
       </DropdownMenu>
 
       <div className="flex-1" />
+
+      <Button
+        variant={connectionsOpen ? "secondary" : "outline"}
+        size="sm"
+        onClick={onOpenConnections}
+        aria-label="Connections"
+      >
+        <PlugZapIcon />
+        Connections
+      </Button>
 
       <Button
         variant="outline"
@@ -173,12 +186,6 @@ export function TopBar({
         </TooltipTrigger>
         <TooltipContent>Toggle theme</TooltipContent>
       </Tooltip>
-
-      <ConnectionsDialog
-        open={managerOpen}
-        onOpenChange={setManagerOpen}
-        controller={connections}
-      />
     </header>
   );
 }
