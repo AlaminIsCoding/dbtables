@@ -55,6 +55,22 @@ describe("describeQueryStatus", () => {
     });
   });
 
+  it("reports a partial result as a successful row count", () => {
+    const outcome: QueryOutcome = {
+      kind: "partial",
+      result: result({
+        rows: [[{ type: "integer", value: 1 }]],
+        truncated: true,
+      }),
+    };
+
+    expect(describeQueryStatus(outcome)).toEqual({
+      state: "succeeded",
+      durationMs: undefined,
+      rows: 1,
+    });
+  });
+
   it("reports a failure category without claiming success", () => {
     expect(
       describeQueryStatus({

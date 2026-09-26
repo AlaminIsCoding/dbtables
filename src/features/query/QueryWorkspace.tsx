@@ -393,7 +393,16 @@ export function QueryWorkspace({
           onExecuted={onExecuted}
         />
       }
-      end={<ResultsPanel outcome={session.outcome} />}
+      end={
+        <ResultsPanel
+          outcome={session.outcome}
+          canFetchMore={session.canFetchMore}
+          fetchingMore={session.isFetchingMore}
+          onFetchMore={() => {
+            void session.fetchMore();
+          }}
+        />
+      }
       startLabel="Editor"
       endLabel="Results"
     />

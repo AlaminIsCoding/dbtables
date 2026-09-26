@@ -7,6 +7,7 @@ export {
   hasResultColumns,
   idleOutcome,
   isEmptyResult,
+  isPartialResult,
   resultOutcome,
   runningOutcome,
   summarizeResult,
@@ -14,8 +15,19 @@ export {
   type QuerySummary,
 } from "./queryOutcome";
 export {
+  canFetchMore,
+  FETCH_MORE_STEP,
+  nextFetchLimit,
+} from "./resultPaging";
+export {
   emptyResultSet,
   isResultSetEmpty,
   queryResultToResultSet,
   type ResultSet,
 } from "./resultSet";
+export {
+  formatValueForViewer,
+  isStructuredText,
+  type ViewerContent,
+} from "./valueView";
+export { ValueViewer, type ValueViewerProps } from "./ValueViewer";

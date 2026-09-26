@@ -66,6 +66,8 @@ export interface ResultGridProps {
   onCellsEdit?: (edits: readonly { location: Item; value: CellValue }[]) => void;
   /** Called when the grid selection changes. */
   onSelectionChange?: (selection: GridSelection) => void;
+  /** Called when a cell is activated (double-click, Enter, or Space). */
+  onCellActivated?: (location: Item) => void;
   className?: string;
 }
 
@@ -81,6 +83,7 @@ export function ResultGrid({
   onCellEdit,
   onCellsEdit,
   onSelectionChange,
+  onCellActivated,
   className,
 }: ResultGridProps) {
   const { ref, width, height } = useElementSize<HTMLDivElement>();
@@ -128,6 +131,15 @@ export function ResultGrid({
     [rows, onCellsEdit],
   );
 
+  const handleCellActivated = useCallback<
+    NonNullable<DataEditorProps["onCellActivated"]>
+  >(
+    (cell) => {
+      onCellActivated?.(cell);
+    },
+    [onCellActivated],
+  );
+
   return (
     <div
       ref={ref}
@@ -146,6 +158,7 @@ export function ResultGrid({
         onCellEdited={onCellEdit ? handleCellEdited : undefined}
         onCellsEdited={onCellsEdit ? handleCellsEdited : undefined}
         onGridSelectionChange={onSelectionChange}
+        onCellActivated={onCellActivated ? handleCellActivated : undefined}
         getCellsForSelection
         copyHeaders
         rowMarkers="number"

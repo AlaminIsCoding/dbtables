@@ -17,6 +17,7 @@ const glide = vi.hoisted(() => ({
         onCellsEdited: (
           edits: readonly { location: readonly [number, number]; value: unknown }[],
         ) => boolean | void;
+        onCellActivated: (cell: readonly [number, number]) => void;
       }
     | undefined,
 }));
@@ -91,5 +92,20 @@ describe("ResultGrid", () => {
     expect(onCellsEdit).toHaveBeenCalledWith([
       { location: [1, 0], value: { type: "text", value: "Batch" } },
     ]);
+  });
+
+  it("forwards cell activation for the value viewer", () => {
+    const onCellActivated = vi.fn();
+
+    render(
+      <ResultGrid
+        result={createMockResultSet(2)}
+        onCellActivated={onCellActivated}
+      />,
+    );
+
+    glide.props?.onCellActivated([1, 0]);
+
+    expect(onCellActivated).toHaveBeenCalledWith([1, 0]);
   });
 });

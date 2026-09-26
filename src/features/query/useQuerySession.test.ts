@@ -188,6 +188,89 @@ describe("useQuerySession", () => {
     });
   });
 
+  it("offers fetch-more for a truncated result and requests a larger bounded cap", async () => {
+    const { result } = renderHook(() => useQuerySession());
+    await openConnected(result);
+    executeMock.mockResolvedValueOnce(
+      gridResult({
+        rows: Array.from({ length: 500 }, () => [{ type: "integer", value: 1 }]),
+        truncated: true,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.runQuery("SELECT id FROM users");
+    });
+
+    expect(result.current.outcome.kind).toBe("partial");
+    expect(result.current.canFetchMore).toBe(true);
+
+    executeMock.mockResolvedValueOnce(
+      gridResult({
+        rows: Array.from({ length: 600 }, () => [{ type: "integer", value: 1 }]),
+        truncated: false,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.fetchMore();
+    });
+
+    expect(executeMock).toHaveBeenCalledTimes(2);
+    const [connectionId, request] = executeMock.mock.calls[1];
+    expect(connectionId).toBe("sqlite-1");
+    expect(request.sql).toBe("SELECT id FROM users");
+    expect(request.maxRows).toBe(1000);
+    expect(result.current.outcome.kind).toBe("grid");
+    expect(result.current.canFetchMore).toBe(false);
+  });
+
+  it("does not offer fetch-more for a complete result", async () => {
+    const { result } = renderHook(() => useQuerySession());
+    await openConnected(result);
+    executeMock.mockResolvedValue(gridResult());
+
+    await act(async () => {
+      await result.current.runQuery("SELECT 1");
+    });
+
+    expect(result.current.canFetchMore).toBe(false);
+
+    await act(async () => {
+      await result.current.fetchMore();
+    });
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a partial result and notices when a fetch-more request fails", async () => {
+    const { result } = renderHook(() => useQuerySession());
+    await openConnected(result);
+    executeMock.mockResolvedValueOnce(
+      gridResult({
+        rows: Array.from({ length: 500 }, () => [{ type: "integer", value: 1 }]),
+        truncated: true,
+      }),
+    );
+
+    await act(async () => {
+      await result.current.runQuery("SELECT id FROM users");
+    });
+
+    executeMock.mockRejectedValueOnce({
+      category: "connection",
+      message: "connection lost",
+    });
+
+    await act(async () => {
+      await result.current.fetchMore();
+    });
+
+    expect(result.current.outcome.kind).toBe("partial");
+    expect(result.current.notice).toBe("connection lost");
+    expect(result.current.isFetchingMore).toBe(false);
+  });
+
   it("rejects a blank statement without calling the backend", async () => {
     const { result } = renderHook(() => useQuerySession());
     await openConnected(result);

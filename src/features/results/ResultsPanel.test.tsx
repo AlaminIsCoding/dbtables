@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { QueryResult } from "../../domain";
@@ -12,6 +12,10 @@ const glide = vi.hoisted(() => ({
         columns: { title: string }[];
         onCellEdited?: unknown;
         onCellsEdited?: unknown;
+        onGridSelectionChange?: (selection: {
+          current?: { cell: readonly [number, number] };
+        }) => void;
+        onCellActivated?: (cell: readonly [number, number]) => void;
       }
     | undefined,
 }));
@@ -98,18 +102,98 @@ describe("ResultsPanel", () => {
     );
   });
 
-  it("marks a truncated result as partial", () => {
-    renderOutcome({
-      kind: "grid",
-      result: resultWith({
-        columns: [{ name: "id" }],
-        rows: [[{ type: "integer", value: 1 }]],
-        truncated: true,
-      }),
-    });
+  it("renders a partial result with a bounded fetch-more action", () => {
+    const onFetchMore = vi.fn();
+    render(
+      <ResultsPanel
+        outcome={{
+          kind: "partial",
+          result: resultWith({
+            columns: [{ name: "id" }],
+            rows: [[{ type: "integer", value: 1 }]],
+            truncated: true,
+          }),
+        }}
+        canFetchMore
+        onFetchMore={onFetchMore}
+      />,
+    );
 
     expect(screen.getByTestId("results-summary").textContent).toContain(
       "partial",
+    );
+    expect(screen.getByTestId("partial-notice").textContent).toContain(
+      "Showing first 1 row",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Fetch more" }));
+    expect(onFetchMore).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables fetch-more while an extension is in flight", () => {
+    render(
+      <ResultsPanel
+        outcome={{
+          kind: "partial",
+          result: resultWith({
+            columns: [{ name: "id" }],
+            rows: [[{ type: "integer", value: 1 }]],
+            truncated: true,
+          }),
+        }}
+        canFetchMore
+        fetchingMore
+        onFetchMore={() => {}}
+      />,
+    );
+
+    const button = screen.getByRole("button", {
+      name: "Fetching…",
+    }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+  });
+
+  it("opens the value viewer for the selected cell", () => {
+    renderOutcome({
+      kind: "grid",
+      result: resultWith({
+        columns: [{ name: "notes" }],
+        rows: [[{ type: "text", value: "a\nlong\nvalue" }]],
+      }),
+    });
+
+    act(() => {
+      glide.props?.onGridSelectionChange?.({ current: { cell: [0, 0] } });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "View value" }));
+
+    expect(screen.getByRole("dialog").getAttribute("aria-label")).toBe(
+      "Cell value: notes",
+    );
+    expect(screen.getByTestId("value-viewer-text").textContent).toBe(
+      "a\nlong\nvalue",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close value viewer" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("opens the value viewer when a cell is activated", () => {
+    renderOutcome({
+      kind: "grid",
+      result: resultWith({
+        columns: [{ name: "payload" }],
+        rows: [[{ type: "text", value: '{"a":1}' }]],
+      }),
+    });
+
+    act(() => {
+      glide.props?.onCellActivated?.([0, 0]);
+    });
+
+    expect(screen.getByTestId("value-viewer-text").textContent).toContain(
+      '"a": 1',
     );
   });
 

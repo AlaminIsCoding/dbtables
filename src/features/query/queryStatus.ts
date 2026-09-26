@@ -57,6 +57,7 @@ export function describeQueryStatus(outcome: QueryOutcome): QueryStatusSummary {
         affectedRows: outcome.result.affectedRows,
       };
     case "grid":
+    case "partial":
     case "empty":
       return {
         state: "succeeded",

@@ -1,26 +1,47 @@
-import { useCallback, useState } from "react";
-import type { GridSelection } from "@glideapps/glide-data-grid";
+import { useCallback, useMemo, useState } from "react";
+import type { GridSelection, Item } from "@glideapps/glide-data-grid";
 
+import { Button } from "../../components/ui/button";
 import { cn } from "../../components/ui/cn";
-import type { QueryError, QueryResult } from "../../domain";
+import type { CellValue, QueryError, QueryResult } from "../../domain";
 import { ResultGrid } from "./ResultGrid";
 import { queryResultToResultSet } from "./resultSet";
 import type { QueryOutcome } from "./queryOutcome";
+import { ValueViewer } from "./ValueViewer";
 
 export interface ResultsPanelProps {
   /** Current query outcome, including idle/running/error states. */
   outcome: QueryOutcome;
+  /** Whether the current partial result can be extended with another fetch. */
+  canFetchMore?: boolean;
+  /** Whether an incremental fetch is currently in flight. */
+  fetchingMore?: boolean;
+  /** Requests the next bounded page of the current result. */
+  onFetchMore?: () => void;
   className?: string;
 }
 
-function selectionLabel(selection: GridSelection): string | null {
-  const cell = selection.current?.cell;
+function selectionLabel(cell: Item | null): string | null {
   if (!cell) {
     return null;
   }
 
   const [col, row] = cell;
   return `R${row + 1} · C${col + 1}`;
+}
+
+/** The normalized cell at `location`, or `null` when it is out of bounds. */
+function cellAt(result: QueryResult, [col, row]: Item): CellValue | null {
+  const columns = result.columns ?? [];
+  const rows = result.rows ?? [];
+  if (row < 0 || col < 0 || row >= rows.length || col >= columns.length) {
+    return null;
+  }
+  return rows[row]?.[col] ?? null;
+}
+
+function columnNameAt(result: QueryResult, col: number): string {
+  return result.columns?.[col]?.name ?? `Column ${col + 1}`;
 }
 
 /** One-line summary shown in the results header for every outcome. */
@@ -46,12 +67,13 @@ export function summarizeOutcome(outcome: QueryOutcome): string {
       return `${affected} row${affected === 1 ? "" : "s"} affected`;
     }
     case "grid":
+    case "partial":
     case "empty": {
       const result = outcome.result;
       const rows = result.rows?.length ?? 0;
       const columns = result.columns?.length ?? 0;
       const parts = [`${rows} rows`, `${columns} columns`];
-      if (result.truncated) {
+      if (outcome.kind === "partial" || result.truncated) {
         parts.push("partial");
       }
       if (result.durationMs !== undefined) {
@@ -171,21 +193,77 @@ function UncertainState({ error }: { error?: QueryError }) {
   );
 }
 
-function renderBody(
-  outcome: QueryOutcome,
-  onSelectionChange: (selection: GridSelection) => void,
-) {
+function PartialBanner({
+  rows,
+  canFetchMore,
+  fetchingMore,
+  onFetchMore,
+}: {
+  rows: number;
+  canFetchMore: boolean;
+  fetchingMore: boolean;
+  onFetchMore?: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground">
+      <span role="status" data-testid="partial-notice">
+        Showing first {rows} row{rows === 1 ? "" : "s"} · result is partial
+      </span>
+      {onFetchMore ? (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-5 px-1.5 text-[10px]"
+          onClick={onFetchMore}
+          disabled={!canFetchMore || fetchingMore}
+        >
+          {fetchingMore ? "Fetching…" : "Fetch more"}
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+interface BodyHandlers {
+  onSelectionChange: (selection: GridSelection) => void;
+  onCellActivated: (location: Item) => void;
+  canFetchMore: boolean;
+  fetchingMore: boolean;
+  onFetchMore?: () => void;
+}
+
+function renderBody(outcome: QueryOutcome, handlers: BodyHandlers) {
   switch (outcome.kind) {
     case "idle":
       return <IdleState />;
     case "running":
       return <LoadingState />;
-    case "grid": {
-      const result = queryResultToResultSet(outcome.result);
+    case "grid":
       return (
-        <ResultGrid result={result} onSelectionChange={onSelectionChange} />
+        <ResultGrid
+          result={queryResultToResultSet(outcome.result)}
+          onSelectionChange={handlers.onSelectionChange}
+          onCellActivated={handlers.onCellActivated}
+        />
       );
-    }
+    case "partial":
+      return (
+        <div className="flex h-full min-h-0 flex-col">
+          <PartialBanner
+            rows={outcome.result.rows?.length ?? 0}
+            canFetchMore={handlers.canFetchMore}
+            fetchingMore={handlers.fetchingMore}
+            onFetchMore={handlers.onFetchMore}
+          />
+          <div className="min-h-0 flex-1">
+            <ResultGrid
+              result={queryResultToResultSet(outcome.result)}
+              onSelectionChange={handlers.onSelectionChange}
+              onCellActivated={handlers.onCellActivated}
+            />
+          </div>
+        </div>
+      );
     case "empty":
       return <EmptyState columns={outcome.result.columns?.length ?? 0} />;
     case "statement":
@@ -204,34 +282,93 @@ function renderBody(
 /**
  * Results pane for a real query run.
  *
- * Renders each normalized outcome distinctly: idle, running, grid, empty,
- * statement-only, failed, command error, cancelled, and uncertain. The grid is
- * read-only here; this slice exposes no table editing.
+ * Renders each normalized outcome distinctly: idle, running, grid, partial,
+ * empty, statement-only, failed, command error, cancelled, and uncertain. A
+ * partial result keeps its grid visible and offers a bounded "fetch more"
+ * action; the full cell value viewer opens for a selected or activated cell.
+ * The grid is read-only here; this slice exposes no table editing.
  */
-export function ResultsPanel({ outcome, className }: ResultsPanelProps) {
-  const [selected, setSelected] = useState<string | null>(null);
+export function ResultsPanel({
+  outcome,
+  canFetchMore = false,
+  fetchingMore = false,
+  onFetchMore,
+  className,
+}: ResultsPanelProps) {
+  const [selectedCell, setSelectedCell] = useState<Item | null>(null);
+  const [viewerCell, setViewerCell] = useState<Item | null>(null);
 
   const handleSelectionChange = useCallback((selection: GridSelection) => {
-    setSelected(selectionLabel(selection));
+    setSelectedCell(selection.current?.cell ?? null);
   }, []);
 
+  const openViewer = useCallback((location: Item) => {
+    setViewerCell(location);
+  }, []);
+
+  const resultForViewer =
+    outcome.kind === "grid" || outcome.kind === "partial"
+      ? outcome.result
+      : null;
+
+  const selectedValue = useMemo(
+    () =>
+      resultForViewer && selectedCell
+        ? cellAt(resultForViewer, selectedCell)
+        : null,
+    [resultForViewer, selectedCell],
+  );
+
+  const viewerValue = useMemo(
+    () =>
+      resultForViewer && viewerCell ? cellAt(resultForViewer, viewerCell) : null,
+    [resultForViewer, viewerCell],
+  );
+
+  const selectedLabel = selectionLabel(selectedCell);
+
   return (
-    <div className={cn("flex h-full min-h-0 flex-col", className)}>
+    <div className={cn("relative flex h-full min-h-0 flex-col", className)}>
       <div className="flex h-7 shrink-0 items-center justify-between gap-2 border-b border-border px-2 text-[11px] text-muted-foreground">
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0">Results</span>
           <span className="truncate" data-testid="results-summary" role="status">
             {summarizeOutcome(outcome)}
           </span>
-          {selected && outcome.kind === "grid" && (
-            <span className="shrink-0">{selected}</span>
+          {resultForViewer && selectedLabel && (
+            <span className="shrink-0">{selectedLabel}</span>
           )}
         </div>
+        {selectedCell !== null && selectedValue !== null && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-5 shrink-0 px-1.5 text-[10px]"
+            onClick={() => openViewer(selectedCell)}
+          >
+            View value
+          </Button>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        {renderBody(outcome, handleSelectionChange)}
+        {renderBody(outcome, {
+          onSelectionChange: handleSelectionChange,
+          onCellActivated: openViewer,
+          canFetchMore,
+          fetchingMore,
+          onFetchMore,
+        })}
       </div>
+
+      {viewerCell && viewerValue !== null && resultForViewer && (
+        <ValueViewer
+          value={viewerValue}
+          columnName={columnNameAt(resultForViewer, viewerCell[0])}
+          rowNumber={viewerCell[1] + 1}
+          onClose={() => setViewerCell(null)}
+        />
+      )}
     </div>
   );
 }

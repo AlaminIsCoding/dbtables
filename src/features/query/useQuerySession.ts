@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { EngineCapabilities, ObjectRef, QueryError } from "../../domain";
 import { createOperationId } from "../../domain";
@@ -17,6 +17,10 @@ import {
   runningOutcome,
   type QueryOutcome,
 } from "../results/queryOutcome";
+import {
+  canFetchMore as canFetchMoreResult,
+  nextFetchLimit,
+} from "../results/resultPaging";
 import {
   historyEntryFromError,
   historyEntryFromResult,
@@ -67,6 +71,10 @@ export interface QuerySession {
   canCancel: boolean;
   /** Whether a cancellation request is in flight for the running query. */
   cancelRequested: boolean;
+  /** Whether the current partial result can be extended with another fetch. */
+  canFetchMore: boolean;
+  /** Whether an incremental fetch of the current result is in flight. */
+  isFetchingMore: boolean;
   /** Non-fatal notice, such as a cancellation that the driver refused. */
   notice: string | null;
   /** Bounded, local recent-query history. Never contains secrets. */
@@ -76,6 +84,14 @@ export interface QuerySession {
   refreshObjects: () => Promise<void>;
   /** Executes the supplied statement and records the outcome. */
   runQuery: (statement: string) => Promise<void>;
+  /**
+   * Re-runs the last successful statement with a larger bounded cap.
+   *
+   * This is an explicit, user-initiated request, never an automatic retry. It
+   * is only offered for a truncated result whose adapter returned the full
+   * requested window; reaching the backend's hard ceiling stops the flow.
+   */
+  fetchMore: () => Promise<void>;
   /** Requests driver cancellation of the running query when supported. */
   cancelRunningQuery: () => Promise<void>;
   /** Empties the recent-query history. */
@@ -108,6 +124,7 @@ export function useQuerySession(): QuerySession {
   });
   const [outcome, setOutcome] = useState<QueryOutcome>(idleOutcome);
   const [isRunning, setIsRunning] = useState(false);
+  const [isFetchingMore, setIsFetchingMore] = useState(false);
   const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(
     defaultCapabilities,
   );
@@ -118,6 +135,13 @@ export function useQuerySession(): QuerySession {
   const connectionIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
   const activeOperationRef = useRef<string | null>(null);
+  const lastStatementRef = useRef<string | null>(null);
+  const requestedLimitRef = useRef(0);
+  const outcomeRef = useRef<QueryOutcome>(outcome);
+
+  useEffect(() => {
+    outcomeRef.current = outcome;
+  }, [outcome]);
 
   const loadObjects = useCallback(async (connectionId: string) => {
     try {
@@ -176,6 +200,9 @@ export function useQuerySession(): QuerySession {
       setCapabilities(null);
       setNotice(null);
       setCancelRequested(false);
+      setIsFetchingMore(false);
+      lastStatementRef.current = null;
+      requestedLimitRef.current = 0;
 
       try {
         const connectionId = await connectSqlite(trimmed);
@@ -203,6 +230,9 @@ export function useQuerySession(): QuerySession {
     setCapabilities(null);
     setCancelRequested(false);
     setNotice(null);
+    setIsFetchingMore(false);
+    lastStatementRef.current = null;
+    requestedLimitRef.current = 0;
 
     if (connectionId) {
       try {
@@ -250,6 +280,8 @@ export function useQuerySession(): QuerySession {
       const operationId = createOperationId();
       runningRef.current = true;
       activeOperationRef.current = operationId;
+      lastStatementRef.current = null;
+      requestedLimitRef.current = 0;
       setIsRunning(true);
       setCancelRequested(false);
       setNotice(null);
@@ -260,6 +292,10 @@ export function useQuerySession(): QuerySession {
           operationId,
           sql: trimmed,
         });
+        if (result.state === "succeeded") {
+          lastStatementRef.current = trimmed;
+          requestedLimitRef.current = result.rows?.length ?? 0;
+        }
         setOutcome(resultOutcome(result));
         recordHistory(historyEntryFromResult(operationId, trimmed, result));
       } catch (error) {
@@ -275,6 +311,46 @@ export function useQuerySession(): QuerySession {
     },
     [recordHistory],
   );
+
+  const fetchMore = useCallback(async () => {
+    const connectionId = connectionIdRef.current;
+    const sql = lastStatementRef.current;
+    const current = outcomeRef.current;
+    if (!connectionId || !sql || runningRef.current) {
+      return;
+    }
+    if (
+      current.kind !== "partial" ||
+      !canFetchMoreResult(current.result, requestedLimitRef.current)
+    ) {
+      return;
+    }
+
+    const nextLimit = nextFetchLimit(requestedLimitRef.current);
+    const operationId = createOperationId();
+    runningRef.current = true;
+    setIsFetchingMore(true);
+    setNotice(null);
+
+    try {
+      const result = await executeQuery(connectionId, {
+        operationId,
+        sql,
+        maxRows: nextLimit,
+      });
+      requestedLimitRef.current = nextLimit;
+      setOutcome(resultOutcome(result));
+      // Fetch-more continues the same statement, so it does not add a second
+      // history entry.
+    } catch (error) {
+      // The already-loaded rows remain valid; surface the failed extension as a
+      // non-fatal notice instead of discarding the visible result.
+      setNotice(toQueryError(error).message);
+    } finally {
+      runningRef.current = false;
+      setIsFetchingMore(false);
+    }
+  }, []);
 
   const cancelRunningQuery = useCallback(async () => {
     const connectionId = connectionIdRef.current;
@@ -300,21 +376,30 @@ export function useQuerySession(): QuerySession {
   }, []);
 
   const cancellationSupported = capabilities?.cancellation === true;
+  const canFetchMore =
+    connection.status === "connected" &&
+    !isRunning &&
+    !isFetchingMore &&
+    outcome.kind === "partial" &&
+    canFetchMoreResult(outcome.result, requestedLimitRef.current);
 
   return {
     connection,
     outcome,
     isRunning,
-    canRun: connection.status === "connected" && !isRunning,
+    canRun: connection.status === "connected" && !isRunning && !isFetchingMore,
     cancellationSupported,
     canCancel: isRunning && cancellationSupported,
     cancelRequested,
+    canFetchMore,
+    isFetchingMore,
     notice,
     history,
     openDatabase,
     disconnectDatabase,
     refreshObjects,
     runQuery,
+    fetchMore,
     cancelRunningQuery,
     clearHistory,
   };

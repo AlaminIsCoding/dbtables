@@ -5,6 +5,7 @@ import {
   FALLBACK_QUERY_ERROR,
   idleOutcome,
   isEmptyResult,
+  isPartialResult,
   resultOutcome,
   runningOutcome,
   summarizeResult,
@@ -40,6 +41,25 @@ describe("query outcome helpers", () => {
 
     expect(resultOutcome(result)).toEqual({ kind: "empty", result });
     expect(isEmptyResult(result)).toBe(true);
+  });
+
+  it("classifies a truncated populated success as partial", () => {
+    const result = succeeded({
+      columns: [{ name: "id" }],
+      rows: [[{ type: "integer", value: 1 }]],
+      truncated: true,
+    });
+
+    expect(resultOutcome(result)).toEqual({ kind: "partial", result });
+    expect(isPartialResult(result)).toBe(true);
+    expect(isEmptyResult(result)).toBe(false);
+  });
+
+  it("does not classify a truncated result without columns as partial", () => {
+    const result = succeeded({ affectedRows: 1, truncated: true });
+
+    expect(isPartialResult(result)).toBe(false);
+    expect(resultOutcome(result)).toEqual({ kind: "statement", result });
   });
 
   it("classifies a success without result columns as a statement", () => {

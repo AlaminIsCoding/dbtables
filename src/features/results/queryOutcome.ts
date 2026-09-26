@@ -14,16 +14,18 @@ export const FALLBACK_QUERY_ERROR: QueryError = {
 /**
  * Everything the results pane needs to render one query outcome.
  *
- * `grid`, `empty`, and `statement` are all successful terminal results; they are
- * separated so the UI can distinguish a row-returning success from a statement
- * that only reports affected rows. `failed`/`error` are distinct: `failed` came
- * from a normalized {@link QueryResult}, while `error` is a command-level
- * failure such as a lost connection or an invalid cap.
+ * `grid`, `partial`, `empty`, and `statement` are all successful terminal
+ * results; they are separated so the UI can distinguish a complete result from
+ * one that was cut off by the row cap (`partial`), a statement that returned no
+ * rows, and a statement that only reports affected rows. `failed`/`error` are
+ * distinct: `failed` came from a normalized {@link QueryResult}, while `error`
+ * is a command-level failure such as a lost connection or an invalid cap.
  */
 export type QueryOutcome =
   | { kind: "idle" }
   | { kind: "running" }
   | { kind: "grid"; result: QueryResult }
+  | { kind: "partial"; result: QueryResult }
   | { kind: "empty"; result: QueryResult }
   | { kind: "statement"; result: QueryResult }
   | { kind: "failed"; error: QueryError }
@@ -60,6 +62,16 @@ export function isEmptyResult(result: QueryResult): boolean {
   );
 }
 
+/** Whether a successful result was cut off by the row cap. */
+export function isPartialResult(result: QueryResult): boolean {
+  return (
+    result.state === "succeeded" &&
+    hasResultColumns(result) &&
+    (result.rows?.length ?? 0) > 0 &&
+    result.truncated
+  );
+}
+
 /** Classifies a normalized backend result into a renderable outcome. */
 export function resultOutcome(result: QueryResult): QueryOutcome {
   switch (result.state) {
@@ -67,8 +79,11 @@ export function resultOutcome(result: QueryResult): QueryOutcome {
       if (!hasResultColumns(result)) {
         return { kind: "statement", result };
       }
-      return isEmptyResult(result)
-        ? { kind: "empty", result }
+      if (isEmptyResult(result)) {
+        return { kind: "empty", result };
+      }
+      return isPartialResult(result)
+        ? { kind: "partial", result }
         : { kind: "grid", result };
 
     case "failed":

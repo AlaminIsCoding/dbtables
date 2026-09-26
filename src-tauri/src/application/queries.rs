@@ -18,6 +18,12 @@ pub const DEFAULT_MAX_ROWS: u32 = 500;
 /// Hard upper bound the application applies to any caller-supplied cap.
 pub const HARD_MAX_ROWS: u32 = 10_000;
 
+/// Rows added to the cap each time a caller fetches more of the same result.
+///
+/// The frontend mirrors this step so a "fetch more" request grows by a bounded
+/// amount; the backend still clamps the result to [`HARD_MAX_ROWS`].
+pub const FETCH_MORE_STEP: u32 = 500;
+
 /// Resolves the row cap for a request.
 ///
 /// `None` gets the default; an explicit `0` is rejected rather than silently
@@ -32,6 +38,28 @@ pub fn resolve_max_rows(requested: Option<u32>) -> Result<u32, QueryError> {
         )),
         Some(value) => Ok(value.min(HARD_MAX_ROWS)),
     }
+}
+
+/// Whether a truncated result that showed `loaded` rows can be extended.
+///
+/// Reaching [`HARD_MAX_ROWS`] is the end of the bounded flow: the application
+/// will not grow a result past its hard ceiling, so the UI must stop offering
+/// "fetch more" rather than re-running the same statement forever.
+pub fn can_fetch_more(loaded: u32) -> bool {
+    loaded < HARD_MAX_ROWS
+}
+
+/// Resolves the cap to request for the next incremental fetch.
+///
+/// Returns `None` when `loaded` rows already reached [`HARD_MAX_ROWS`], so a
+/// caller cannot ask for an unbounded extension. Otherwise the cap grows by
+/// [`FETCH_MORE_STEP`] and is clamped to the hard ceiling.
+pub fn next_fetch_rows(loaded: u32) -> Option<u32> {
+    if !can_fetch_more(loaded) {
+        return None;
+    }
+
+    Some(loaded.saturating_add(FETCH_MORE_STEP).min(HARD_MAX_ROWS))
 }
 
 /// Executes one SQL statement with a bounded result size.
@@ -78,8 +106,8 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use super::{
-        cancel_query, capabilities, execute_query, resolve_max_rows, DEFAULT_MAX_ROWS,
-        HARD_MAX_ROWS,
+        cancel_query, can_fetch_more, capabilities, execute_query, next_fetch_rows,
+        resolve_max_rows, DEFAULT_MAX_ROWS, FETCH_MORE_STEP, HARD_MAX_ROWS,
     };
     use crate::database::testing::FakeAdapter;
     use crate::database::{CancelOutcome, ConnectionId, ConnectionSecret, DatabaseAdapter};
@@ -117,6 +145,27 @@ mod tests {
 
         let error = resolve_max_rows(Some(0)).expect_err("zero is not a valid cap");
         assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn next_fetch_rows_grows_by_a_bounded_step_and_stops_at_the_hard_cap() {
+        assert_eq!(next_fetch_rows(0), Some(FETCH_MORE_STEP));
+        assert_eq!(next_fetch_rows(FETCH_MORE_STEP), Some(FETCH_MORE_STEP * 2));
+        assert_eq!(
+            next_fetch_rows(HARD_MAX_ROWS - 1),
+            Some(HARD_MAX_ROWS),
+            "the next fetch must not exceed the hard ceiling"
+        );
+
+        assert!(can_fetch_more(0));
+        assert!(can_fetch_more(HARD_MAX_ROWS - 1));
+        assert!(!can_fetch_more(HARD_MAX_ROWS));
+        assert_eq!(next_fetch_rows(HARD_MAX_ROWS), None);
+        assert_eq!(
+            next_fetch_rows(HARD_MAX_ROWS + 1),
+            None,
+            "an already-over-cap result cannot be extended"
+        );
     }
 
     #[test]
