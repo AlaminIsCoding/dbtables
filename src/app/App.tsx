@@ -1,16 +1,18 @@
 import { useState } from "react";
 
 import { Sidebar } from "@/components/layout/Sidebar";
+import { ConnectScreen } from "@/components/layout/ConnectScreen";
 import { TopBar } from "@/components/layout/TopBar";
 import { Workspace } from "@/components/layout/Workspace";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-import { WorkspaceProvider } from "./store";
+import { WorkspaceProvider, useWorkspace } from "./store";
 import { useTheme } from "./useTheme";
 
 function Shell() {
   const { theme, toggleTheme } = useTheme();
+  const { connectionId } = useWorkspace();
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   return (
@@ -22,8 +24,14 @@ function Shell() {
           onToggleSidebar={() => setSidebarOpen((open) => !open)}
         />
         <div className="flex min-h-0 flex-1">
-          <Sidebar collapsed={!sidebarOpen} />
-          <Workspace />
+          {connectionId ? (
+            <>
+              <Sidebar collapsed={!sidebarOpen} />
+              <Workspace />
+            </>
+          ) : (
+            <ConnectScreen />
+          )}
         </div>
       </div>
       <Toaster theme={theme} position="bottom-right" />

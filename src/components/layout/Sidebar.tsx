@@ -56,6 +56,7 @@ export interface SidebarProps {
 /** Explorer sidebar: schema sections, search, and per-object actions. */
 export function Sidebar({ className, collapsed = false }: SidebarProps) {
   const {
+    connections,
     connectionId,
     schema,
     rowCounts,
@@ -96,6 +97,21 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
   const filteredTables = matches(tables);
   const filteredViews = matches(views);
 
+  const profiles =
+    connections.profiles.status === "ready" ? connections.profiles.profiles : [];
+  const activeProfileId =
+    connections.active.status === "connected" ||
+    connections.active.status === "connecting"
+      ? connections.active.profileId
+      : null;
+  const activeProfile = profiles.find((profile) => profile.id === activeProfileId);
+  const activeName = connectionId
+    ? (activeProfile?.name ?? "connected")
+    : null;
+  const activeEngine =
+    activeProfile?.descriptor.engine ??
+    (connectionId !== null ? "sqlite" : null);
+
   const handleDrop = async () => {
     if (!pendingDrop || !connectionId) {
       return;
@@ -134,11 +150,17 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
         className,
       )}
     >
-      <div className="flex h-9 shrink-0 items-center gap-1 px-2">
-        <span className="text-[10.5px] font-semibold tracking-wider text-muted-foreground uppercase">
-          Schema
+      <div className="mb-1 flex h-9 shrink-0 items-center gap-1 px-2 pt-1">
+        <span className="flex min-w-0 flex-1 items-baseline gap-1">
+          <span className="truncate font-mono text-[11px]">
+            {activeName ?? "No database"}
+          </span>
+          {activeEngine ? (
+            <span className="shrink-0 text-[10px] text-muted-foreground">
+              ({activeEngine})
+            </span>
+          ) : null}
         </span>
-        <div className="flex-1" />
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -154,7 +176,7 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
           <TooltipContent>Refresh schema</TooltipContent>
         </Tooltip>
         <CreateMenu>
-          <Button variant="ghost" size="icon-xs" aria-label="Create">
+          <Button variant="outline" size="icon-sm" aria-label="Add">
             <PlusIcon />
           </Button>
         </CreateMenu>
@@ -226,15 +248,6 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
           </div>
         )}
       </ScrollArea>
-
-      <div className="flex shrink-0 justify-center p-2">
-        <CreateMenu align="start">
-          <Button variant="outline" size="sm" className="justify-center">
-            <PlusIcon />
-            Add
-          </Button>
-        </CreateMenu>
-      </div>
 
       <AlertDialog
         open={pendingDrop !== null}

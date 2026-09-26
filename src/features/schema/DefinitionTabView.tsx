@@ -86,7 +86,7 @@ type AddChange = Extract<PendingColumnChange, { kind: "add" }>;
 
 /** Grid shared by the column header and its rows. */
 const COLUMN_GRID =
-  "grid grid-cols-[minmax(9rem,1.3fr)_minmax(8rem,1.1fr)_56px_52px_minmax(8rem,1fr)_72px] items-center gap-2";
+  "grid grid-cols-[minmax(9rem,1.3fr)_minmax(8rem,1.1fr)_56px_52px_72px] items-center gap-2";
 
 /** Grid shared by the foreign-key header and its rows. */
 const FK_GRID =
@@ -481,57 +481,6 @@ export function DefinitionTabView({
       aria-label="Object definition"
       className="flex min-h-0 flex-1 flex-col bg-background"
     >
-      <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-semibold tracking-wide text-muted-foreground uppercase">
-            Definition
-          </span>
-          <span className="truncate font-mono text-[11px]" title={object.name}>
-            {object.name}
-          </span>
-          {pending.length > 0 ? (
-            <span data-testid="pending-count" className="text-[11px] text-muted-foreground">
-              {pending.length} pending
-            </span>
-          ) : null}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => void load()}
-            disabled={loading || isApplying}
-          >
-            <RefreshCwIcon />
-            Refresh
-          </Button>
-          {canEdit ? (
-            <>
-              <Button
-                size="sm"
-                onClick={() => void handleApply()}
-                disabled={pending.length === 0 || isApplying}
-                data-testid="apply-changes"
-              >
-                <CheckIcon />
-                {isApplying ? "Applying…" : `Apply (${pending.length})`}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setPending([]);
-                }}
-                disabled={pending.length === 0 || isApplying}
-              >
-                <Undo2Icon />
-                Discard
-              </Button>
-            </>
-          ) : null}
-        </div>
-      </header>
-
       {object.kind === "view" ? (
         <p
           role="status"
@@ -566,10 +515,6 @@ export function DefinitionTabView({
                       {columns.length}
                     </span>
                   </div>
-                  <p className="text-[10px] text-muted-foreground">
-                    SQLite cannot change a column type, nullability, or default.
-                    Add, rename, or drop columns instead.
-                  </p>
 
                   <div
                     className={cn(
@@ -581,7 +526,6 @@ export function DefinitionTabView({
                     <span>Type</span>
                     <span className="text-center">Null</span>
                     <span className="text-center">PK</span>
-                    <span>Default</span>
                     <span className="text-right">Actions</span>
                   </div>
 
@@ -686,9 +630,6 @@ export function DefinitionTabView({
                                 <span className="text-[11px] text-muted-foreground">-</span>
                               )}
                             </span>
-                            <span className="font-mono text-[11px] text-muted-foreground">
-                              -
-                            </span>
                             <div className="flex justify-end gap-0.5">
                               {drop ? (
                                 <Button
@@ -766,9 +707,6 @@ export function DefinitionTabView({
                               <span className="text-[11px] text-muted-foreground">-</span>
                             )}
                           </span>
-                          <span className="truncate font-mono text-[11px] text-muted-foreground">
-                            {change.column.default ?? "-"}
-                          </span>
                           <div className="flex justify-end">
                             <Button
                               size="xs"
@@ -785,41 +723,58 @@ export function DefinitionTabView({
 
                   {canEdit ? (
                     <div className="flex flex-col gap-2 border-t border-border/60 pt-2">
-                      <div className={COLUMN_GRID}>
-                        <Input
-                          aria-label="New column name"
-                          value={newName}
-                          spellCheck={false}
-                          placeholder="column_name"
-                          className={inputClass()}
-                          onChange={(event) => {
-                            setNewName(event.target.value);
-                            setAddError(null);
-                          }}
-                        />
-                        <Select
-                          value={newType}
-                          onValueChange={(value) => {
-                            setNewType(value);
-                            setAddError(null);
-                          }}
-                        >
-                          <SelectTrigger
-                            size="sm"
-                            aria-label="New column type"
-                            className="h-7 w-full font-mono text-[11px]"
+                      <div className="flex flex-wrap items-end gap-2">
+                        <label className="flex flex-col gap-1">
+                          {fieldLabel("Name")}
+                          <Input
+                            aria-label="New column name"
+                            value={newName}
+                            spellCheck={false}
+                            placeholder="column_name"
+                            className={inputClass("w-40")}
+                            onChange={(event) => {
+                              setNewName(event.target.value);
+                              setAddError(null);
+                            }}
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          {fieldLabel("Type")}
+                          <Select
+                            value={newType}
+                            onValueChange={(value) => {
+                              setNewType(value);
+                              setAddError(null);
+                            }}
                           >
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {TYPE_OPTIONS.map((type) => (
-                              <SelectItem key={type} value={type}>
-                                {type}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                        <span className="flex justify-center">
+                            <SelectTrigger
+                              size="sm"
+                              aria-label="New column type"
+                              className="h-7 w-32 font-mono text-[11px]"
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {TYPE_OPTIONS.map((type) => (
+                                <SelectItem key={type} value={type}>
+                                  {type}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </label>
+                        <label className="flex flex-col gap-1">
+                          {fieldLabel("Default")}
+                          <Input
+                            aria-label="New column default"
+                            value={newDefault}
+                            spellCheck={false}
+                            placeholder="(none)"
+                            className={inputClass("w-32")}
+                            onChange={(event) => setNewDefault(event.target.value)}
+                          />
+                        </label>
+                        <label className="flex items-center gap-2 pb-2 text-[11px]">
                           <Checkbox
                             aria-label="New column nullable"
                             checked={newNullable}
@@ -827,8 +782,9 @@ export function DefinitionTabView({
                               setNewNullable(checked === true)
                             }
                           />
-                        </span>
-                        <span className="flex justify-center">
+                          Nullable
+                        </label>
+                        <label className="flex items-center gap-2 pb-2 text-[11px]">
                           <Checkbox
                             aria-label="New column primary key"
                             checked={newPrimary}
@@ -836,26 +792,17 @@ export function DefinitionTabView({
                               setNewPrimary(checked === true)
                             }
                           />
-                        </span>
-                        <Input
-                          aria-label="New column default"
-                          value={newDefault}
-                          spellCheck={false}
-                          placeholder="(none)"
-                          className={inputClass()}
-                          onChange={(event) => setNewDefault(event.target.value)}
-                        />
-                        <div className="flex justify-end">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={handleAddColumn}
-                            data-testid="stage-add-column"
-                          >
-                            <PlusIcon />
-                            Add
-                          </Button>
-                        </div>
+                          Primary key
+                        </label>
+                        <Button
+                          size="sm"
+                          className="mb-0.5"
+                          onClick={handleAddColumn}
+                          data-testid="stage-add-column"
+                        >
+                          <PlusIcon />
+                          Add column
+                        </Button>
                       </div>
                       {addError ? (
                         <p role="alert" className="text-[11px] text-destructive">
@@ -1113,6 +1060,54 @@ export function DefinitionTabView({
           </ResizablePanel>
         </ResizablePanelGroup>
       )}
+
+      <footer className="flex h-9 shrink-0 items-center gap-1 border-t border-border bg-muted px-2 text-xs select-none">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Refresh"
+          aria-label="Refresh"
+          onClick={() => void load()}
+          disabled={loading || isApplying}
+        >
+          <RefreshCwIcon className={loading ? "animate-spin" : undefined} />
+        </Button>
+        {canEdit ? (
+          <>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Apply changes"
+              aria-label="Apply changes"
+              onClick={() => void handleApply()}
+              disabled={pending.length === 0 || isApplying}
+              data-testid="apply-changes"
+              className={pending.length > 0 ? "text-primary" : undefined}
+            >
+              <CheckIcon />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              title="Discard changes"
+              aria-label="Discard changes"
+              onClick={() => setPending([])}
+              disabled={pending.length === 0 || isApplying}
+            >
+              <Undo2Icon />
+            </Button>
+          </>
+        ) : null}
+        {pending.length > 0 ? (
+          <span
+            data-testid="pending-count"
+            className="inline-flex h-5 items-center rounded-full bg-primary/15 px-2 text-[11px] font-medium text-accent-foreground"
+          >
+            {pending.length} pending
+          </span>
+        ) : null}
+        <div className="flex-1" />
+      </footer>
 
       <AlertDialog
         open={dropTarget !== null}

@@ -47,7 +47,7 @@ export interface IndexTabViewProps {
 
 /** Grid shared by the index header and its rows. */
 const INDEX_GRID =
-  "grid grid-cols-[minmax(10rem,1.4fr)_minmax(9rem,1.2fr)_72px_64px_36px] items-center gap-2";
+  "grid grid-cols-[minmax(10rem,1.5fr)_minmax(9rem,1.3fr)_72px_36px] items-center gap-2";
 
 function fieldLabel(text: string) {
   return (
@@ -207,31 +207,6 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
       aria-label="Object indexes"
       className="flex min-h-0 flex-1 flex-col bg-background"
     >
-      <header className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0 font-semibold tracking-wide text-muted-foreground uppercase">
-            Indexes
-          </span>
-          <span className="truncate font-mono text-[11px]" title={object.name}>
-            {object.name}
-          </span>
-          {indexes ? (
-            <span className="text-[11px] text-muted-foreground tabular-nums">
-              {indexes.length}
-            </span>
-          ) : null}
-        </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => void load()}
-          disabled={loading || busy}
-        >
-          <RefreshCwIcon />
-          Refresh
-        </Button>
-      </header>
-
       {loading && description === null ? (
         <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[11px] text-muted-foreground">
           <Spinner className="size-3" /> Loading indexes…
@@ -249,9 +224,16 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
             <div className="h-full overflow-auto p-3">
               <div className="flex flex-col gap-5">
                 <section className="flex flex-col gap-2">
-                  <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
-                    Existing indexes
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                      Indexes
+                    </span>
+                    {indexes ? (
+                      <span className="text-[10px] text-muted-foreground tabular-nums">
+                        {indexes.length}
+                      </span>
+                    ) : null}
+                  </div>
 
                   {indexes === undefined ? (
                     <p
@@ -275,7 +257,6 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
                         <span>Name</span>
                         <span>Columns</span>
                         <span className="text-center">Unique</span>
-                        <span className="text-center">Primary</span>
                         <span />
                       </div>
                       <div className="flex flex-col">
@@ -284,24 +265,22 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
                             key={index.name}
                             className={cn(INDEX_GRID, "border-t border-border/60 py-1")}
                           >
-                            <span className="truncate font-mono text-[11px]">
-                              {index.name}
+                            <span className="flex min-w-0 items-center gap-1.5">
+                              <span className="truncate font-mono text-[11px]">
+                                {index.name}
+                              </span>
+                              {index.primary ? (
+                                <Badge variant="outline" className="h-4 shrink-0 px-1 text-[9px]">
+                                  <KeyRoundIcon className="size-3" />
+                                  PK
+                                </Badge>
+                              ) : null}
                             </span>
                             <span className="truncate font-mono text-[11px] text-muted-foreground">
                               {(index.columns ?? []).join(", ") || "-"}
                             </span>
                             <span className="text-center text-[11px] text-muted-foreground">
                               {index.unique ? "Yes" : "No"}
-                            </span>
-                            <span className="flex justify-center">
-                              {index.primary ? (
-                                <Badge variant="outline" className="h-4 px-1 text-[9px]">
-                                  <KeyRoundIcon className="size-3" />
-                                  PK
-                                </Badge>
-                              ) : (
-                                <span className="text-[11px] text-muted-foreground">-</span>
-                              )}
                             </span>
                             <div className="flex justify-end">
                               {canCreate ? (
@@ -448,6 +427,20 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
           </ResizablePanel>
         </ResizablePanelGroup>
       )}
+
+      <footer className="flex h-9 shrink-0 items-center gap-1 border-t border-border bg-muted px-2 text-xs select-none">
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Refresh"
+          aria-label="Refresh"
+          onClick={() => void load()}
+          disabled={loading || busy}
+        >
+          <RefreshCwIcon className={loading ? "animate-spin" : undefined} />
+        </Button>
+        <div className="flex-1" />
+      </footer>
 
       <AlertDialog
         open={dropTarget !== null}

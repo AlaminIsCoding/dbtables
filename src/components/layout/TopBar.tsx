@@ -5,25 +5,17 @@ import {
   MessageSquareIcon,
   MoonIcon,
   PanelLeftIcon,
+  PowerIcon,
   SquarePenIcon,
   SunIcon,
-  XIcon,
 } from "lucide-react";
 
 import type { Theme } from "@/app/theme";
 import { useWorkspace } from "@/app/store";
 import logoDark from "@/assets/logo-dark.png";
 import logoLight from "@/assets/logo-light.png";
-import { ConnectionManager } from "@/features/connections";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -33,6 +25,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+
+import { ConnectionsDialog } from "./ConnectionsDialog";
 
 export interface TopBarProps {
   theme: Theme;
@@ -63,15 +57,6 @@ export function TopBar({
 
   const profiles =
     connections.profiles.status === "ready" ? connections.profiles.profiles : [];
-  const activeProfileId =
-    connections.active.status === "connected" ||
-    connections.active.status === "connecting"
-      ? connections.active.profileId
-      : null;
-  const activeProfile = profiles.find((p) => p.id === activeProfileId);
-  const activeEngine =
-    activeProfile?.descriptor.engine ??
-    (connectionId !== null ? "sqlite" : null);
 
   return (
     <header
@@ -86,6 +71,7 @@ export function TopBar({
             variant="ghost"
             size="icon-sm"
             onClick={onToggleSidebar}
+            disabled={connectionId === null}
             aria-label="Toggle sidebar"
           >
             <PanelLeftIcon />
@@ -132,32 +118,26 @@ export function TopBar({
           <DropdownMenuItem onSelect={() => setManagerOpen(true)}>
             Manage connections…
           </DropdownMenuItem>
+          {connectionId ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => void connections.disconnect()}>
+                <PowerIcon />
+                Disconnect
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {activeEngine && connectionId ? (
-        <div className="ml-1 flex max-w-64 items-center gap-2 rounded-full border border-border bg-muted py-0.5 pr-1 pl-2.5 text-xs">
-          <span className="size-1.5 shrink-0 rounded-full bg-emerald-500" />
-          <span className="truncate font-mono text-[11px]">
-            {activeProfile?.name ?? "connected"}
-          </span>
-          <span className="text-[10px] uppercase text-muted-foreground">
-            {activeEngine}
-          </span>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onClick={() => void connections.disconnect()}
-            aria-label="Disconnect"
-          >
-            <XIcon />
-          </Button>
-        </div>
-      ) : null}
-
       <div className="flex-1" />
 
-      <Button variant="outline" size="sm" onClick={() => openQuery()}>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => openQuery()}
+        disabled={connectionId === null}
+      >
         <SquarePenIcon />
         New query
       </Button>
@@ -194,20 +174,11 @@ export function TopBar({
         <TooltipContent>Toggle theme</TooltipContent>
       </Tooltip>
 
-      <Dialog open={managerOpen} onOpenChange={setManagerOpen}>
-        <DialogContent className="max-w-2xl p-0">
-          <DialogHeader className="px-4 pt-4">
-            <DialogTitle>Connections</DialogTitle>
-            <DialogDescription>
-              Create and connect SQLite databases. Passwords for server engines
-              are stored in the operating system credential store.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="max-h-[70vh] overflow-y-auto px-4 pb-4">
-            <ConnectionManager controller={connections} />
-          </div>
-        </DialogContent>
-      </Dialog>
+      <ConnectionsDialog
+        open={managerOpen}
+        onOpenChange={setManagerOpen}
+        controller={connections}
+      />
     </header>
   );
 }
