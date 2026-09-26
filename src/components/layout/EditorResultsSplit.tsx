@@ -1,3 +1,4 @@
+import { ResultsPanel } from "../../features/results";
 import { SplitPane } from "./SplitPane";
 
 interface EditorResultsSplitProps {
@@ -25,22 +26,7 @@ function EditorPane({ label }: { label: string }) {
 }
 
 function ResultsPane() {
-  return (
-    <div className="flex h-full flex-col">
-      <div className="flex h-7 shrink-0 items-center justify-between border-b border-border px-2 text-[11px] text-muted-foreground">
-        <span>Results</span>
-        <span>0 rows</span>
-      </div>
-      <div className="flex flex-1 items-center justify-center p-4 text-center">
-        <div>
-          <p className="text-sm font-medium">No results yet</p>
-          <p className="mt-1 max-w-xs text-xs text-muted-foreground">
-            Run a query to see rows. The Glide grid prototype is the next task.
-          </p>
-        </div>
-      </div>
-    </div>
-  );
+  return <ResultsPanel />;
 }
 
 /** Editor-over-results split used by each query tab placeholder. */

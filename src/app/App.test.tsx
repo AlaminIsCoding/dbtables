@@ -8,6 +8,27 @@ vi.mock("../services/appStatus", () => ({
   getAppStatus: vi.fn(),
 }));
 
+// The shell renders the Glide prototype in the results pane. jsdom has no
+// canvas support, so the grid is stubbed to keep the shell test focused.
+vi.mock("@glideapps/glide-data-grid", () => ({
+  GridCellKind: {
+    Uri: "uri",
+    Text: "text",
+    Image: "image",
+    RowID: "row-id",
+    Number: "number",
+    Bubble: "bubble",
+    Boolean: "boolean",
+    Loading: "loading",
+    Markdown: "markdown",
+    Drilldown: "drilldown",
+    Protected: "protected",
+    Custom: "custom",
+  },
+  getDefaultTheme: () => ({}),
+  DataEditor: () => null,
+}));
+
 const getAppStatusMock = vi.mocked(getAppStatus);
 
 const okResponse: AppStatusResponse = {
@@ -41,7 +62,11 @@ describe("App workspace shell", () => {
     ).toBe("true");
     expect(screen.getByRole("tab", { name: "Query 2" })).toBeTruthy();
     expect(screen.getByText("SQL editor")).toBeTruthy();
-    expect(screen.getByText("No results yet")).toBeTruthy();
+    expect(
+      screen.getByRole("region", {
+        name: /Query results grid: 120 rows, 11 columns/,
+      }),
+    ).toBeTruthy();
     expect(
       screen.getByRole("separator", { name: "Resize editor and results" }),
     ).toBeTruthy();
