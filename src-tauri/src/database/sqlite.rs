@@ -1071,9 +1071,9 @@ mod fixture_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll, Waker};
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, ErrorCode};
 
-    use super::SqliteAdapter;
+    use super::{categorize, SqliteAdapter};
     use crate::database::{
         ChangeOutcome, ChangeRequest, ConnectionId, ConnectionState, ConstraintKind,
         DatabaseAdapter, FilterOperator, ObjectKind, ObjectRef, ObjectScope, PendingChange,
@@ -1188,6 +1188,27 @@ mod fixture_tests {
             schema: None,
             name: "users".to_string(),
             kind: ObjectKind::Table,
+        }
+    }
+
+    /// Pins the SQLite result-code mapping used by the failure path.
+    ///
+    /// A busy or locked database must be categorized as `locking` so a blocked
+    /// write is never rendered as a successful result, matching the explicit
+    /// lock/deadlock coverage for the MySQL and PostgreSQL adapters.
+    #[test]
+    fn sqlite_result_codes_map_to_normalized_categories() {
+        let cases = [
+            (ErrorCode::DatabaseBusy, ErrorCategory::Locking),
+            (ErrorCode::DatabaseLocked, ErrorCategory::Locking),
+            (ErrorCode::ConstraintViolation, ErrorCategory::Constraint),
+            (ErrorCode::PermissionDenied, ErrorCategory::Permission),
+            (ErrorCode::ReadOnly, ErrorCategory::Permission),
+            (ErrorCode::OperationInterrupted, ErrorCategory::Cancelled),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(categorize(code), expected, "code {code:?}");
         }
     }
 
