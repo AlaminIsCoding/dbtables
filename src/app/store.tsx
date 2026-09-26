@@ -9,7 +9,13 @@ import {
   type ReactNode,
 } from "react";
 
-import type { ObjectRef, QueryError, TableFilter } from "@/domain";
+import type {
+  ObjectRef,
+  ObjectScope,
+  QueryError,
+  ScopeListing,
+  TableFilter,
+} from "@/domain";
 import {
   useConnectionManager,
   type ConnectionManagerController,
@@ -28,7 +34,7 @@ import {
   type WorkspaceTabsState,
 } from "@/lib/workspace/tabs";
 import { toQueryError } from "@/services/errors";
-import { listObjects } from "@/services/metadata";
+import { listObjects, listScopes } from "@/services/metadata";
 import { countTableRows } from "@/services/schema";
 
 /** Severity of a database message shown in the messages drawer. */
@@ -57,6 +63,12 @@ export interface WorkspaceValue {
   connectionId: string | null;
   /** Connected schema listing. */
   schema: SchemaState;
+  /** Database/schema scopes the connection exposes, or `null` when unsupported. */
+  scopes: ScopeListing | null;
+  /** Currently selected database/schema scope. */
+  scope: ObjectScope;
+  /** Selects a database/schema scope and reloads the object list. */
+  setScope: (scope: ObjectScope) => void;
   /** Row counts keyed by table name; absent while unknown. */
   rowCounts: Record<string, number>;
   /** Reloads the schema listing and row counts. */
@@ -116,12 +128,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     activeId: null,
   });
   const [schema, setSchema] = useState<SchemaState>({ status: "idle" });
+  const [scopes, setScopes] = useState<ScopeListing | null>(null);
+  const [scope, setScopeState] = useState<ObjectScope>({});
   const [rowCounts, setRowCounts] = useState<Record<string, number>>({});
   const [messages, setMessages] = useState<MessageEntry[]>([]);
   const [unread, setUnread] = useState(0);
   const [messagesOpen, setMessagesOpen] = useState(false);
   const messageIdRef = useRef(0);
   const countTokenRef = useRef(0);
+  // Read inside `refreshSchema` without making it change identity per selection.
+  const scopeRef = useRef<ObjectScope>(scope);
+  scopeRef.current = scope;
 
   const connectionId =
     connections.active.status === "connected"
@@ -171,20 +188,39 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const refreshSchema = useCallback(async () => {
     if (!connectionId) {
       setSchema({ status: "idle" });
+      setScopes(null);
       setRowCounts({});
       return;
     }
     setSchema({ status: "loading" });
     try {
-      const objects = await listObjects(connectionId);
-      const tables = objects.filter((object) => object.kind === "table");
-      const views = objects.filter((object) => object.kind === "view");
+      // Scope discovery is best-effort: an engine without scopes reports
+      // `unsupported`, which must not fail the object listing.
+      const [scopesResult, objects] = await Promise.allSettled([
+        listScopes(connectionId),
+        listObjects(connectionId, scopeRef.current),
+      ]);
+      setScopes(scopesResult.status === "fulfilled" ? scopesResult.value : null);
+      if (objects.status !== "fulfilled") {
+        throw objects.reason;
+      }
+      const tables = objects.value.filter((object) => object.kind === "table");
+      const views = objects.value.filter((object) => object.kind === "view");
       setSchema({ status: "ready", tables, views });
       void loadCounts(connectionId, tables);
     } catch (error) {
       setSchema({ status: "error", error: toQueryError(error) });
     }
   }, [connectionId, loadCounts]);
+
+  const setScope = useCallback(
+    (next: ObjectScope) => {
+      scopeRef.current = next;
+      setScopeState(next);
+      void refreshSchema();
+    },
+    [refreshSchema],
+  );
 
   // Reset schema and tabs whenever the active connection changes.
   const previousConnectionRef = useRef<string | null>(null);
@@ -206,10 +242,15 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
               ? connections.profiles.profiles.find((p) => p.id === profileId)?.name
               : undefined)
           : undefined;
+      scopeRef.current = {};
+      setScopeState({});
       void refreshSchema();
       log("success", `Connected to ${label ?? "database"}`);
     } else {
       setSchema({ status: "idle" });
+      setScopes(null);
+      setScopeState({});
+      scopeRef.current = {};
     }
   }, [connectionId, connections.active, connections.profiles, refreshSchema, log]);
 
@@ -259,6 +300,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       connections,
       connectionId,
       schema,
+      scopes,
+      scope,
+      setScope,
       rowCounts,
       refreshSchema,
       tabs: tabsState.tabs,
@@ -284,6 +328,9 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       connections,
       connectionId,
       schema,
+      scopes,
+      scope,
+      setScope,
       rowCounts,
       refreshSchema,
       tabsState.tabs,
