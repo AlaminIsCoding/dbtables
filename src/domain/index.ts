@@ -334,6 +334,15 @@ export function isSuccessfulOperationState(state: OperationState): boolean {
   return state === "succeeded";
 }
 
+/**
+ * Outcome of a cancellation request; mirrors the Rust `CancelOutcome`.
+ *
+ * Cancellation is a request, not proof that a server-side write was rolled
+ * back. `requested` only means the driver accepted the request for a running
+ * operation; the operation's own result reports the actual outcome.
+ */
+export type CancelOutcome = "requested" | "not_running";
+
 /** Mints a stable, unique operation identifier for a frontend-initiated request. */
 export function createOperationId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {

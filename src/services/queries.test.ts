@@ -1,8 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { QueryRequest, QueryResult } from "../domain";
-import { EXECUTE_QUERY_COMMAND, executeQuery } from "./queries";
+import type { EngineCapabilities, QueryRequest, QueryResult } from "../domain";
+import {
+  CANCEL_QUERY_COMMAND,
+  EXECUTE_QUERY_COMMAND,
+  QUERY_CAPABILITIES_COMMAND,
+  cancelQuery,
+  executeQuery,
+  getQueryCapabilities,
+} from "./queries";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -21,6 +28,16 @@ const result: QueryResult = {
   columns: [{ name: "id" }],
   rows: [[{ type: "integer", value: 1 }]],
   truncated: false,
+};
+
+const capabilities: EngineCapabilities = {
+  transactions: true,
+  ddlTransactions: true,
+  savepoints: true,
+  cancellation: true,
+  schemas: false,
+  multipleDatabases: false,
+  tls: false,
 };
 
 describe("executeQuery", () => {
@@ -49,5 +66,47 @@ describe("executeQuery", () => {
       category: "connection",
       message: "connection is not open",
     });
+  });
+});
+
+describe("cancelQuery", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("invokes the cancel_query command with the connection and operation", async () => {
+    invokeMock.mockResolvedValue("requested");
+
+    await expect(cancelQuery("sqlite-1", "op-1")).resolves.toBe("requested");
+
+    expect(invokeMock).toHaveBeenCalledWith(CANCEL_QUERY_COMMAND, {
+      connectionId: "sqlite-1",
+      operationId: "op-1",
+    });
+  });
+
+  it("surfaces an unsupported cancellation to the caller", async () => {
+    invokeMock.mockRejectedValue({
+      category: "unsupported",
+      message: "the driver does not support query cancellation",
+    });
+
+    await expect(cancelQuery("sqlite-1", "op-1")).rejects.toEqual({
+      category: "unsupported",
+      message: "the driver does not support query cancellation",
+    });
+  });
+});
+
+describe("getQueryCapabilities", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("invokes the query_capabilities command", async () => {
+    invokeMock.mockResolvedValue(capabilities);
+
+    await expect(getQueryCapabilities()).resolves.toEqual(capabilities);
+    expect(invokeMock).toHaveBeenCalledWith(QUERY_CAPABILITIES_COMMAND);
   });
 });

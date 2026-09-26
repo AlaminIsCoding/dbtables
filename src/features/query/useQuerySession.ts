@@ -1,11 +1,15 @@
 import { useCallback, useRef, useState } from "react";
 
-import type { ObjectRef, QueryError } from "../../domain";
+import type { EngineCapabilities, ObjectRef, QueryError } from "../../domain";
 import { createOperationId } from "../../domain";
 import { connectSqlite, disconnectConnection } from "../../services/connections";
 import { toQueryError } from "../../services/errors";
 import { listObjects } from "../../services/metadata";
-import { executeQuery } from "../../services/queries";
+import {
+  cancelQuery as requestQueryCancellation,
+  executeQuery,
+  getQueryCapabilities,
+} from "../../services/queries";
 import {
   commandErrorOutcome,
   idleOutcome,
@@ -13,6 +17,12 @@ import {
   runningOutcome,
   type QueryOutcome,
 } from "../results/queryOutcome";
+import {
+  historyEntryFromError,
+  historyEntryFromResult,
+  prependHistoryEntry,
+  type QueryHistoryEntry,
+} from "./queryHistory";
 
 /** Loading/ready/error state for the connection's object list. */
 export type ObjectListState =
@@ -51,11 +61,29 @@ export interface QuerySession {
   isRunning: boolean;
   /** Whether a query can be started right now. */
   canRun: boolean;
+  /** Whether the active connection's driver supports cancellation. */
+  cancellationSupported: boolean;
+  /** Whether the running query can be cancelled right now. */
+  canCancel: boolean;
+  /** Whether a cancellation request is in flight for the running query. */
+  cancelRequested: boolean;
+  /** Non-fatal notice, such as a cancellation that the driver refused. */
+  notice: string | null;
+  /** Bounded, local recent-query history. Never contains secrets. */
+  history: QueryHistoryEntry[];
   openDatabase: (filePath: string) => Promise<void>;
   disconnectDatabase: () => Promise<void>;
   refreshObjects: () => Promise<void>;
   /** Executes the supplied statement and records the outcome. */
   runQuery: (statement: string) => Promise<void>;
+  /** Requests driver cancellation of the running query when supported. */
+  cancelRunningQuery: () => Promise<void>;
+  /** Empties the recent-query history. */
+  clearHistory: () => void;
+}
+
+function defaultCapabilities(): EngineCapabilities | null {
+  return null;
 }
 
 /**
@@ -67,6 +95,12 @@ export interface QuerySession {
  * execution is awaited asynchronously; React updates to `running` before the
  * call so the editor and connection controls stay interactive while the backend
  * works.
+ *
+ * Cancellation is capability-gated: the hook reads the adapter's reported
+ * capabilities and only offers Cancel when the driver supports it. A cancel
+ * request never invents a final state; the executing call reports the real
+ * outcome, and a refused request surfaces a non-fatal notice instead of
+ * overwriting the running state.
  */
 export function useQuerySession(): QuerySession {
   const [connection, setConnection] = useState<ConnectionStatus>({
@@ -74,9 +108,16 @@ export function useQuerySession(): QuerySession {
   });
   const [outcome, setOutcome] = useState<QueryOutcome>(idleOutcome);
   const [isRunning, setIsRunning] = useState(false);
+  const [capabilities, setCapabilities] = useState<EngineCapabilities | null>(
+    defaultCapabilities,
+  );
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [history, setHistory] = useState<QueryHistoryEntry[]>([]);
 
   const connectionIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
+  const activeOperationRef = useRef<string | null>(null);
 
   const loadObjects = useCallback(async (connectionId: string) => {
     try {
@@ -97,6 +138,16 @@ export function useQuerySession(): QuerySession {
             }
           : current,
       );
+    }
+  }, []);
+
+  const loadCapabilities = useCallback(async () => {
+    try {
+      setCapabilities(await getQueryCapabilities());
+    } catch {
+      // Capability discovery is best-effort: an unknown adapter must never
+      // advertise a feature, so fall back to "nothing supported".
+      setCapabilities(null);
     }
   }, []);
 
@@ -122,6 +173,9 @@ export function useQuerySession(): QuerySession {
 
       setConnection({ status: "connecting" });
       setOutcome(idleOutcome());
+      setCapabilities(null);
+      setNotice(null);
+      setCancelRequested(false);
 
       try {
         const connectionId = await connectSqlite(trimmed);
@@ -132,13 +186,13 @@ export function useQuerySession(): QuerySession {
           filePath: trimmed,
           objects: { status: "loading" },
         });
-        await loadObjects(connectionId);
+        await Promise.all([loadObjects(connectionId), loadCapabilities()]);
       } catch (error) {
         connectionIdRef.current = null;
         setConnection({ status: "error", error: toQueryError(error) });
       }
     },
-    [loadObjects],
+    [loadCapabilities, loadObjects],
   );
 
   const disconnectDatabase = useCallback(async () => {
@@ -146,6 +200,9 @@ export function useQuerySession(): QuerySession {
     connectionIdRef.current = null;
     setConnection({ status: "disconnected" });
     setOutcome(idleOutcome());
+    setCapabilities(null);
+    setCancelRequested(false);
+    setNotice(null);
 
     if (connectionId) {
       try {
@@ -170,44 +227,95 @@ export function useQuerySession(): QuerySession {
     await loadObjects(connectionId);
   }, [loadObjects]);
 
-  const runQuery = useCallback(async (statement: string) => {
+  const recordHistory = useCallback((entry: QueryHistoryEntry | null) => {
+    if (!entry) {
+      return;
+    }
+    setHistory((current) => prependHistoryEntry(current, entry));
+  }, []);
+
+  const runQuery = useCallback(
+    async (statement: string) => {
+      const connectionId = connectionIdRef.current;
+      if (!connectionId || runningRef.current) {
+        return;
+      }
+
+      const trimmed = statement.trim();
+      if (trimmed.length === 0) {
+        setOutcome(commandErrorOutcome(EMPTY_SQL_ERROR));
+        return;
+      }
+
+      const operationId = createOperationId();
+      runningRef.current = true;
+      activeOperationRef.current = operationId;
+      setIsRunning(true);
+      setCancelRequested(false);
+      setNotice(null);
+      setOutcome(runningOutcome());
+
+      try {
+        const result = await executeQuery(connectionId, {
+          operationId,
+          sql: trimmed,
+        });
+        setOutcome(resultOutcome(result));
+        recordHistory(historyEntryFromResult(operationId, trimmed, result));
+      } catch (error) {
+        const queryError = toQueryError(error);
+        setOutcome(commandErrorOutcome(queryError));
+        recordHistory(historyEntryFromError(operationId, trimmed, queryError));
+      } finally {
+        runningRef.current = false;
+        activeOperationRef.current = null;
+        setCancelRequested(false);
+        setIsRunning(false);
+      }
+    },
+    [recordHistory],
+  );
+
+  const cancelRunningQuery = useCallback(async () => {
     const connectionId = connectionIdRef.current;
-    if (!connectionId || runningRef.current) {
+    const operationId = activeOperationRef.current;
+    if (!connectionId || !operationId || !runningRef.current) {
       return;
     }
 
-    const trimmed = statement.trim();
-    if (trimmed.length === 0) {
-      setOutcome(commandErrorOutcome(EMPTY_SQL_ERROR));
-      return;
-    }
-
-    runningRef.current = true;
-    setIsRunning(true);
-    setOutcome(runningOutcome());
-
+    setCancelRequested(true);
+    setNotice(null);
     try {
-      const result = await executeQuery(connectionId, {
-        operationId: createOperationId(),
-        sql: trimmed,
-      });
-      setOutcome(resultOutcome(result));
+      await requestQueryCancellation(connectionId, operationId);
+      // A `requested` or `not_running` outcome is not itself a final state:
+      // the executing call reports the real result, so leave `outcome` alone.
     } catch (error) {
-      setOutcome(commandErrorOutcome(toQueryError(error)));
-    } finally {
-      runningRef.current = false;
-      setIsRunning(false);
+      setCancelRequested(false);
+      setNotice(toQueryError(error).message);
     }
   }, []);
+
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+  }, []);
+
+  const cancellationSupported = capabilities?.cancellation === true;
 
   return {
     connection,
     outcome,
     isRunning,
     canRun: connection.status === "connected" && !isRunning,
+    cancellationSupported,
+    canCancel: isRunning && cancellationSupported,
+    cancelRequested,
+    notice,
+    history,
     openDatabase,
     disconnectDatabase,
     refreshObjects,
     runQuery,
+    cancelRunningQuery,
+    clearHistory,
   };
 }

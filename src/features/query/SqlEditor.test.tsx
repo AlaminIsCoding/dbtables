@@ -29,7 +29,7 @@ describe("SqlEditor", () => {
     expect(screen.getByTestId("sql-editor").textContent).not.toContain("SELECT 1");
   });
 
-  it("runs on Ctrl+Enter", () => {
+  it("runs on Ctrl+Enter with the current selection context", () => {
     const onRun = vi.fn();
     render(<SqlEditor value="SELECT 1" onChange={() => {}} onRun={onRun} />);
 
@@ -40,6 +40,7 @@ describe("SqlEditor", () => {
     });
 
     expect(onRun).toHaveBeenCalledTimes(1);
+    expect(onRun).toHaveBeenCalledWith({ selectedText: "", cursor: 0 });
   });
 
   it("does not run on plain Enter", () => {
@@ -49,5 +50,21 @@ describe("SqlEditor", () => {
     fireEvent.keyDown(editorContent(), { key: "Enter", code: "Enter" });
 
     expect(onRun).not.toHaveBeenCalled();
+  });
+
+  it("reports the initial selection when mounted", () => {
+    const onSelectionChange = vi.fn();
+    render(
+      <SqlEditor
+        value="SELECT 1"
+        onChange={() => {}}
+        onSelectionChange={onSelectionChange}
+      />,
+    );
+
+    expect(onSelectionChange).toHaveBeenCalledWith({
+      selectedText: "",
+      cursor: 0,
+    });
   });
 });

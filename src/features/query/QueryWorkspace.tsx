@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 
 import { SplitPane } from "../../components/layout/SplitPane";
 import { Button } from "../../components/ui/button";
@@ -6,7 +6,10 @@ import { cn } from "../../components/ui/cn";
 import type { ObjectRef } from "../../domain";
 import { ResultsPanel } from "../results";
 import { selectStatementFor } from "./objectStatement";
-import { SqlEditor } from "./SqlEditor";
+import type { QueryHistoryEntry } from "./queryHistory";
+import { describeQueryStatus, formatQueryStatus } from "./queryStatus";
+import { SqlEditor, type SqlEditorSelection } from "./SqlEditor";
+import { hasExecutableStatement, resolveRunSql } from "./statement";
 import {
   useQuerySession,
   type ConnectionStatus,
@@ -97,6 +100,72 @@ function ObjectList({
   );
 }
 
+function HistoryList({
+  entries,
+  onPick,
+  onClear,
+}: {
+  entries: QueryHistoryEntry[];
+  onPick: (entry: QueryHistoryEntry) => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="rounded-md border border-border">
+      <div className="flex items-center justify-between border-b border-border px-2 py-1 text-[11px] text-muted-foreground">
+        <span>Recent queries</span>
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-5 px-1.5 text-[10px]"
+          onClick={onClear}
+          disabled={entries.length === 0}
+        >
+          Clear
+        </Button>
+      </div>
+      <div className="max-h-32 overflow-auto p-1">
+        {entries.length === 0 ? (
+          <p className="px-1 py-1 text-[11px] text-muted-foreground">
+            No queries run yet.
+          </p>
+        ) : (
+          <ul aria-label="Recent queries" className="flex flex-col gap-0.5">
+            {entries.map((entry) => (
+              <li key={entry.id}>
+                <button
+                  type="button"
+                  onClick={() => onPick(entry)}
+                  title={entry.sql}
+                  className="flex w-full items-center gap-2 rounded-sm px-1.5 py-0.5 text-left text-xs hover:bg-accent"
+                >
+                  <span
+                    className={cn(
+                      "w-16 shrink-0 text-[10px] uppercase tracking-wide",
+                      entry.state === "succeeded"
+                        ? "text-muted-foreground"
+                        : "text-destructive",
+                    )}
+                  >
+                    {entry.state}
+                  </span>
+                  <span className="truncate font-mono text-[11px]">
+                    {entry.sql}
+                  </span>
+                  {entry.durationMs !== undefined ? (
+                    <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                      {entry.durationMs} ms
+                    </span>
+                  ) : null}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EditorPane({
   session,
   label,
@@ -117,15 +186,41 @@ function EditorPane({
   const filePathId = `${baseId}-file-path`;
   const { connection } = session;
   const connected = connection.status === "connected";
-  const canRun = session.canRun && sql.trim().length > 0;
+  const hasStatement = hasExecutableStatement(sql);
+  const canRun = session.canRun && hasStatement;
+  const selectionRef = useRef<SqlEditorSelection>({
+    selectedText: "",
+    cursor: 0,
+  });
+  const status = describeQueryStatus(session.outcome);
 
   function run() {
-    if (!canRun) {
+    if (!session.canRun) {
       return;
     }
-    onExecuted?.(sql);
-    void session.runQuery(sql);
+
+    const resolved = resolveRunSql(
+      sql,
+      selectionRef.current.selectedText,
+      selectionRef.current.cursor,
+    );
+    if (resolved.sql.length === 0) {
+      // The cursor is not inside an executable statement and nothing is
+      // selected. Surface the blank-statement validation instead of executing
+      // unrelated text.
+      void session.runQuery("");
+      return;
+    }
+
+    onExecuted?.(resolved.sql);
+    void session.runQuery(resolved.sql);
   }
+
+  const cancelTitle = session.isRunning
+    ? session.cancellationSupported
+      ? "Cancel the running query"
+      : "Cancellation is not supported for this connection"
+    : "No query is running";
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -171,6 +266,7 @@ function EditorPane({
             </Button>
           </div>
           <p
+            data-testid="query-target"
             role="status"
             aria-live="polite"
             className={cn(
@@ -180,7 +276,7 @@ function EditorPane({
                 : "text-muted-foreground",
             )}
           >
-            {describeConnection(connection)}
+            Target: {describeConnection(connection)}
           </p>
         </div>
 
@@ -209,21 +305,59 @@ function EditorPane({
         </div>
 
         <span className="text-[11px] font-medium">SQL</span>
-        <SqlEditor value={sql} onChange={onSqlChange} onRun={run} />
+        <SqlEditor
+          value={sql}
+          onChange={onSqlChange}
+          onRun={run}
+          onSelectionChange={(selection) => {
+            selectionRef.current = selection;
+          }}
+        />
 
         <div className="flex items-center justify-between gap-2">
-          <Button
-            onClick={run}
-            disabled={!canRun}
-            aria-keyshortcuts="Control+Enter Meta+Enter"
-            title="Run (Ctrl/Cmd+Enter)"
+          <div className="flex items-center gap-1">
+            <Button
+              onClick={run}
+              disabled={!canRun}
+              aria-keyshortcuts="Control+Enter Meta+Enter"
+              title="Run selection or current statement (Ctrl/Cmd+Enter)"
+            >
+              {session.isRunning ? "Running…" : "Run"}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                void session.cancelRunningQuery();
+              }}
+              disabled={!session.canCancel || session.cancelRequested}
+              title={cancelTitle}
+            >
+              {session.cancelRequested ? "Cancelling…" : "Cancel"}
+            </Button>
+          </div>
+          <span
+            data-testid="query-status"
+            role="status"
+            aria-live="polite"
+            className="text-[11px] text-muted-foreground"
           >
-            {session.isRunning ? "Running…" : "Run"}
-          </Button>
-          <span className="text-[11px] text-muted-foreground">
-            {dirty ? "Unsaved changes" : "Current SQL"} · Ctrl/Cmd+Enter to run
+            {formatQueryStatus(status)}
           </span>
         </div>
+        <p className="text-[11px] text-muted-foreground">
+          Runs the selected text, or the statement at the cursor · Ctrl/Cmd+Enter
+        </p>
+        {session.notice ? (
+          <p role="alert" className="text-[11px] text-destructive">
+            {session.notice}
+          </p>
+        ) : null}
+
+        <HistoryList
+          entries={session.history}
+          onPick={(entry) => onSqlChange(entry.sql)}
+          onClear={session.clearHistory}
+        />
       </div>
     </div>
   );

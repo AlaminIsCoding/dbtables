@@ -21,16 +21,35 @@ import { useEffect, useRef } from "react";
 
 import { cn } from "../../components/ui/cn";
 
+/** Selection context handed to the run handler. */
+export interface SqlEditorSelection {
+  /** Selected text, or an empty string when the cursor has no selection. */
+  selectedText: string;
+  /** Cursor head offset in the document. */
+  cursor: number;
+}
+
 export interface SqlEditorProps {
   /** Controlled SQL text. External changes replace the whole document. */
   value: string;
   /** Called with the full document whenever the user edits the text. */
   onChange: (value: string) => void;
-  /** Called for `Ctrl`/`Cmd` + `Enter` while the editor has focus. */
-  onRun?: () => void;
+  /** Called for `Ctrl`/`Cmd` + `Enter`, with the current selection context. */
+  onRun?: (selection: SqlEditorSelection) => void;
+  /** Called whenever the cursor or selection changes. */
+  onSelectionChange?: (selection: SqlEditorSelection) => void;
   /** Accessible name for the editor surface. */
   ariaLabel?: string;
   className?: string;
+}
+
+/** Reads the primary selection and cursor head from an editor view. */
+function readSelection(view: EditorView): SqlEditorSelection {
+  const range = view.state.selection.main;
+  return {
+    selectedText: view.state.sliceDoc(range.from, range.to),
+    cursor: range.head,
+  };
 }
 
 /**
@@ -45,6 +64,7 @@ export function SqlEditor({
   value,
   onChange,
   onRun,
+  onSelectionChange,
   ariaLabel = "SQL editor",
   className,
 }: SqlEditorProps) {
@@ -52,10 +72,12 @@ export function SqlEditor({
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   const onRunRef = useRef(onRun);
+  const onSelectionChangeRef = useRef(onSelectionChange);
 
   // Keep the latest callbacks without recreating the editor view.
   onChangeRef.current = onChange;
   onRunRef.current = onRun;
+  onSelectionChangeRef.current = onSelectionChange;
 
   useEffect(() => {
     const parent = containerRef.current;
@@ -86,8 +108,8 @@ export function SqlEditor({
           keymap.of([
             {
               key: "Mod-Enter",
-              run: () => {
-                onRunRef.current?.();
+              run: (view) => {
+                onRunRef.current?.(readSelection(view));
                 return true;
               },
             },
@@ -96,6 +118,9 @@ export function SqlEditor({
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             onChangeRef.current(update.state.doc.toString());
+          }
+          if (update.selectionSet || update.docChanged) {
+            onSelectionChangeRef.current?.(readSelection(update.view));
           }
         }),
         EditorView.contentAttributes.of({
@@ -139,6 +164,8 @@ export function SqlEditor({
 
     const view = new EditorView({ state, parent });
     viewRef.current = view;
+    // Report the initial (empty) selection so a run handler always has a cursor.
+    onSelectionChangeRef.current?.(readSelection(view));
 
     return () => {
       view.destroy();

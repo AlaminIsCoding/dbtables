@@ -6,8 +6,8 @@
 //! depth. Normalized result mapping, duration, and error categories are handled
 //! by the adapter so the application stays engine-neutral.
 
-use crate::database::{ConnectionId, DatabaseAdapter};
-use crate::domain::{ErrorCategory, QueryError, QueryRequest, QueryResult};
+use crate::database::{CancelOutcome, ConnectionId, DatabaseAdapter};
+use crate::domain::{EngineCapabilities, ErrorCategory, OperationId, QueryError, QueryRequest, QueryResult};
 
 /// Rows returned when a request does not set its own cap.
 ///
@@ -49,17 +49,43 @@ pub async fn execute_query(
         .await
 }
 
+/// Reports the capabilities the adapter can actually honor.
+///
+/// The UI uses this to gate engine-specific controls such as cancellation
+/// instead of assuming every engine supports the same behavior.
+pub fn capabilities(adapter: &dyn DatabaseAdapter) -> EngineCapabilities {
+    adapter.capabilities()
+}
+
+/// Requests cancellation of a running operation.
+///
+/// Cancellation is a request, not a confirmed outcome: adapters that do not
+/// support it reject with an `Unsupported` error, and a success only means the
+/// driver accepted the request. The running [`execute_query`] call reports the
+/// operation's actual final state, so callers must not treat this result as the
+/// query's outcome.
+pub async fn cancel_query(
+    adapter: &dyn DatabaseAdapter,
+    connection: &ConnectionId,
+    operation: &OperationId,
+) -> Result<CancelOutcome, QueryError> {
+    adapter.cancel(connection, operation).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
-    use super::{execute_query, resolve_max_rows, DEFAULT_MAX_ROWS, HARD_MAX_ROWS};
+    use super::{
+        cancel_query, capabilities, execute_query, resolve_max_rows, DEFAULT_MAX_ROWS,
+        HARD_MAX_ROWS,
+    };
     use crate::database::testing::FakeAdapter;
-    use crate::database::{ConnectionId, DatabaseAdapter};
-    use crate::domain::connection::SqliteConnection;
+    use crate::database::{CancelOutcome, ConnectionId, ConnectionSecret, DatabaseAdapter};
+    use crate::domain::connection::{ServerConnection, SqliteConnection, TlsMode};
     use crate::domain::{
-        ConnectionDescriptor, EngineId, ErrorCategory, OperationState, QueryRequest,
+        ConnectionDescriptor, EngineId, ErrorCategory, OperationId, OperationState, QueryRequest,
     };
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -142,5 +168,61 @@ mod tests {
         ))
         .expect_err("an unknown connection must fail");
         assert_eq!(unknown.category, ErrorCategory::Connection);
+    }
+
+    #[test]
+    fn capabilities_delegate_to_the_adapter() {
+        let adapter = FakeAdapter::new(EngineId::Postgres);
+        assert_eq!(capabilities(&adapter), EngineId::Postgres.capabilities());
+        assert!(capabilities(&adapter).cancellation);
+
+        let sqlite = FakeAdapter::new(EngineId::Sqlite);
+        assert_eq!(capabilities(&sqlite), EngineId::Sqlite.capabilities());
+        assert!(!capabilities(&sqlite).cancellation);
+    }
+
+    #[test]
+    fn cancel_query_requires_adapter_capability_and_reports_the_request() {
+        let unsupported = FakeAdapter::new(EngineId::Sqlite);
+        let sqlite_connection = block_on(unsupported.connect(&sqlite_descriptor(), None))
+            .expect("fake connect should succeed");
+        let error = block_on(cancel_query(
+            &unsupported,
+            &sqlite_connection,
+            &OperationId::new("op-running"),
+        ))
+        .expect_err("SQLite must report cancellation as unsupported");
+        assert_eq!(error.category, ErrorCategory::Unsupported);
+
+        let descriptor = ConnectionDescriptor::Postgres(ServerConnection {
+            host: "localhost".to_string(),
+            port: 5432,
+            database: Some("app".to_string()),
+            username: "app_user".to_string(),
+            tls: TlsMode::Preferred,
+        });
+        let secret = ConnectionSecret::new("test-only-value");
+        let adapter = FakeAdapter::new(EngineId::Postgres).with_running_operation("op-running");
+        let connection = block_on(adapter.connect(&descriptor, Some(&secret)))
+            .expect("fake connect should succeed");
+
+        assert_eq!(
+            block_on(cancel_query(
+                &adapter,
+                &connection,
+                &OperationId::new("op-running")
+            ))
+            .expect("a running operation accepts cancellation"),
+            CancelOutcome::Requested
+        );
+        assert_eq!(
+            block_on(cancel_query(
+                &adapter,
+                &connection,
+                &OperationId::new("op-idle")
+            ))
+            .expect("an idle operation does not accept cancellation"),
+            CancelOutcome::NotRunning
+        );
     }
 }
