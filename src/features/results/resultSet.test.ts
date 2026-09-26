@@ -43,3 +43,26 @@ describe("emptyResultSet", () => {
     expect(isResultSetEmpty(result)).toBe(true);
   });
 });
+
+describe("large results", () => {
+  it("passes a large row array through by reference instead of copying it", () => {
+    // The grid seam must not transform or clone every row: per-row work here
+    // would scale with result size on the render path. The backend already
+    // bounds how large a result can be (up to its hard cap), and Glide
+    // virtualizes rendering, so the adapter hands the array straight through.
+    const rows = Array.from({ length: 10_000 }, (_, index) => [
+      { type: "integer" as const, value: index },
+    ]);
+    const columns = [{ name: "id", typeName: "INTEGER" }];
+
+    const result = queryResultToResultSet({
+      ...baseResult,
+      columns,
+      rows,
+      truncated: true,
+    });
+
+    expect(result.rows).toBe(rows);
+    expect(result.columns).toBe(columns);
+  });
+});

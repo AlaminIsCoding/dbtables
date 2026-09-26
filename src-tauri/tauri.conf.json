@@ -25,6 +25,11 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "publisher": "dbtables contributors",
+    "copyright": "Copyright © 2026 dbtables contributors",
+    "category": "DeveloperTool",
+    "shortDescription": "A lightweight desktop database client.",
+    "longDescription": "A focused desktop client for SQLite, MySQL, and PostgreSQL: connect, browse schema, run SQL, inspect and export results, and make deliberate table edits.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
