@@ -15,7 +15,10 @@ pub mod errors;
 pub mod result;
 
 pub use capabilities::{EngineCapabilities, EngineId};
-pub use connection::{ConnectionDescriptor, ServerConnection, SqliteConnection, TlsMode};
+pub use connection::{
+    ConnectionDescriptor, ConnectionProfile, ProfileId, ServerConnection, SqliteConnection, TlsMode,
+    MAX_PROFILE_NAME_LENGTH,
+};
 pub use errors::{ErrorCategory, QueryError};
 pub use result::{
     CellValue, ColumnInfo, OperationId, OperationState, QueryRequest, QueryResult, Row,

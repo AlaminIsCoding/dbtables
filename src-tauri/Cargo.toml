@@ -38,3 +38,8 @@ postgres-types = "0.2"
 bytes = "1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "sync"] }
+# OS-protected credential storage for connection-profile passwords. The default
+# `v1` feature selects the native store on each desktop platform: Windows
+# Credential Manager, macOS Keychain, and the Linux/*BSD Secret Service. Secrets
+# are never written to the plain-text settings file.
+keyring = "4"

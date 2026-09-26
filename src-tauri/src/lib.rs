@@ -2,6 +2,7 @@ pub mod application;
 pub mod commands;
 pub mod database;
 pub mod domain;
+pub mod persistence;
 
 use database::SqliteAdapter;
 

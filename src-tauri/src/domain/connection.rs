@@ -1,6 +1,11 @@
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 use super::capabilities::EngineId;
+use super::errors::{ErrorCategory, QueryError};
 
 /// Secret-free description of how to reach a database.
 ///
@@ -89,10 +94,145 @@ pub enum TlsMode {
     VerifyFull,
 }
 
+/// Maximum length of a profile display name, counted in Unicode scalar values.
+pub const MAX_PROFILE_NAME_LENGTH: usize = 120;
+
+/// Opaque, serializable identifier for a saved connection profile.
+///
+/// The identifier is also the reference under which the profile's password is
+/// stored in protected storage; profile data carries the identifier only and
+/// never the secret itself. Serialized as a plain string, matching the
+/// connection and transaction identifier tokens.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProfileId(String);
+
+impl ProfileId {
+    /// Wraps an existing profile identifier.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Generates a new identifier that is unique within this process.
+    ///
+    /// Combines a monotonic counter with the current wall clock so profiles
+    /// created within the same nanosecond still receive distinct identifiers.
+    /// Identifiers only need to be unique within one user's local settings.
+    pub fn generate() -> Self {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        Self(format!("profile-{nanos}-{sequence}"))
+    }
+
+    /// Borrows the identifier as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProfileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Validated, secret-free description of a saved connection profile.
+///
+/// A profile pairs a user-facing `name` with the non-secret
+/// [`ConnectionDescriptor`] needed to reach a database. It never carries a
+/// password: the profile's [`ProfileId`] is the reference used to resolve the
+/// secret from protected storage at connect time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProfile {
+    /// Stable identifier, also the protected-storage secret reference.
+    pub id: ProfileId,
+    /// User-facing display name.
+    pub name: String,
+    /// Secret-free routing settings for the target database.
+    pub descriptor: ConnectionDescriptor,
+}
+
+impl ConnectionProfile {
+    /// Creates a profile with a freshly generated identifier.
+    pub fn new(name: impl Into<String>, descriptor: ConnectionDescriptor) -> Self {
+        Self {
+            id: ProfileId::generate(),
+            name: name.into(),
+            descriptor,
+        }
+    }
+
+    /// Validates the non-secret profile fields before a save.
+    ///
+    /// Returns [`ErrorCategory::Validation`] with a safe, actionable message.
+    /// The message never contains a secret because a profile never holds one.
+    pub fn validate(&self) -> Result<(), QueryError> {
+        if self.id.as_str().trim().is_empty() {
+            return Err(validation_error("a profile must have a non-empty identifier"));
+        }
+
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(validation_error("a profile name must not be empty"));
+        }
+        if name.chars().count() > MAX_PROFILE_NAME_LENGTH {
+            return Err(validation_error(format!(
+                "a profile name must be at most {MAX_PROFILE_NAME_LENGTH} characters"
+            )));
+        }
+
+        match &self.descriptor {
+            ConnectionDescriptor::Sqlite(connection) => {
+                if connection.file_path.trim().is_empty() {
+                    return Err(validation_error(
+                        "a SQLite profile must reference a database file",
+                    ));
+                }
+            }
+            ConnectionDescriptor::MySql(server) | ConnectionDescriptor::Postgres(server) => {
+                if server.host.trim().is_empty() {
+                    return Err(validation_error("a server profile must have a host"));
+                }
+                if server.port == 0 {
+                    return Err(validation_error(
+                        "a server profile must have a port between 1 and 65535",
+                    ));
+                }
+                if server.username.trim().is_empty() {
+                    return Err(validation_error("a server profile must have a username"));
+                }
+                if let Some(database) = &server.database {
+                    if database.trim().is_empty() {
+                        return Err(validation_error(
+                            "a server profile's database name must not be empty when present",
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Builds a validation-category [`QueryError`] with a safe message.
+fn validation_error(message: impl Into<String>) -> QueryError {
+    QueryError::new(ErrorCategory::Validation, message)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionDescriptor, ServerConnection, SqliteConnection, TlsMode};
+    use super::{
+        ConnectionDescriptor, ConnectionProfile, ProfileId, ServerConnection, SqliteConnection,
+        TlsMode, MAX_PROFILE_NAME_LENGTH,
+    };
     use crate::domain::capabilities::EngineId;
+    use crate::domain::errors::ErrorCategory;
 
     fn sample_server() -> ServerConnection {
         ServerConnection {
@@ -173,6 +313,131 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(mode).expect("tls mode should serialize"),
                 serde_json::json!(expected)
+            );
+        }
+    }
+
+    fn sqlite_profile(name: &str) -> ConnectionProfile {
+        ConnectionProfile::new(
+            name,
+            ConnectionDescriptor::Sqlite(SqliteConnection {
+                file_path: "C:/data/app.sqlite".to_string(),
+            }),
+        )
+    }
+
+    fn postgres_profile(name: &str) -> ConnectionProfile {
+        ConnectionProfile::new(name, ConnectionDescriptor::Postgres(sample_server()))
+    }
+
+    #[test]
+    fn profile_ids_are_unique_non_empty_strings() {
+        let first = ProfileId::generate();
+        let second = ProfileId::generate();
+
+        assert!(!first.as_str().trim().is_empty());
+        assert_ne!(first, second);
+        assert_eq!(
+            serde_json::to_value(&first).expect("profile id should serialize"),
+            serde_json::json!(first.as_str())
+        );
+    }
+
+    #[test]
+    fn validate_accepts_sqlite_and_server_profiles() {
+        sqlite_profile("Local app").validate().expect("SQLite profile");
+        postgres_profile("Reporting").validate().expect("server profile");
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_profile_identifier() {
+        let mut profile = sqlite_profile("Local app");
+        profile.id = ProfileId::new("  ");
+
+        let error = profile.validate().expect_err("empty id must fail");
+        assert_eq!(error.category, ErrorCategory::Validation);
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_or_overlong_name() {
+        let empty = sqlite_profile("   ");
+        assert_eq!(
+            empty.validate().expect_err("empty name must fail").category,
+            ErrorCategory::Validation
+        );
+
+        let overlong = sqlite_profile(&"n".repeat(MAX_PROFILE_NAME_LENGTH + 1));
+        assert_eq!(
+            overlong
+                .validate()
+                .expect_err("overlong name must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_sqlite_path() {
+        let mut profile = sqlite_profile("Local app");
+        profile.descriptor = ConnectionDescriptor::Sqlite(SqliteConnection {
+            file_path: "  ".to_string(),
+        });
+
+        assert_eq!(
+            profile
+                .validate()
+                .expect_err("blank path must fail")
+                .category,
+            ErrorCategory::Validation
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_server_fields() {
+        for (host, port, username, database) in [
+            ("", 5432, "app_user", Some("app".to_string())),
+            ("localhost", 0, "app_user", Some("app".to_string())),
+            ("localhost", 5432, "  ", Some("app".to_string())),
+            ("localhost", 5432, "app_user", Some("  ".to_string())),
+        ] {
+            let profile = ConnectionProfile::new(
+                "Reporting",
+                ConnectionDescriptor::Postgres(ServerConnection {
+                    host: host.to_string(),
+                    port,
+                    database,
+                    username: username.to_string(),
+                    tls: TlsMode::Preferred,
+                }),
+            );
+
+            assert_eq!(
+                profile
+                    .validate()
+                    .expect_err("invalid server settings must fail")
+                    .category,
+                ErrorCategory::Validation
+            );
+        }
+    }
+
+    #[test]
+    fn profile_round_trips_through_serde_without_secrets() {
+        let profile = postgres_profile("Reporting");
+
+        let encoded = serde_json::to_string(&profile).expect("profile should serialize");
+        let decoded: ConnectionProfile =
+            serde_json::from_str(&encoded).expect("profile should deserialize");
+
+        assert_eq!(decoded, profile);
+        assert_eq!(
+            serde_json::to_value(&profile).expect("profile should serialize")["descriptor"]["engine"],
+            "postgres"
+        );
+        for forbidden in ["password", "passwd", "secret", "token", "credential"] {
+            assert!(
+                !encoded.to_lowercase().contains(forbidden),
+                "profile serialization leaked `{forbidden}`",
             );
         }
     }
