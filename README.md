@@ -1,129 +1,198 @@
-# dbtables
+<p align="center">
+  <img src="docs/screenshots/thumbnail.png" alt="dbtables — a lightweight desktop database client" width="760">
+</p>
 
-A lightweight desktop database client. The app is a Tauri desktop shell with a
-React/TypeScript frontend and a Rust backend. Database access stays in Rust; the
-frontend never connects to a database directly.
+<h1 align="center">dbtables</h1>
 
-## Prerequisites
+<p align="center">
+  A fast, focused desktop database client for SQLite, MySQL, and PostgreSQL.<br>
+  Connect, browse schemas, run SQL, edit table data, and export results — without the weight of a full database IDE.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white" alt="Tauri 2">
+  <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white" alt="React 19">
+  <img src="https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white" alt="TypeScript 5">
+  <img src="https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white" alt="Vite 7">
+  <img src="https://img.shields.io/badge/Tailwind_CSS-4-06B6D4?logo=tailwindcss&logoColor=white" alt="Tailwind CSS 4">
+</p>
+
+---
+
+## Overview
+
+**dbtables** is a desktop database client built as a Tauri app: a React/TypeScript
+frontend over a Rust backend. The frontend never talks to a database directly —
+every query, connection, and credential stays in Rust, behind a typed IPC facade.
+
+It is designed around a small set of ideas:
+
+- **One obvious target.** The active database is always visible, so you know
+  exactly where a query or edit will land.
+- **Engine-specific behavior behind adapters.** SQLite, MySQL, and PostgreSQL
+  share one normalized contract; when their semantics differ, the difference is
+  surfaced explicitly instead of hidden.
+- **Bounded, responsive work.** Results are fetched in batches and virtualized,
+  so large queries don't freeze the UI or blow up memory.
+- **Deliberate, observable writes.** Table edits are staged, applied explicitly,
+  and report conflicts and uncertain outcomes honestly.
+
+## Features
+
+- **Connection management** — save, edit, test, and remove profiles for SQLite
+  files and MySQL/PostgreSQL servers; passwords are stored through the OS
+  credential store, never in plain-text settings.
+- **Database picker** — choose a connection, then open any database the server
+  exposes (MySQL switches in place; PostgreSQL reconnects), with a shared picker
+  that also opens automatically when a target database isn't set yet.
+- **Schema explorer** — tables/views with row counts, search, per-object context
+  menus, and a PostgreSQL schema picker.
+- **SQL workspace** — CodeMirror 6 editor with SQL highlighting, run the current
+  statement or selection, query status/duration, and a message log.
+- **Results grid** — a themed, virtualized data grid with selection, copy, and
+  CSV export; large results are paged rather than loaded wholesale.
+- **Table browsing & editing** — paging, filters, sort, inline cell editing, and
+  staged insert/update/delete applied explicitly with conflict detection.
+- **Schema management** — create tables, add/rename/drop columns, alter a
+  column's type/nullability/default (MySQL & PostgreSQL), and manage indexes and
+  foreign keys, all with a generated, syntax-highlighted SQL preview.
+- **Cross-engine correctness** — engine-aware identifiers, types, and DDL, so a
+  MySQL preview uses backticks and a PostgreSQL one uses ANSI quotes.
+
+## Screenshots
+
+| Connections | Database picker |
+| --- | --- |
+| <img src="docs/screenshots/connections.png" alt="Connection cards"> | <img src="docs/screenshots/database-picker.png" alt="Database picker"> |
+
+| SQL workspace | Data grid |
+| --- | --- |
+| <img src="docs/screenshots/sql-workspace.png" alt="SQL workspace with results"> | <img src="docs/screenshots/data-grid.png" alt="Result data grid"> |
+
+| Table editing | Schema editor |
+| --- | --- |
+| <img src="docs/screenshots/table-editing.png" alt="Editable table data"> | <img src="docs/screenshots/schema-editor.png" alt="Schema definition editor"> |
+
+## Tech stack
+
+| Layer | Choice |
+| --- | --- |
+| Desktop shell | [Tauri 2](https://tauri.app) |
+| Frontend | React 19, TypeScript, Vite |
+| UI | Tailwind CSS v4 with shadcn/ui-style primitives, lucide-react icons |
+| SQL editor | CodeMirror 6 (`@codemirror/lang-sql`) |
+| Data grid | Custom themed virtualized grid (`src/components/data-table`) |
+| Backend | Rust — per-engine adapters over a normalized contract |
+| Packaging | Tauri bundles (NSIS on Windows, app/dmg on macOS, deb/AppImage on Linux) |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI["React UI<br/>(features, components)"]
+    IPC["Typed Tauri IPC facade<br/>(src/services)"]
+    APP["Application services<br/>(conn / metadata / query / table-data / schema)"]
+    ADAPTER["DatabaseAdapter contract"]
+    SQLITE["SQLite adapter"]
+    MYSQL["MySQL adapter"]
+    PG["PostgreSQL adapter"]
+    DB[("Database engines")]
+
+    UI --> IPC --> APP --> ADAPTER
+    ADAPTER --> SQLITE --> DB
+    ADAPTER --> MYSQL --> DB
+    ADAPTER --> PG --> DB
+```
+
+- Presentation lives in feature folders under `src/features`; it calls the
+  frontend service facade in `src/services` rather than invoking Tauri commands
+  directly.
+- The Rust backend is split into thin `commands/`, use-case `application/`,
+  normalized `domain/`, and engine `database/` adapters.
+- Engines are added by implementing the adapter contract plus contract tests —
+  no shared UI rewrites.
+
+More detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## Getting started
+
+### Prerequisites
 
 - Node.js with npm
-- Rust toolchain with Cargo
-- The Tauri system prerequisites for the OS you build on
-  (https://tauri.app/start/prerequisites/)
+- A Rust toolchain with Cargo
+- The [Tauri system prerequisites](https://tauri.app/start/prerequisites/) for
+  your OS
 
-## Local commands
+### Run it
 
-Run these from the repository root.
+```sh
+npm install
+npm run tauri dev     # launch the desktop app with hot reload
+```
+
+### Common commands
 
 | Command | Purpose |
 | --- | --- |
-| `npm install` | Install frontend dependencies. |
 | `npm run tauri dev` | Run the desktop app with hot reload. |
 | `npm run check` | Type-check the frontend (`tsc --noEmit`). |
-| `npm test` | Run frontend unit tests (Vitest). |
-| `npm run rust:test` | Run Rust tests. |
-| `npm run rust:build` | Build the Rust backend. |
-| `npm run tauri build` | Produce a production desktop build for the current OS. |
+| `npm test` | Run frontend unit tests (Vitest + Testing Library). |
+| `npm run rust:test` | Run the Rust test suite. |
+| `npm run build` | Type-check and build the frontend bundle. |
+| `npm run tauri build` | Produce a production desktop bundle for the current OS. |
 
-## Performance and bounded results
-
-Large results are fetched in bounded batches rather than loaded in full. The
-bound lives in the backend and is mirrored, not invented, by the frontend:
-
-- `DEFAULT_MAX_ROWS` (`500`), `HARD_MAX_ROWS` (`10_000`), and `FETCH_MORE_STEP`
-  (`500`) are defined in `src-tauri/src/application/queries.rs`. Every execution
-  is clamped to `HARD_MAX_ROWS`, and "fetch more" re-runs the statement with a
-  larger cap until the hard ceiling is reached.
-- The SQLite adapter also enforces its own hard ceiling (`MAX_RESULT_ROWS`) so a
-  caller that bypasses the application still cannot load an unbounded result.
-- The frontend paging policy in `src/features/results/resultPaging.ts` mirrors
-  the step and stops offering "fetch more" once the backend returns fewer rows
-  than requested (its hard ceiling).
-- Glide virtualizes rendering, but virtualization alone does not bound backend
-  or process memory; the fetch bound above is what does.
-- The grid seam (`src/features/results/resultSet.ts`) passes the bounded row
-  array through by reference. It performs no per-row transformation, so work on
-  the render path does not scale with result size.
-
-Automated coverage:
-
-- `src-tauri/tests/performance.rs` runs the real SQLite adapter against a
-  fixture larger than the hard ceiling and pins the default cap, the bounded
-  step growth, and termination at the hard ceiling.
-- `src/features/results/resultPaging.test.ts` and
-  `src/features/results/resultSet.test.ts` pin the frontend paging and
-  pass-through behavior.
-
-To print the profile line for the large-result tests:
+### Tests
 
 ```sh
+npm test                                  # frontend
+npm run rust:test                         # backend
 cargo test --manifest-path src-tauri/Cargo.toml --test performance -- --nocapture
 ```
 
-## Production packages
-
-Build the app on the operating system you intend to ship to. Tauri bundles use
-native tooling and are not cross-compiled, so a Windows bundle is built on
-Windows, a macOS bundle on macOS, and a Linux bundle on Linux.
-
-### Reproducible build steps
-
-1. Install the OS prerequisites from
-   https://tauri.app/start/prerequisites/ and the matching Node.js and Rust
-   toolchains.
-2. Install frontend dependencies from the lockfile:
-   ```sh
-   npm ci
-   ```
-3. Build the production bundle. `beforeBuildCommand` runs `npm run build`, which
-   type-checks the frontend and produces `dist/` before Rust is packaged:
-   ```sh
-   npm run tauri build
-   ```
-4. Install or launch the artifact for the OS (paths are relative to the
-   repository root):
-
-| OS | Configured bundle targets | Artifact location |
-| --- | --- | --- |
-| Windows | `nsis` | `src-tauri/target/release/bundle/nsis/*.exe` |
-| macOS | `app`, `dmg` | `src-tauri/target/release/bundle/macos/*.app`, `src-tauri/target/release/bundle/dmg/*.dmg` |
-| Linux | `deb`, `appimage` | `src-tauri/target/release/bundle/deb/*.deb`, `src-tauri/target/release/bundle/appimage/*.AppImage` |
-
-The per-OS targets come from `src-tauri/tauri.conf.json` (Windows `nsis`) plus
-`src-tauri/tauri.macos.conf.json` and `src-tauri/tauri.linux.conf.json`. Tauri
-merges the platform file for the current OS; arrays replace the base value, so
-each file lists every format it builds. Generated bundles live under
-`src-tauri/target/` and are not committed.
-
-### Manual packaged-app checklist
-
-The automated build only proves the bundle is produced. A person must verify the
-packaged app itself. Build and install the bundle for each agreed target OS,
-then:
-
-1. Launch the installed app (not `npm run tauri dev`) and confirm it opens.
-2. Connect to disposable SQLite, MySQL, and PostgreSQL databases.
-3. Run a query and export the results to CSV; compare the exported values.
-4. Confirm passwords are stored through the OS credential store and do not
-   appear in plain-text settings or logs.
-5. Exercise a large result (more rows than the default cap) and one failed
-   write; confirm bounded paging and a visible failure/uncertain outcome.
-
-Report any OS-specific issue and confirm release readiness before treating the
-hardening gate as passed.
-
-## Typed IPC sample
-
-`src/services/appStatus.ts` exposes `getAppStatus()`, a typed frontend service
-request. It invokes the `app_status` Tauri command. The thin handler in
-`src-tauri/src/commands/status.rs` delegates to the Rust function in
-`src-tauri/src/application/status.rs`, which returns the app name and a
-harmless ready message. This establishes the frontend-service-to-Rust-command
-pattern used by later features.
-
-## Project layout
+## Project structure
 
 ```text
-src/            React/TypeScript frontend (services/, feature folders as they arrive)
-src-tauri/      Tauri Rust backend (commands/, application/, and later database/)
+src/
+  app/            # shell, workspace store, theme
+  components/     # shadcn-style UI primitives, layout, data grid, engine logos
+  features/       # connections, explorer, query, results, table-data, schema
+  services/       # typed frontend facade over Tauri IPC
+  domain/         # frontend-safe normalized types
+  lib/            # workspace tabs, SQL helpers, utilities
+src-tauri/
+  src/commands/       # thin Tauri command handlers
+  src/application/    # use cases (connections, metadata, queries, schema, …)
+  src/domain/         # normalized, serializable domain types
+  src/database/       # adapter contract + sqlite / mysql / postgres adapters
+  src/persistence/    # profile storage + credential-store boundary
+  tests/              # adapter contract and performance suites
+docs/screenshots/     # README images
 ```
+
+## Security & data safety
+
+- Credentials are resolved from OS-protected storage; profiles persist only
+  non-secret fields, and secrets never cross the IPC boundary back to the UI.
+- Values are sent as bound parameters; identifiers are validated and quoted with
+  engine-specific rules.
+- Failed operations are never rendered as success, and a transport failure
+  during a write is reported as an uncertain outcome rather than silently
+  retried.
+- Results are bounded (a default cap plus a hard ceiling) so a query cannot load
+  an unbounded result into memory.
+
+## Roadmap / known limitations
+
+- Column **primary-key** changes are not yet exposed (needs engine-specific
+  `ADD/DROP PRIMARY KEY`; SQLite would require a guarded table rebuild).
+- **SQLite** cannot alter an existing column in place; the definition editor
+  hides that action rather than faking it.
+- MySQL column alterations preserve an existing default heuristically; uncommon
+  expression defaults may need refinement.
+- SSH tunneling, visual migrations, and triggers are out of scope for now.
+
+## License
+
+No license has been specified yet. This is a personal portfolio project — please
+contact the author before reuse.
