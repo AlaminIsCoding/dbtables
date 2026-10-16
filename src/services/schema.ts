@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  ColumnAlteration,
   ColumnDefinition,
   ForeignKeyDefinition,
   ObjectRef,
@@ -15,6 +16,7 @@ export const DROP_TABLE_COMMAND = "drop_table";
 export const ADD_COLUMN_COMMAND = "add_column";
 export const RENAME_COLUMN_COMMAND = "rename_column";
 export const DROP_COLUMN_COMMAND = "drop_column";
+export const ALTER_COLUMN_COMMAND = "alter_column";
 export const ADD_FOREIGN_KEY_COMMAND = "add_foreign_key";
 export const DROP_FOREIGN_KEY_COMMAND = "drop_foreign_key";
 export const CREATE_INDEX_COMMAND = "create_index";
@@ -77,6 +79,25 @@ export async function dropColumn(
   column: string,
 ): Promise<void> {
   return invoke<void>(DROP_COLUMN_COMMAND, { connectionId, object, column });
+}
+
+/**
+ * Alters an existing column's type, nullability, or default.
+ *
+ * Only the supplied aspects change; the rest of the column definition is left
+ * untouched. Engines that cannot alter a column in place return an
+ * `unsupported` error.
+ */
+export async function alterColumn(
+  connectionId: string,
+  object: ObjectRef,
+  alteration: ColumnAlteration,
+): Promise<void> {
+  return invoke<void>(ALTER_COLUMN_COMMAND, {
+    connectionId,
+    object,
+    alteration,
+  });
 }
 
 /** Adds a foreign key to an existing table, where the engine supports it. */

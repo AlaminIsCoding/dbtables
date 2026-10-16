@@ -71,7 +71,8 @@ use crate::database::{
     build_update_statement, conflict_columns, effective_sort_order, effective_table_page_limit,
     quote_identifier, require_identifier, validate_default_expression, validate_row_identity,
     validate_type_name, AdapterFuture, CancelOutcome, ChangeRequest, ChangeResult,
-    ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState, ConnectionTest,
+    ColumnAlteration, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
+    ConnectionTest,
     ConstraintInfo, ConstraintKind, DatabaseAdapter, ForeignKeyDefinition, IndexInfo, ObjectKind,
     ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDefinition, TableDescription,
     TableFilter, TablePage, TablePageRequest, TransactionId,
@@ -1007,10 +1008,20 @@ async fn postgres_table_shape(
     schema: &str,
     object_name: &str,
 ) -> Result<(Vec<ColumnInfo>, Vec<String>), QueryError> {
+    // `format_type` yields a usable type name (`character varying(255)`,
+    // `numeric(10,2)`, `integer[]`) instead of `information_schema`'s
+    // `data_type` (`character varying`, `USER-DEFINED`), so the definition
+    // editor can offer it back for an `ALTER COLUMN`.
     let rows = client
         .query(
-            "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), \
+                    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
             &[&schema, &object_name],
         )
         .await
@@ -1514,6 +1525,69 @@ async fn drop_postgres_column(
     client.batch_execute(&sql).await.map_err(map_error)
 }
 
+/// Alters an existing column's type, nullability, or default.
+///
+/// PostgreSQL supports targeted `ALTER COLUMN` actions, so only the requested
+/// aspects are changed and the rest of the definition is left untouched.
+async fn alter_postgres_column(
+    client: &Client,
+    default_schema: Option<&str>,
+    object: &ObjectRef,
+    alteration: &ColumnAlteration,
+) -> Result<(), QueryError> {
+    let schema = resolve_schema(default_schema, object.schema.as_deref())?;
+    let (columns, _) = postgres_table_shape(client, &schema, &object.name).await?;
+    let name = alteration.name.trim();
+    require_identifier(name, "column")?;
+    if !postgres_has_column(&columns, name) {
+        return Err(validation_error(format!(
+            "table `{}` has no column `{name}`",
+            object.name
+        )));
+    }
+
+    let mut actions: Vec<String> = Vec::new();
+    if let Some(type_name) = &alteration.type_name {
+        validate_type_name(type_name)?;
+        actions.push(format!(
+            "ALTER COLUMN {} TYPE {}",
+            quote_identifier(name),
+            type_name.trim()
+        ));
+    }
+    if let Some(nullable) = alteration.nullable {
+        actions.push(format!(
+            "ALTER COLUMN {} {}",
+            quote_identifier(name),
+            if nullable { "DROP NOT NULL" } else { "SET NOT NULL" }
+        ));
+    }
+    if alteration.drop_default {
+        actions.push(format!(
+            "ALTER COLUMN {} DROP DEFAULT",
+            quote_identifier(name)
+        ));
+    } else if let Some(default) = &alteration.set_default {
+        validate_default_expression(name, default)?;
+        actions.push(format!(
+            "ALTER COLUMN {} SET DEFAULT {}",
+            quote_identifier(name),
+            default.trim()
+        ));
+    }
+
+    if actions.is_empty() {
+        return Err(validation_error("no column change was requested"));
+    }
+
+    let sql = format!(
+        "ALTER TABLE {} {}",
+        postgres_qualified(&schema, &object.name),
+        actions.join(", ")
+    );
+    client.batch_execute(&sql).await.map_err(map_error)
+}
+
 /// Adds a foreign-key constraint to an existing table.
 async fn add_postgres_foreign_key(
     client: &Client,
@@ -1899,7 +1973,7 @@ impl DatabaseAdapter for PostgresAdapter {
                      JOIN pg_class idx ON idx.oid = i.indexrelid \
                      JOIN pg_class tbl ON tbl.oid = i.indrelid \
                      JOIN pg_namespace ns ON ns.oid = tbl.relnamespace \
-                     CROSS JOIN LATERAL generate_series(1, i.indnatts) AS cols(n) \
+                     CROSS JOIN LATERAL generate_series(1, i.indnkeyatts) AS cols(n) \
                      WHERE ns.nspname = $1 AND tbl.relname = $2 \
                      ORDER BY idx.relname, cols.n",
                     &[&schema, &object.name],
@@ -1922,27 +1996,40 @@ impl DatabaseAdapter for PostgresAdapter {
                 indexes.push(IndexInfo::new(name, vec![column], unique, primary));
             }
 
-            // Constraints: `table_constraints` joined to `key_column_usage`
-            // supplies columns and foreign-key targets; `check_constraints`
-            // supplies the check clause. Each is reported with its normalized
-            // kind rather than flattened into one opaque list.
+            // Constraints: `information_schema.key_column_usage` has no
+            // `referenced_*` columns (that is MySQL), so foreign-key targets come
+            // from `pg_constraint` paired with `pg_attribute`. Every constraint
+            // keeps its normalized kind rather than flattening into one list.
             let constraint_rows = client
                 .query(
-                    "SELECT tc.constraint_name::text, tc.constraint_type::text, \
-                            kcu.column_name::text, kcu.referenced_table_schema::text, \
-                            kcu.referenced_table_name::text, kcu.referenced_column_name::text, \
-                            cc.check_clause::text \
-                     FROM information_schema.table_constraints tc \
-                     LEFT JOIN information_schema.key_column_usage kcu \
-                       ON kcu.constraint_schema = tc.constraint_schema \
-                      AND kcu.constraint_name = tc.constraint_name \
-                      AND kcu.table_schema = tc.table_schema \
-                      AND kcu.table_name = tc.table_name \
-                     LEFT JOIN information_schema.check_constraints cc \
-                       ON cc.constraint_schema = tc.constraint_schema \
-                      AND cc.constraint_name = tc.constraint_name \
-                     WHERE tc.table_schema = $1 AND tc.table_name = $2 \
-                     ORDER BY tc.constraint_name, kcu.ordinal_position",
+                    "SELECT c.conname::text, \
+                            CASE c.contype \
+                              WHEN 'p' THEN 'PRIMARY KEY' \
+                              WHEN 'f' THEN 'FOREIGN KEY' \
+                              WHEN 'u' THEN 'UNIQUE' \
+                              WHEN 'c' THEN 'CHECK' \
+                              ELSE '' \
+                            END::text, \
+                            a.attname::text, \
+                            rn.nspname::text, \
+                            rc.relname::text, \
+                            ra.attname::text, \
+                            pg_get_constraintdef(c.oid)::text \
+                     FROM pg_constraint c \
+                     JOIN pg_class t ON t.oid = c.conrelid \
+                     JOIN pg_namespace tn ON tn.oid = t.relnamespace \
+                     LEFT JOIN LATERAL unnest(c.conkey) WITH ORDINALITY \
+                       AS k(attnum, ord) ON true \
+                     LEFT JOIN pg_attribute a \
+                       ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+                     LEFT JOIN LATERAL unnest(c.confkey) WITH ORDINALITY \
+                       AS fk(attnum, ford) ON fk.ford = k.ord \
+                     LEFT JOIN pg_attribute ra \
+                       ON ra.attrelid = c.confrelid AND ra.attnum = fk.attnum \
+                     LEFT JOIN pg_class rc ON rc.oid = c.confrelid \
+                     LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+                     WHERE tn.nspname = $1 AND t.relname = $2 \
+                     ORDER BY c.conname, k.ord",
                     &[&schema, &object.name],
                 )
                 .await
@@ -2115,6 +2202,20 @@ impl DatabaseAdapter for PostgresAdapter {
             let guard = slot.lock().await;
             let client = connected_client(&guard, connection)?;
             drop_postgres_column(client, guard.default_schema.as_deref(), object, column).await
+        })
+    }
+
+    fn alter_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        alteration: &'a ColumnAlteration,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            let slot = self.connection_slot(connection)?;
+            let guard = slot.lock().await;
+            let client = connected_client(&guard, connection)?;
+            alter_postgres_column(client, guard.default_schema.as_deref(), object, alteration).await
         })
     }
 

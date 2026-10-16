@@ -49,8 +49,9 @@ use crate::database::{
     build_update_statement, conflict_columns, effective_sort_order, effective_table_page_limit,
     quote_identifier_backtick, require_identifier, validate_default_expression,
     validate_row_identity, validate_type_name, AdapterFuture, CancelOutcome, ChangeRequest,
-    ChangeResult, ColumnDefinition, ConnectionId, ConnectionSecret, ConnectionState,
-    ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter, ForeignKeyDefinition,
+    ChangeResult, ColumnAlteration, ColumnDefinition, ConnectionId, ConnectionSecret,
+    ConnectionState, ConnectionTest, ConstraintInfo, ConstraintKind, DatabaseAdapter,
+    ForeignKeyDefinition,
     IndexInfo, ObjectKind, ObjectRef, ObjectScope, PendingChange, ScopeListing, TableDefinition,
     TableDescription, TableFilter, TablePage, TablePageRequest, TransactionId,
 };
@@ -1115,6 +1116,84 @@ fn drop_mysql_column(
     execute_mysql_ddl(handle, &sql)
 }
 
+/// Alters an existing column's type, nullability, or default.
+///
+/// MySQL's `MODIFY COLUMN` restates the whole definition, so the current type
+/// and default are read first and preserved unless the request changes them.
+fn alter_mysql_column(
+    handle: &mut Conn,
+    default_database: Option<&str>,
+    object: &ObjectRef,
+    alteration: &ColumnAlteration,
+) -> Result<(), QueryError> {
+    let database = resolve_database(handle, default_database, object.database.as_deref())?;
+    let name = alteration.name.trim();
+    require_identifier(name, "column")?;
+
+    let current: Option<(String, String, Option<String>, String)> = handle
+        .exec_first(
+            "SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (database.as_str(), object.name.as_str(), name),
+        )
+        .map_err(map_error)?;
+
+    let Some((current_type, is_nullable, current_default, extra)) = current else {
+        return Err(QueryError::new(
+            ErrorCategory::Validation,
+            format!("table `{}` has no column `{name}`", object.name),
+        ));
+    };
+
+    let type_name = match &alteration.type_name {
+        Some(type_name) => {
+            validate_type_name(type_name)?;
+            type_name.trim().to_string()
+        }
+        None => current_type,
+    };
+    let nullable = alteration.nullable.unwrap_or(is_nullable == "YES");
+
+    let default_clause = if alteration.drop_default {
+        None
+    } else if let Some(default) = &alteration.set_default {
+        validate_default_expression(name, default)?;
+        Some(default.trim().to_string())
+    } else {
+        mysql_preserved_default(&current_default, &extra)
+    };
+
+    let mut definition = format!("{} {}", quote_identifier_backtick(name), type_name);
+    definition.push_str(if nullable { " NULL" } else { " NOT NULL" });
+    if let Some(default) = default_clause {
+        definition.push_str(" DEFAULT ");
+        definition.push_str(&default);
+    }
+
+    let sql = format!(
+        "ALTER TABLE {} MODIFY COLUMN {definition}",
+        mysql_qualified(&database, &object.name)
+    );
+    execute_mysql_ddl(handle, &sql)
+}
+
+/// Re-emits a MySQL column's existing default for a `MODIFY COLUMN` restatement.
+///
+/// `EXTRA` marks generated/expression defaults, which are emitted verbatim;
+/// otherwise a numeric value is emitted as-is and any other value is quoted as a
+/// string literal.
+fn mysql_preserved_default(default: &Option<String>, extra: &str) -> Option<String> {
+    let value = default.as_deref()?;
+    if extra.to_ascii_uppercase().contains("DEFAULT_GENERATED") {
+        return Some(value.to_string());
+    }
+    if value.parse::<f64>().is_ok() {
+        return Some(value.to_string());
+    }
+    Some(format!("'{}'", value.replace('\'', "''")))
+}
+
 /// Adds a foreign-key constraint to an existing table.
 fn add_mysql_foreign_key(
     handle: &mut Conn,
@@ -1629,6 +1708,19 @@ impl DatabaseAdapter for MySqlAdapter {
         Box::pin(async move {
             self.with_connection(connection, |handle, database| {
                 drop_mysql_column(handle, database, object, column)
+            })
+        })
+    }
+
+    fn alter_column<'a>(
+        &'a self,
+        connection: &'a ConnectionId,
+        object: &'a ObjectRef,
+        alteration: &'a ColumnAlteration,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            self.with_connection(connection, |handle, database| {
+                alter_mysql_column(handle, database, object, alteration)
             })
         })
     }

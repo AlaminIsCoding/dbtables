@@ -12,8 +12,8 @@
 use std::collections::HashSet;
 
 use crate::database::{
-    ColumnDefinition, ConnectionId, DatabaseAdapter, ForeignKeyDefinition, ObjectKind, ObjectRef,
-    TableDefinition, TableDescription, TableFilter,
+    ColumnAlteration, ColumnDefinition, ConnectionId, DatabaseAdapter, ForeignKeyDefinition,
+    ObjectKind, ObjectRef, TableDefinition, TableDescription, TableFilter,
 };
 use crate::domain::{ErrorCategory, QueryError};
 
@@ -167,6 +167,29 @@ pub async fn drop_column(
     adapter.drop_column(connection, object, column).await
 }
 
+/// Alters a validated existing column's type, nullability, or default.
+pub async fn alter_column(
+    adapter: &dyn DatabaseAdapter,
+    connection: &ConnectionId,
+    object: &ObjectRef,
+    alteration: &ColumnAlteration,
+) -> Result<(), QueryError> {
+    require_name(&alteration.name, "column")?;
+    if alteration.type_name.is_none()
+        && alteration.nullable.is_none()
+        && alteration.set_default.is_none()
+        && !alteration.drop_default
+    {
+        return Err(validation("no column change was requested"));
+    }
+    if alteration.set_default.is_some() && alteration.drop_default {
+        return Err(validation(
+            "a column default cannot be set and dropped at once",
+        ));
+    }
+    adapter.alter_column(connection, object, alteration).await
+}
+
 /// Adds a validated foreign-key constraint to an existing table.
 pub async fn add_foreign_key(
     adapter: &dyn DatabaseAdapter,
@@ -237,11 +260,12 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use super::{
-        count_table_rows, create_index, create_table, rename_column, validate_table_definition,
+        alter_column, count_table_rows, create_index, create_table, rename_column,
+        validate_table_definition,
     };
     use crate::database::testing::FakeAdapter;
     use crate::database::{
-        ColumnDefinition, DatabaseAdapter, ObjectKind, ObjectRef, TableDefinition,
+        ColumnAlteration, ColumnDefinition, DatabaseAdapter, ObjectKind, ObjectRef, TableDefinition,
     };
     use crate::domain::connection::SqliteConnection;
     use crate::domain::{ConnectionDescriptor, EngineId, ErrorCategory};
@@ -354,5 +378,61 @@ mod tests {
         let error = block_on(count_table_rows(&adapter, &connection, &object, &[]))
             .expect_err("the fake adapter does not count rows");
         assert_eq!(error.category, ErrorCategory::Unsupported);
+    }
+
+    #[test]
+    fn alter_column_validates_before_delegating() {
+        let adapter = FakeAdapter::new(EngineId::Sqlite);
+        let connection =
+            block_on(adapter.connect(&sqlite_descriptor(), None)).expect("fake connect");
+        let object = table_object("users");
+
+        let no_change = ColumnAlteration {
+            name: "email".to_string(),
+            type_name: None,
+            nullable: None,
+            set_default: None,
+            drop_default: false,
+        };
+        assert_eq!(
+            block_on(alter_column(&adapter, &connection, &object, &no_change))
+                .expect_err("an empty alteration is invalid")
+                .category,
+            ErrorCategory::Validation
+        );
+
+        let conflicting_default = ColumnAlteration {
+            name: "email".to_string(),
+            type_name: None,
+            nullable: None,
+            set_default: Some("0".to_string()),
+            drop_default: true,
+        };
+        assert_eq!(
+            block_on(alter_column(
+                &adapter,
+                &connection,
+                &object,
+                &conflicting_default
+            ))
+            .expect_err("setting and dropping a default at once is invalid")
+            .category,
+            ErrorCategory::Validation
+        );
+
+        let valid = ColumnAlteration {
+            name: "email".to_string(),
+            type_name: Some("TEXT".to_string()),
+            nullable: Some(false),
+            set_default: None,
+            drop_default: false,
+        };
+        // The fake adapter does not implement alter_column.
+        assert_eq!(
+            block_on(alter_column(&adapter, &connection, &object, &valid))
+                .expect_err("the fake adapter cannot alter columns")
+                .category,
+            ErrorCategory::Unsupported
+        );
     }
 }

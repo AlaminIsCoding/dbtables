@@ -66,7 +66,7 @@ function fieldLabel(text: string) {
  * adapter.
  */
 export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
-  const { refreshSchema, log } = useWorkspace();
+  const { refreshSchema, activeEngine, log } = useWorkspace();
   const canCreate = object.kind === "table";
 
   const [description, setDescription] = useState<TableDescription | null>(null);
@@ -115,10 +115,11 @@ export function IndexTabView({ connectionId, object }: IndexTabViewProps) {
               name.trim() || "index_name",
               selected.length > 0 ? selected : ["column"],
               unique,
+              activeEngine,
             ),
           ]
         : [],
-    [name, object, selected, unique],
+    [name, object, selected, unique, activeEngine],
   );
 
   const toggleColumn = useCallback((column: string) => {

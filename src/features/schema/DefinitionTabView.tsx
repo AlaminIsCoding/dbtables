@@ -5,6 +5,7 @@ import {
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
+  SlidersHorizontalIcon,
   Trash2Icon,
   Undo2Icon,
   XIcon,
@@ -48,7 +49,9 @@ import {
 } from "@/components/ui/tooltip";
 import {
   createOperationId,
+  type ColumnAlteration,
   type ColumnDefinition,
+  type ColumnInfo,
   type ConstraintInfo,
   type ForeignKeyDefinition,
   type ObjectRef,
@@ -60,6 +63,7 @@ import { describeTable } from "@/services/metadata";
 import {
   addColumn,
   addForeignKey,
+  alterColumn,
   dropColumn,
   dropForeignKey,
   renameColumn,
@@ -75,7 +79,7 @@ import {
   type PendingColumnChange,
 } from "./columnEdits";
 import { ErrorBanner, SqlPreview } from "./parts";
-import { NONE, TYPE_OPTIONS } from "./typeOptions";
+import { NONE, typeOptionsFor } from "./typeOptions";
 
 export interface DefinitionTabViewProps {
   connectionId: string;
@@ -126,7 +130,8 @@ export function DefinitionTabView({
   connectionId,
   object,
 }: DefinitionTabViewProps) {
-  const { refreshSchema, schema, log } = useWorkspace();
+  const { refreshSchema, schema, scope, activeEngine, log } = useWorkspace();
+  const typeOptions = typeOptionsFor(activeEngine);
   const canEdit = object.kind === "table";
 
   const [description, setDescription] = useState<TableDescription | null>(null);
@@ -138,6 +143,13 @@ export function DefinitionTabView({
     null,
   );
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+
+  const canAlter = canEdit && activeEngine !== "sqlite";
+  const [altering, setAltering] = useState<string | null>(null);
+  const [alterType, setAlterType] = useState("TEXT");
+  const [alterNullable, setAlterNullable] = useState(true);
+  const [alterDefault, setAlterDefault] = useState("");
+  const [alterError, setAlterError] = useState<string | null>(null);
 
   const [newName, setNewName] = useState("");
   const [newType, setNewType] = useState("TEXT");
@@ -182,6 +194,8 @@ export function DefinitionTabView({
     setRenaming(null);
     setDropTarget(null);
     setAddError(null);
+    setAltering(null);
+    setAlterError(null);
     setFkNotice(null);
   }, [connectionId, object.name, object.database, object.schema, object.kind]);
 
@@ -195,8 +209,8 @@ export function DefinitionTabView({
     [columns, pending],
   );
   const pendingSql = useMemo(
-    () => pendingChangesToSql(object, pending),
-    [object, pending],
+    () => pendingChangesToSql(object, pending, activeEngine),
+    [object, pending, activeEngine],
   );
 
   const pendingAdds = useMemo(
@@ -223,11 +237,17 @@ export function DefinitionTabView({
       if (!table) {
         return null;
       }
+      // Carry the referenced table's database/schema so engines that need a
+      // scope (MySQL, PostgreSQL) can resolve it.
+      const known = tableOptions.find((option) => option.name === table);
+      const target: ObjectRef = known ?? {
+        kind: "table",
+        name: table,
+        database: scope.database,
+        schema: scope.schema,
+      };
       try {
-        const info = await describeTable(connectionId, {
-          kind: "table",
-          name: table,
-        });
+        const info = await describeTable(connectionId, target);
         const next: RefTableInfo = {
           columns: info.columns.map((column) => column.name),
           primaryKey: info.primaryKeyColumns?.[0] ?? null,
@@ -240,7 +260,7 @@ export function DefinitionTabView({
         return next;
       }
     },
-    [connectionId],
+    [connectionId, tableOptions, scope.database, scope.schema],
   );
 
   const discardChange = useCallback((id: string) => {
@@ -316,6 +336,59 @@ export function DefinitionTabView({
     setAddError(null);
   }, [effectiveNames, renaming]);
 
+  const startAlter = useCallback((column: ColumnInfo) => {
+    setAltering(column.name);
+    setAlterType(column.typeName?.trim() || "TEXT");
+    setAlterNullable(column.nullable ?? true);
+    setAlterDefault("");
+    setAlterError(null);
+  }, []);
+
+  const cancelAlter = useCallback(() => {
+    setAltering(null);
+    setAlterError(null);
+  }, []);
+
+  const saveAlter = useCallback(() => {
+    if (!altering) {
+      return;
+    }
+    if (alterType.trim().length === 0) {
+      setAlterError("Enter a column type.");
+      return;
+    }
+    const alteration: ColumnAlteration = {
+      name: altering,
+      typeName: alterType.trim(),
+      nullable: alterNullable,
+    };
+    const fallback = alterDefault.trim();
+    if (fallback.length > 0) {
+      alteration.setDefault = fallback;
+    }
+    setPending((current) => {
+      const index = current.findIndex(
+        (change) =>
+          change.kind === "alter" && change.alteration.name === altering,
+      );
+      if (index >= 0) {
+        const copy = [...current];
+        copy[index] = {
+          id: current[index].id,
+          kind: "alter",
+          alteration,
+        };
+        return copy;
+      }
+      return [
+        ...current,
+        { id: createOperationId(), kind: "alter", alteration },
+      ];
+    });
+    setAltering(null);
+    setAlterError(null);
+  }, [alterDefault, alterNullable, alterType, altering]);
+
   const stageDrop = useCallback((name: string) => {
     setPending((current) => {
       // Dropping a not-yet-applied addition just removes that addition.
@@ -348,6 +421,8 @@ export function DefinitionTabView({
           await addColumn(connectionId, object, change.column);
         } else if (change.kind === "rename") {
           await renameColumn(connectionId, object, change.from, change.to);
+        } else if (change.kind === "alter") {
+          await alterColumn(connectionId, object, change.alteration);
         } else {
           await dropColumn(connectionId, object, change.column);
         }
@@ -539,11 +614,24 @@ export function DefinitionTabView({
                         (change) =>
                           change.kind === "drop" && change.column === column.name,
                       );
+                      const alter = pending.find(
+                        (change) =>
+                          change.kind === "alter" &&
+                          change.alteration.name === column.name,
+                      );
                       let displayName = column.name;
                       if (rename && rename.kind === "rename") {
                         displayName = rename.to;
                       }
                       const isPrimary = primaryKeyColumns.includes(column.name);
+                      const stagedType =
+                        alter?.kind === "alter"
+                          ? alter.alteration.typeName
+                          : undefined;
+                      const stagedNullable =
+                        alter?.kind === "alter"
+                          ? alter.alteration.nullable
+                          : undefined;
                       return (
                         <div
                           key={column.name}
@@ -609,17 +697,29 @@ export function DefinitionTabView({
                                     drop
                                   </Badge>
                                 ) : null}
+                                {alter ? (
+                                  <Badge
+                                    variant="secondary"
+                                    className="h-4 px-1 text-[9px]"
+                                  >
+                                    altered
+                                  </Badge>
+                                ) : null}
                               </span>
                             )}
                             <span className="truncate font-mono text-[11px] text-muted-foreground">
-                              {column.typeName ?? "-"}
+                              {stagedType ?? column.typeName ?? "-"}
                             </span>
                             <span className="text-center text-[11px] text-muted-foreground">
-                              {column.nullable === undefined
-                                ? "-"
-                                : column.nullable
+                              {stagedNullable !== undefined
+                                ? stagedNullable
                                   ? "Yes"
-                                  : "No"}
+                                  : "No"
+                                : column.nullable === undefined
+                                  ? "-"
+                                  : column.nullable
+                                    ? "Yes"
+                                    : "No"}
                             </span>
                             <span className="flex justify-center">
                               {isPrimary ? (
@@ -650,6 +750,16 @@ export function DefinitionTabView({
                                 </Button>
                               ) : (
                                 <>
+                                  {canAlter ? (
+                                    <Button
+                                      size="icon-xs"
+                                      variant="ghost"
+                                      aria-label={`Alter ${column.name}`}
+                                      onClick={() => startAlter(column)}
+                                    >
+                                      <SlidersHorizontalIcon />
+                                    </Button>
+                                  ) : null}
                                   <Button
                                     size="icon-xs"
                                     variant="ghost"
@@ -676,6 +786,84 @@ export function DefinitionTabView({
                               )}
                             </div>
                           </div>
+                          {altering === column.name ? (
+                            <div className="mt-1 flex flex-wrap items-end gap-2 rounded-md border border-border/60 bg-muted/30 p-2">
+                              <label className="flex flex-col gap-1">
+                                {fieldLabel("Type")}
+                                <Select value={alterType} onValueChange={setAlterType}>
+                                  <SelectTrigger
+                                    size="sm"
+                                    aria-label={`Alter ${column.name} type`}
+                                    className="h-7 w-36 font-mono text-[11px]"
+                                  >
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {typeOptions.map((type) => (
+                                      <SelectItem key={type} value={type}>
+                                        {type}
+                                      </SelectItem>
+                                    ))}
+                                    {alterType &&
+                                    !typeOptions.includes(alterType) ? (
+                                      <SelectItem value={alterType}>
+                                        {alterType}
+                                      </SelectItem>
+                                    ) : null}
+                                  </SelectContent>
+                                </Select>
+                              </label>
+                              <label className="flex flex-col gap-1">
+                                {fieldLabel("Nullable")}
+                                <span className="flex h-7 items-center">
+                                  <Checkbox
+                                    aria-label={`Alter ${column.name} nullable`}
+                                    checked={alterNullable}
+                                    onCheckedChange={(checked) =>
+                                      setAlterNullable(checked === true)
+                                    }
+                                  />
+                                </span>
+                              </label>
+                              <label className="flex flex-col gap-1">
+                                {fieldLabel("Default")}
+                                <Input
+                                  aria-label={`Alter ${column.name} default`}
+                                  value={alterDefault}
+                                  spellCheck={false}
+                                  placeholder="(unchanged)"
+                                  className={inputClass("w-36")}
+                                  onChange={(event) => {
+                                    setAlterDefault(event.target.value);
+                                    setAlterError(null);
+                                  }}
+                                />
+                              </label>
+                              <Button
+                                size="sm"
+                                className="mb-0.5"
+                                onClick={saveAlter}
+                              >
+                                Stage change
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="mb-0.5"
+                                onClick={cancelAlter}
+                              >
+                                Cancel
+                              </Button>
+                              {alterError ? (
+                                <p
+                                  role="alert"
+                                  className="text-[11px] text-destructive"
+                                >
+                                  {alterError}
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : null}
                         </div>
                       );
                     })}
@@ -755,7 +943,7 @@ export function DefinitionTabView({
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                              {TYPE_OPTIONS.map((type) => (
+                              {typeOptions.map((type) => (
                                 <SelectItem key={type} value={type}>
                                   {type}
                                 </SelectItem>
@@ -811,8 +999,9 @@ export function DefinitionTabView({
                       ) : null}
                       {newPrimary ? (
                         <p className="text-[10px] text-muted-foreground">
-                          SQLite cannot add a PRIMARY KEY column to an existing
-                          table; applying this will return an unsupported error.
+                          Adding a PRIMARY KEY column to an existing table is not
+                          supported; applying this will return an unsupported
+                          error.
                         </p>
                       ) : null}
                     </div>

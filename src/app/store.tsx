@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import type {
+  EngineId,
   ObjectRef,
   ObjectScope,
   QueryError,
@@ -70,6 +71,8 @@ export interface WorkspaceValue {
   scope: ObjectScope;
   /** Selects a database/schema scope and reloads the object list. */
   setScope: (scope: ObjectScope) => void;
+  /** Engine of the active connection, or `null` while disconnected. */
+  activeEngine: EngineId | null;
   /** Databases selectable on the active connection, for the database picker. */
   databases: string[];
   /** Currently open database, when the engine exposes a database selection. */
@@ -406,6 +409,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       scopes,
       scope,
       setScope,
+      activeEngine: activeEngine ?? null,
       databases,
       currentDatabase,
       openDatabase,
@@ -437,6 +441,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       scopes,
       scope,
       setScope,
+      activeEngine,
       databases,
       currentDatabase,
       openDatabase,

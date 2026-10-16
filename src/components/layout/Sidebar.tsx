@@ -40,8 +40,9 @@ import {
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { ObjectRef } from "@/domain";
+import type { EngineId, ObjectRef } from "@/domain";
 import { reportError } from "@/lib/notify";
+import { quotedObjectName } from "@/lib/sql-ident";
 import { cn } from "@/lib/utils";
 import { qualifiedObjectName } from "@/lib/workspace/tabs";
 import { toQueryError } from "@/services/errors";
@@ -248,6 +249,7 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
                 <SchemaItem
                   key={qualifiedObjectName(object)}
                   object={object}
+                  engine={activeEngine}
                   count={rowCounts[object.name]}
                   onOpen={openTable}
                   onQuery={openQuery}
@@ -265,6 +267,7 @@ export function Sidebar({ className, collapsed = false }: SidebarProps) {
                 <SchemaItem
                   key={qualifiedObjectName(object)}
                   object={object}
+                  engine={activeEngine}
                   onOpen={openTable}
                   onQuery={openQuery}
                   onDrop={setPendingDrop}
@@ -354,12 +357,14 @@ function SchemaSection({
 
 function SchemaItem({
   object,
+  engine,
   count,
   onOpen,
   onQuery,
   onDrop,
 }: {
   object: ObjectRef;
+  engine: EngineId | null;
   count?: number;
   onOpen: (object: ObjectRef, sub?: "data" | "definition" | "index") => void;
   onQuery: (sql?: string) => void;
@@ -402,7 +407,9 @@ function SchemaItem({
         </ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
-          onSelect={() => onQuery(`SELECT * FROM "${object.name}" LIMIT 100;`)}
+          onSelect={() =>
+            onQuery(`SELECT * FROM ${quotedObjectName(engine, object)} LIMIT 100;`)
+          }
         >
           <TerminalIcon />
           New query on this object

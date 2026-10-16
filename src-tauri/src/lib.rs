@@ -57,6 +57,7 @@ pub fn run() {
             commands::schema::add_column,
             commands::schema::rename_column,
             commands::schema::drop_column,
+            commands::schema::alter_column,
             commands::schema::add_foreign_key,
             commands::schema::drop_foreign_key,
             commands::schema::create_index,

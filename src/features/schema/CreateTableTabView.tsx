@@ -19,7 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { createOperationId } from "@/domain";
+import { createOperationId, type ObjectRef } from "@/domain";
 import { reportError } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 import { toQueryError } from "@/services/errors";
@@ -38,7 +38,7 @@ import {
   type DraftForeignKey,
 } from "./createTable";
 import { SqlPreview } from "./parts";
-import { NONE, TYPE_OPTIONS } from "./typeOptions";
+import { NONE, typeOptionsFor } from "./typeOptions";
 export interface CreateTableTabViewProps {
   connectionId: string;
 }
@@ -76,8 +76,18 @@ interface RefTableInfo {
  * the schema refreshed, and the new table opened in place of this tab.
  */
 export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
-  const { activeTabId, closeTab, openTable, refreshSchema, schema, log } =
-    useWorkspace();
+  const {
+    activeTabId,
+    closeTab,
+    openTable,
+    refreshSchema,
+    schema,
+    scope,
+    activeEngine,
+    log,
+  } = useWorkspace();
+
+  const typeOptions = typeOptionsFor(activeEngine);
 
   const [draft, setDraft] = useState<CreateTableDraft>(() =>
     createEmptyDraft(createOperationId()),
@@ -88,7 +98,10 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
 
   const validation = useMemo(() => validateCreateTableDraft(draft), [draft]);
   const showErrors = submitted;
-  const preview = useMemo(() => previewCreateTable(draft), [draft]);
+  const preview = useMemo(
+    () => previewCreateTable(draft, activeEngine),
+    [draft, activeEngine],
+  );
 
   const tableOptions = useMemo(
     () => (schema.status === "ready" ? schema.tables : []),
@@ -167,11 +180,17 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
       if (!table) {
         return null;
       }
+      // Carry the referenced table's database/schema so engines that need a
+      // scope (MySQL, PostgreSQL) can resolve it.
+      const known = tableOptions.find((option) => option.name === table);
+      const object: ObjectRef = known ?? {
+        kind: "table",
+        name: table,
+        database: scope.database,
+        schema: scope.schema,
+      };
       try {
-        const description = await describeTable(connectionId, {
-          kind: "table",
-          name: table,
-        });
+        const description = await describeTable(connectionId, object);
         const info: RefTableInfo = {
           columns: description.columns.map((column) => column.name),
           primaryKey: description.primaryKeyColumns?.[0] ?? null,
@@ -185,7 +204,7 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
         return info;
       }
     },
-    [connectionId],
+    [connectionId, tableOptions, scope.database, scope.schema],
   );
 
   // Load metadata for any referenced table so its column dropdown is filled.
@@ -370,7 +389,7 @@ export function CreateTableTabView({ connectionId }: CreateTableTabViewProps) {
                               <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                              {TYPE_OPTIONS.map((type) => (
+                              {typeOptions.map((type) => (
                                 <SelectItem key={type} value={type}>
                                   {type}
                                 </SelectItem>

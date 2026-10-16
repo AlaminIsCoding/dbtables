@@ -1,5 +1,6 @@
 import type {
   ColumnDefinition,
+  EngineId,
   ForeignKeyDefinition,
   TableDefinition,
 } from "@/domain";
@@ -208,7 +209,10 @@ export function draftToTableDefinition(
 }
 
 /** Best-effort SQL preview, tolerant of incomplete rows. */
-export function previewCreateTable(draft: CreateTableDraft): string {
+export function previewCreateTable(
+  draft: CreateTableDraft,
+  engine?: EngineId | null,
+): string {
   const definition: TableDefinition = {
     object: { name: draft.name.trim() || "new_table", kind: "table" },
     columns: draft.columns.map((column) => {
@@ -226,5 +230,5 @@ export function previewCreateTable(draft: CreateTableDraft): string {
     }),
     foreignKeys: draft.foreignKeys.map(draftForeignKeyToDefinition),
   };
-  return renderCreateTable(definition);
+  return renderCreateTable(definition, engine);
 }

@@ -266,6 +266,26 @@ export interface ColumnDefinition {
   default?: string;
 }
 
+/**
+ * A requested change to an existing column's definition.
+ *
+ * Every aspect is optional; an absent field (or `dropDefault: false`) leaves
+ * that aspect unchanged. Engines that cannot alter a column in place (SQLite)
+ * reject the request as unsupported.
+ */
+export interface ColumnAlteration {
+  /** Existing column name. */
+  name: string;
+  /** New type text; absent to leave the type unchanged. */
+  typeName?: string;
+  /** New nullability; absent to leave it unchanged. */
+  nullable?: boolean;
+  /** New default expression; absent to leave the default unchanged. */
+  setDefault?: string;
+  /** Clear the existing default. */
+  dropDefault?: boolean;
+}
+
 /** A foreign-key definition used when creating a table. */
 export interface ForeignKeyDefinition {
   /** Local column identifiers that form the key. */

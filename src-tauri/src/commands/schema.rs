@@ -2,8 +2,8 @@ use tauri::State;
 
 use crate::application::schema;
 use crate::database::{
-    ColumnDefinition, ConnectionId, DatabaseState, ForeignKeyDefinition, ObjectRef, TableDefinition,
-    TableDescription, TableFilter,
+    ColumnAlteration, ColumnDefinition, ConnectionId, DatabaseState, ForeignKeyDefinition, ObjectRef,
+    TableDefinition, TableDescription, TableFilter,
 };
 use crate::domain::QueryError;
 
@@ -71,6 +71,18 @@ pub async fn drop_column(
 ) -> Result<(), QueryError> {
     let adapter = state.adapter_for(&connection_id)?;
     schema::drop_column(adapter, &connection_id, &object, &column).await
+}
+
+/// Alters an existing column's type, nullability, or default.
+#[tauri::command]
+pub async fn alter_column(
+    state: State<'_, DatabaseState>,
+    connection_id: ConnectionId,
+    object: ObjectRef,
+    alteration: ColumnAlteration,
+) -> Result<(), QueryError> {
+    let adapter = state.adapter_for(&connection_id)?;
+    schema::alter_column(adapter, &connection_id, &object, &alteration).await
 }
 
 /// Adds a foreign-key constraint to an existing table.

@@ -8,6 +8,7 @@ import {
   quoteObject,
   renderAddColumn,
   renderAddForeignKey,
+  renderAlterColumn,
   renderCreateIndex,
   renderCreateTable,
   renderDropColumn,
@@ -124,5 +125,46 @@ describe("schema SQL generation", () => {
         ");",
       ].join("\n"),
     );
+  });
+});
+
+describe("engine-aware SQL preview", () => {
+  it("uses backticks for MySQL", () => {
+    const mysqlTable: ObjectRef = {
+      database: "app",
+      name: "notes",
+      kind: "table",
+    };
+    expect(
+      renderAddColumn(
+        mysqlTable,
+        { name: "body", typeName: "TEXT", nullable: true, primaryKey: false },
+        "mysql",
+      ),
+    ).toBe("ALTER TABLE `app`.`notes` ADD COLUMN `body` TEXT;");
+  });
+
+  it("renders a PostgreSQL alteration as separate actions", () => {
+    const table: ObjectRef = { schema: "public", name: "notes", kind: "table" };
+    expect(
+      renderAlterColumn(
+        table,
+        { name: "body", typeName: "text", nullable: false },
+        "postgres",
+      ),
+    ).toBe(
+      'ALTER TABLE "public"."notes" ALTER COLUMN "body" TYPE text, ALTER COLUMN "body" SET NOT NULL;',
+    );
+  });
+
+  it("renders a MySQL alteration with MODIFY COLUMN", () => {
+    const table: ObjectRef = { database: "app", name: "notes", kind: "table" };
+    expect(
+      renderAlterColumn(
+        table,
+        { name: "body", typeName: "TEXT", nullable: false },
+        "mysql",
+      ),
+    ).toBe("ALTER TABLE `app`.`notes` MODIFY COLUMN `body` TEXT NOT NULL;");
   });
 });

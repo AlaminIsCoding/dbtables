@@ -468,6 +468,31 @@ impl ColumnDefinition {
     }
 }
 
+/// A requested change to an existing column's definition.
+///
+/// Every aspect is optional: an absent field (or `false` for `drop_default`)
+/// means "leave it unchanged". `set_default` and `drop_default` are separate so
+/// "clear the default" is unambiguous. Engines that cannot alter a column in
+/// place (SQLite without a table rebuild) reject the request as unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnAlteration {
+    /// Existing column name.
+    pub name: String,
+    /// New type text; absent to leave the type unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// New nullability; absent to leave it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nullable: Option<bool>,
+    /// New default expression; absent to leave the default unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_default: Option<String>,
+    /// Clear the existing default.
+    #[serde(default)]
+    pub drop_default: bool,
+}
+
 /// A foreign-key constraint supplied to schema management.
 ///
 /// `columns` and `referenced_columns` must be the same length and are paired in
@@ -1800,6 +1825,24 @@ pub trait DatabaseAdapter: Send + Sync {
             Err(QueryError::new(
                 ErrorCategory::Unsupported,
                 "this adapter does not support dropping columns",
+            ))
+        })
+    }
+
+    /// Alters an existing column's type, nullability, or default.
+    ///
+    /// Engines that cannot alter a column in place (SQLite without a table
+    /// rebuild) return [`ErrorCategory::Unsupported`].
+    fn alter_column<'a>(
+        &'a self,
+        _connection: &'a ConnectionId,
+        _object: &'a ObjectRef,
+        _alteration: &'a ColumnAlteration,
+    ) -> AdapterFuture<'a, Result<(), QueryError>> {
+        Box::pin(async move {
+            Err(QueryError::new(
+                ErrorCategory::Unsupported,
+                "this adapter does not support altering columns",
             ))
         })
     }

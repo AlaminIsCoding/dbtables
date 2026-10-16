@@ -1,7 +1,14 @@
-import type { ColumnDefinition, ColumnInfo, ObjectRef } from "@/domain";
+import type {
+  ColumnAlteration,
+  ColumnDefinition,
+  ColumnInfo,
+  EngineId,
+  ObjectRef,
+} from "@/domain";
 
 import {
   renderAddColumn,
+  renderAlterColumn,
   renderDropColumn,
   renderRenameColumn,
 } from "./sql";
@@ -16,7 +23,8 @@ import {
 export type PendingColumnChange =
   | { id: string; kind: "add"; column: ColumnDefinition }
   | { id: string; kind: "rename"; from: string; to: string }
-  | { id: string; kind: "drop"; column: string };
+  | { id: string; kind: "drop"; column: string }
+  | { id: string; kind: "alter"; alteration: ColumnAlteration };
 
 /** Engine-neutral column definition for a column discovered by inspection. */
 export function columnToDefinition(
@@ -62,6 +70,9 @@ export function pendingColumnNames(
         }
         break;
       }
+      case "alter":
+        // Altering a column never changes its name.
+        break;
     }
   }
   return names;
@@ -121,6 +132,8 @@ export function describePendingChange(change: PendingColumnChange): string {
       return `Rename ${change.from} → ${change.to}`;
     case "drop":
       return `Drop ${change.column}`;
+    case "alter":
+      return `Alter ${change.alteration.name}`;
   }
 }
 
@@ -128,15 +141,18 @@ export function describePendingChange(change: PendingColumnChange): string {
 export function pendingChangesToSql(
   object: ObjectRef,
   changes: readonly PendingColumnChange[],
+  engine?: EngineId | null,
 ): string[] {
   return changes.map((change) => {
     switch (change.kind) {
       case "add":
-        return renderAddColumn(object, change.column);
+        return renderAddColumn(object, change.column, engine);
       case "rename":
-        return renderRenameColumn(object, change.from, change.to);
+        return renderRenameColumn(object, change.from, change.to, engine);
       case "drop":
-        return renderDropColumn(object, change.column);
+        return renderDropColumn(object, change.column, engine);
+      case "alter":
+        return renderAlterColumn(object, change.alteration, engine);
     }
   });
 }
